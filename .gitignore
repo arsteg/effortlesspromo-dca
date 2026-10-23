@@ -56,6 +56,9 @@ cover/
 *.mo
 *.pot
 
+# Local dev database (see .env.example DATABASE_URL)
+dca.db
+
 # Django stuff:
 *.log
 local_settings.py
