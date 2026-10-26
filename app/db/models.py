@@ -80,6 +80,20 @@ class OutboxStatus(str, Enum):
     DELIVERED = "delivered"
 
 
+class RevisionStatus(str, Enum):
+    """Reconciliation state of a revision-tracked aggregate projection (DCA-031).
+
+    ``CURRENT`` — ``applied_version`` is the highest *contiguous* revision seen; nothing is buffered
+    waiting on a missing predecessor. ``GAPPED`` — one or more newer revisions have arrived out of
+    order and are buffered (:class:`RevisionPendingEvent`) pending a still-missing revision, so the
+    gap is **visible** rather than guessed. A projection flips back to ``CURRENT`` once the missing
+    revisions arrive and the buffered events are reconciled in order.
+    """
+
+    CURRENT = "current"
+    GAPPED = "gapped"
+
+
 class InboxStatus(str, Enum):
     """Processing state of an inbound-event receipt (DCA-028).
 
@@ -353,6 +367,94 @@ class InboxReceipt(TenantOwned, Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # Set when the handler completed; populated at receive time because completion is transactional.
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class RevisionProjection(TenantOwned, Base):
+    """DCA-031 — a revision-tracked projection of one aggregate (tenant-owned).
+
+    When this service consumes integration events that *project* an aggregate's state (a consent
+    record, an ICP profile, …), events can arrive out of order: a retried or delayed delivery may
+    carry an OLDER revision than one already applied. This row records the highest **contiguous**
+    revision applied for an aggregate — ``(business_id, aggregate_type, aggregate_id)`` — so the
+    single sanctioned writer (:class:`~app.projection.revision.RevisionProjector`) can:
+
+    - **Reject a stale revision.** An event whose ``aggregate_version`` is ``<=`` ``applied_version``
+      is refused — an older consent/profile revision can never overwrite the current one.
+    - **Make a gap visible, not guessed.** An event whose version is ``> applied_version + 1`` is
+      NOT applied (the intervening revisions are missing and their state is unknown); it is buffered
+      as a :class:`RevisionPendingEvent`, the projection is marked ``GAPPED``, and the buffered events
+      are applied in order once the missing revision arrives (the explicit reconciliation path).
+
+    ``state`` holds only OPAQUE references (ids / row keys) — screened free of secrets/contact data by
+    the projector before anything is staged, exactly like the audit / outbox / inbox payloads.
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 row-level-security
+    policy, so one tenant can never read another's projections.
+    """
+
+    __tablename__ = "revision_projections"
+    # One projection per aggregate PER business; the same aggregate key may repeat across tenants.
+    __table_args__ = (
+        tenant_unique("aggregate_type", "aggregate_id", name="uq_revision_projection"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # WHICH kind of aggregate this projection tracks — a controlled code (e.g. "consent"). Opaque.
+    aggregate_type: Mapped[str] = mapped_column(String(128), index=True)
+    # The aggregate's own id within its type. Opaque (an id / row key), never contact data.
+    aggregate_id: Mapped[str] = mapped_column(String(200), index=True)
+    # Highest CONTIGUOUS revision applied. 0 means nothing has been applied yet (a gap from the start).
+    applied_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The projected state at ``applied_version`` — opaque references only.
+    state: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=RevisionStatus.CURRENT.value,
+        server_default=RevisionStatus.CURRENT.value,
+        index=True,
+    )
+    # The event id that last advanced this projection (opaque); "" before anything is applied.
+    last_event_id: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    last_occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class RevisionPendingEvent(TenantOwned, Base):
+    """DCA-031 — a buffered, out-of-order revision awaiting a missing predecessor (tenant-owned).
+
+    When a projected event arrives ahead of its turn (``aggregate_version > applied_version + 1``),
+    its state cannot be applied yet — the revisions in between are missing and must not be guessed.
+    The event is buffered here so the gap is **visible** (queryable) and so it can be applied, in
+    order, once the gap is filled (the reconciliation path). A buffered revision is unique per
+    aggregate (``(business_id, aggregate_type, aggregate_id, aggregate_version)``), so a re-delivery
+    of the same out-of-order revision is not double-buffered.
+
+    ``state`` holds only OPAQUE references, screened by the projector before staging. Tenant-owned, so
+    it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant
+    data table.
+    """
+
+    __tablename__ = "revision_pending_events"
+    __table_args__ = (
+        tenant_unique(
+            "aggregate_type", "aggregate_id", "aggregate_version", name="uq_revision_pending"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    aggregate_type: Mapped[str] = mapped_column(String(128), index=True)
+    aggregate_id: Mapped[str] = mapped_column(String(200), index=True)
+    # The out-of-order revision this buffered event carries (always > the projection's applied_version
+    # when staged).
+    aggregate_version: Mapped[int] = mapped_column(Integer, index=True)
+    # The event id that produced this buffered revision (opaque).
+    event_id: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # The state this revision WOULD project once the gap before it is filled — opaque references only.
+    state: Mapped[dict] = mapped_column(JSON, default=dict)
+    occurred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class AiInvocation(TenantOwned, Base):

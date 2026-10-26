@@ -22,7 +22,8 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
 - Inbound auth: `X-Service-Auth` shared secret, fail-closed (401 when unconfigured) —
   authenticates the calling *service* only; tenant authority is the platform's job (DCA-001 B3).
 - Own schema (SQLAlchemy 2): `tenant_agents`, `icp_profiles`, `discovery_runs`,
-  `prospect_candidates`, `acquisition_decisions`, `ai_invocations`.
+  `prospect_candidates`, `acquisition_decisions`, `ai_invocations`, `audit_events`,
+  `outbox_messages`, `inbox_receipts`, `revision_projections`, `revision_pending_events`.
 - Discovery cycle (deterministic): plan → fetch → **rulepack screening** (India pack:
   official-registry tier only, role contacts only, org identifier mandatory; DEFAULT pack = allow
   nothing) → dedupe → suggested candidates, every record getting an auditable

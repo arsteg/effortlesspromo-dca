@@ -35,6 +35,8 @@ DCA_TABLES = {
     "audit_events",
     "outbox_messages",
     "inbox_receipts",
+    "revision_projections",
+    "revision_pending_events",
 }
 
 
@@ -263,6 +265,59 @@ def test_0007_creates_inbox_receipts_on_a_preexisting_database(clean_schema):
     eng.dispose()
     assert "uq_inbox_event" in uniques  # the replay-dedup constraint travelled with the table
     assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0008_creates_revision_tables_on_a_preexisting_database(clean_schema):
+    """DCA-031 — the 0008 create branch (for a DB migrated before the revision tables existed).
+
+    Same shape as the 0005/0006/0007 tests: a fresh DB gets the tables from the metadata baseline
+    (0001) and their RLS policies from 0002, so 0008 is a no-op there. To exercise 0008's real job,
+    upgrade to head, drop both tables + policies, stamp history back to 0007, then upgrade to head
+    again — 0008 must recreate both tables (with their unique constraints) AND their RLS policies.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "revision_pending_events" CASCADE'))
+        conn.execute(text('DROP TABLE IF EXISTS "revision_projections" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0007_inbox_receipts")  # pretend we predate the revision tables
+    command.upgrade(cfg, "head")  # 0008 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert {"revision_projections", "revision_pending_events"}.issubset(tables)
+    proj_uniques = {
+        u["name"] for u in insp.get_unique_constraints("revision_projections", schema=clean_schema)
+    }
+    pending_uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("revision_pending_events", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = conn.execute(
+            text(
+                "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                "AND tablename IN ('revision_projections', 'revision_pending_events') "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).fetchall()
+    eng.dispose()
+    assert "uq_revision_projection" in proj_uniques  # one projection per aggregate per tenant
+    assert "uq_revision_pending" in pending_uniques  # a revision is buffered at most once
+    assert {row[0] for row in policies} == {
+        "revision_projections",
+        "revision_pending_events",
+    }  # RLS re-established on both, not just the bare tables
 
 
 @requires_pg

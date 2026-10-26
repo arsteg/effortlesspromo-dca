@@ -2148,6 +2148,140 @@ def _dca_030(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-031",
+    "stale revisions: apply rev3 then delayed rev2 (unchanged); a gap is buffered pending, then reconciles",
+)
+def _dca_031(ctx: CheckContext) -> dict:
+    """Prove revision-aware projection for synthetic Business A, over the DCA-029 envelope's
+    ``aggregate_version``:
+
+      1. apply revisions 1 -> 2 -> 3 in order         -> projection advances to 3;
+      2. deliver a DELAYED revision 2                 -> rejected STALE, state UNCHANGED (rev 3 wins);
+      3. deliver revision 5 while 4 is missing        -> buffered as a visible GAP (pending), not applied;
+      4. deliver the missing revision 4               -> fills the gap and reconciles 5 in order.
+
+    Shows the actual projection row (applied_version / status / state) and the buffered pending rows
+    and computed missing versions at each step, so a human can see an older revision never overwrites
+    a newer one and a gap is visible rather than guessed. Local synthetic SQLite; no AI/paid action.
+    """
+    from datetime import UTC, datetime
+
+    from app.identity.fake import BUSINESS_A
+    from app.identity.tenant_context import TenantContext
+    from app.integration import new_envelope
+    from app.projection import RevisionOutcome, RevisionProjector
+
+    atype, aid = "consent", "consent-aggregate-1"
+
+    def ctx_a() -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=BUSINESS_A,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def deliver(version: int, state: dict) -> RevisionOutcome:
+        """A guarded receiver: mint+validate the envelope, then project its revision (one unit of work)."""
+        env = new_envelope(
+            event_id=f"evt-{version}",
+            business_id=BUSINESS_A,
+            event_type="consent.updated",
+            aggregate_version=version,
+            occurred_at=datetime(2026, 1, 1, 12, version, 0, tzinfo=UTC),
+            payload=state,
+        )
+        with ctx.session_factory() as session:
+            projector = RevisionProjector.for_context(session, ctx_a())
+            outcome = projector.apply(
+                aggregate_type=atype,
+                aggregate_id=aid,
+                version=env.aggregate_version,
+                state=dict(env.payload),
+                event_id=env.event_id,
+                occurred_at=env.occurred_at,
+            )
+            session.commit()
+        return outcome
+
+    def snapshot(label: str) -> dict:
+        with ctx.session_factory() as session:
+            projector = RevisionProjector.for_context(session, ctx_a())
+            proj = projector.projection(aggregate_type=atype, aggregate_id=aid)
+            pending = [
+                p.aggregate_version
+                for p in projector.pending(aggregate_type=atype, aggregate_id=aid)
+            ]
+            missing = projector.gaps(aggregate_type=atype, aggregate_id=aid)
+        state = proj.state if proj else {}
+        applied = proj.applied_version if proj else 0
+        status = proj.status if proj else "(none)"
+        print(
+            f"  [{label}] applied_version={applied} status={status} state={state} "
+            f"pending={pending} missing_gap={missing}"
+        )
+        return {
+            "applied_version": applied,
+            "status": status,
+            "state": state,
+            "pending": pending,
+            "missing": missing,
+        }
+
+    out: dict = {}
+    print("\n1) apply revisions 1 -> 2 -> 3 in order:")
+    for v in (1, 2, 3):
+        o = deliver(v, {"rev": v, "consent": "granted"})
+        print(f"  deliver rev {v} -> {o.decision.value} (applied_version={o.applied_version})")
+    out["after_ordered"] = snapshot("after 1,2,3")
+
+    print("\n2) deliver a DELAYED older revision 2 (must NOT overwrite rev 3):")
+    stale = deliver(2, {"rev": 2, "consent": "withdrawn"})
+    print(f"  deliver rev 2 (delayed) -> {stale.decision.value} ({stale.reason})")
+    out["stale_decision"] = stale.decision.value
+    out["after_stale"] = snapshot("after delayed rev 2")
+
+    print("\n3) deliver revision 5 while revision 4 is missing (a GAP - buffered, not applied):")
+    gap = deliver(5, {"rev": 5})
+    print(f"  deliver rev 5 -> {gap.decision.value} ({gap.reason})")
+    out["gap_decision"] = gap.decision.value
+    out["gap_missing"] = list(gap.missing)
+    out["after_gap"] = snapshot("after rev 5 (gap)")
+
+    print("\n4) deliver the missing revision 4 (fills the gap, reconciles 5 in order):")
+    filled = deliver(4, {"rev": 4})
+    print(
+        f"  deliver rev 4 -> {filled.decision.value} "
+        f"(applied_version={filled.applied_version}, reconciled={list(filled.reconciled)})"
+    )
+    out["reconciled"] = list(filled.reconciled)
+    out["after_reconcile"] = snapshot("after rev 4 (reconciled)")
+
+    stale_preserved = out["after_stale"]["applied_version"] == 3 and out["after_stale"][
+        "state"
+    ] == {"rev": 3, "consent": "granted"}
+    gap_visible = out["after_gap"]["applied_version"] == 3 and out["after_gap"]["pending"] == [5]
+    reconciled_ok = (
+        out["after_reconcile"]["applied_version"] == 5
+        and out["after_reconcile"]["status"] == "current"
+        and out["after_reconcile"]["pending"] == []
+    )
+    print(
+        "\nchecks: "
+        f"older_revision_did_not_overwrite={stale_preserved}  "
+        f"gap_visible_not_guessed={gap_visible}  "
+        f"reconciled_in_order={reconciled_ok}"
+    )
+    out["older_revision_did_not_overwrite"] = stale_preserved
+    out["gap_visible_not_guessed"] = gap_visible
+    out["reconciled_in_order"] = reconciled_ok
+    print(
+        "\n(an older revision never overwrote a newer projection; the gap was visible, not guessed; no paid action)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
