@@ -36,10 +36,14 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
 ## Run
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.txt      # dev loop (or: pip install .  — installable package)
 pytest                                   # in-memory SQLite, no network
 uvicorn app.asgi:app --reload --port 8100
+effortlesspromo-dca                      # console entry point (after pip install .)
 ```
+
+`requirements.lock` pins the full transitive runtime set (generated from a clean `pip install .`;
+regenerate with `pip freeze` in a fresh venv when bumping dependencies).
 
 Minimum env: `EFFORTLESSPROMO_DCA_ENVIRONMENT`, `EFFORTLESSPROMO_DCA_DATABASE_URL`,
 `EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN` (else every privileged call 401s).

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "effortlesspromo-dca"
 version = "0.1.0"
@@ -16,10 +20,17 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest==8.3.4",
+    "ruff==0.8.4",
 ]
 postgres = [
     "psycopg[binary]==3.2.3",
 ]
+
+[project.scripts]
+effortlesspromo-dca = "app.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
