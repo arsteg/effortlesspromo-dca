@@ -34,6 +34,7 @@ DCA_TABLES = {
     "ai_invocations",
     "audit_events",
     "outbox_messages",
+    "inbox_receipts",
 }
 
 
@@ -219,6 +220,48 @@ def test_0006_creates_outbox_messages_on_a_preexisting_database(clean_schema):
         ).first()
     eng.dispose()
     assert "uq_outbox_event" in uniques  # the duplicate-intent constraint travelled with the table
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0007_creates_inbox_receipts_on_a_preexisting_database(clean_schema):
+    """DCA-028 — the 0007 create branch (for a DB migrated before ``inbox_receipts`` existed).
+
+    Same shape as the 0005/0006 tests: a fresh DB gets the table from the metadata baseline (0001) and
+    its RLS policy from 0002, so 0007 is a no-op there. To exercise 0007's real job, upgrade to head,
+    drop the table + policy, stamp history back to 0006, then upgrade to head again — 0007 must
+    recreate the table (with its unique receipt constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "inbox_receipts" CASCADE'))  # policy drops with it
+    eng.dispose()
+
+    command.stamp(cfg, "0006_outbox_messages")  # pretend we predate the inbox table
+    command.upgrade(cfg, "head")  # 0007 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "inbox_receipts" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("inbox_receipts", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'inbox_receipts' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_inbox_event" in uniques  # the replay-dedup constraint travelled with the table
     assert policy is not None  # RLS re-established, not just the bare table
 
 

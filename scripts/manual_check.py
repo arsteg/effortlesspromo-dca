@@ -1693,6 +1693,169 @@ def _dca_027(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-028",
+    "inbox dedup: handle once, replay is a no-op, failed processing retries; raw contact refused",
+)
+def _dca_028(ctx: CheckContext) -> dict:
+    """Prove inbound-event deduplication with transactional handler completion. For synthetic
+    Business A, seed two candidates and deliver a synthetic event per candidate through the
+    idempotent-receiver unit of work (fast-path skip if already seen; else mutate + record the
+    receipt and commit both together):
+
+      1. deliver event E1 for candidate #1 -> handled: status changes AND one receipt is recorded;
+      2. deliver E1 AGAIN (a replay) -> short-circuited by the fast path, NO second application;
+      2b. re-register E1 WITHOUT the fast path -> rejected by the (business_id, source, id) uniqueness
+          constraint, so even a careless caller cannot apply the change twice;
+      3. deliver event E2 for candidate #2 but FAIL mid-handler -> rolled back: neither the status
+         change NOR the receipt survives, so the retry (4) applies it cleanly exactly once;
+      5. attempt to record a receipt carrying a RAW CONTACT payload -> refused before anything staged.
+
+    Shows the actual candidate statuses and inbox rows after each step. No AI/paid action, no HTTP.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db.models import DiscoveryRun, InboxReceipt, InboxStatus, ProspectCandidate
+    from app.identity.fake import BUSINESS_A
+    from app.identity.tenant_context import TenantContext
+    from app.inbox import InboxPayloadError, InboxSink
+
+    source = "effortlesspromo-api"
+
+    def ctx_a() -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=BUSINESS_A,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def seed_candidate(session, identifier: str) -> str:
+        run = DiscoveryRun(business_id=BUSINESS_A, status="completed")
+        session.add(run)
+        session.flush()
+        cand = ProspectCandidate(
+            business_id=BUSINESS_A,
+            run_id=run.id,
+            org_name="Synthetic Org",
+            org_identifier=identifier,
+            source_key="synthetic",
+            source_ref="synthetic://1",
+            trust_tier="official_registry",
+            status="suggested",
+        )
+        session.add(cand)
+        session.flush()
+        return cand.id
+
+    def handle(candidate_id: str, event_id: str, *, fail: bool = False) -> bool:
+        """One idempotent-receiver unit of work. Returns True iff the local change was applied."""
+        with ctx.session_factory() as session:
+            sink = InboxSink.for_context(session, ctx_a())
+            if sink.already_processed(event_source=source, event_id=event_id) is not None:
+                return False
+            cand = session.get(ProspectCandidate, candidate_id)
+            cand.status = "accepted"
+            sink.register(
+                event_source=source, event_id=event_id, payload={"candidateId": candidate_id}
+            )
+            if fail:
+                session.rollback()
+                return False
+            session.commit()
+            return True
+
+    out: dict = {}
+
+    with ctx.session_factory() as session:
+        c1 = seed_candidate(session, "SYN-1")
+        c2 = seed_candidate(session, "SYN-2")
+        session.commit()
+
+    # 1 + 2) first delivery handles the event; a replay is a no-op via the fast path.
+    applied_first = handle(c1, "evt-1")
+    applied_replay = handle(c1, "evt-1")
+
+    # 2b) a replay that skips the fast path is still rejected by the uniqueness constraint.
+    dup_rejected = False
+    with ctx.session_factory() as session:
+        cand = session.get(ProspectCandidate, c1)
+        cand.status = "re-accepted"
+        InboxSink.for_context(session, ctx_a()).register(event_source=source, event_id="evt-1")
+        try:
+            session.commit()
+        except IntegrityError:
+            dup_rejected = True
+            session.rollback()
+
+    # 3) a failed delivery rolls back both the change and the receipt; 4) the retry applies it once.
+    applied_fail = handle(c2, "evt-2", fail=True)
+    with ctx.session_factory() as session:
+        s2_after_fail = session.get(ProspectCandidate, c2).status
+        receipts_after_fail = len(session.scalars(select(InboxReceipt)).all())
+    applied_retry = handle(c2, "evt-2")
+
+    # 5) refuse a raw-contact payload — nothing staged.
+    refused = False
+    refusal = ""
+    with ctx.session_factory() as session:
+        try:
+            InboxSink.for_context(session, ctx_a()).register(
+                event_source=source,
+                event_id="evt-3",
+                payload={"ownerEmail": "founder@acme.co.in"},
+            )
+        except InboxPayloadError as exc:
+            refused = True
+            refusal = str(exc)
+        session.commit()
+
+    # Inspect the actual persisted state.
+    with ctx.session_factory() as session:
+        s1 = session.get(ProspectCandidate, c1).status
+        s2 = session.get(ProspectCandidate, c2).status
+        rows = session.scalars(select(InboxReceipt).order_by(InboxReceipt.received_at)).all()
+
+    print("\ndelivery effects:")
+    print(f"  deliver E1 (first)  -> applied={applied_first}   (expected: True)")
+    print(f"  deliver E1 (replay) -> applied={applied_replay}  (expected: False — fast-path no-op)")
+    print(f"  re-register E1 no fast-path -> rejected={dup_rejected} (uniqueness constraint)")
+    print(
+        f"  deliver E2 (fails)  -> applied={applied_fail}  status after={s2_after_fail} "
+        f"receipts after={receipts_after_fail} (both rolled back)"
+    )
+    print(f"  retry E2            -> applied={applied_retry}  (expected: True — clean re-run)")
+
+    print("\ncandidate statuses:")
+    print(f"  #1  status={s1}   (expected: accepted — applied exactly once despite the replay)")
+    print(f"  #2  status={s2}   (expected: accepted — applied once on retry)")
+
+    print(f"\ninbox_receipts rows persisted: {len(rows)} (expected: 2 — one per handled event)")
+    for r in rows:
+        print(
+            f"  - source={r.event_source}  event_id={r.event_id}  status={r.status}  "
+            f"payload={r.payload}"
+        )
+    print(f"\nraw-contact receipt refused: {refused}  ({refusal if refused else 'NOT REFUSED!'})")
+
+    out["applied_first"] = applied_first
+    out["replay_was_noop"] = applied_replay is False
+    out["duplicate_rejected"] = dup_rejected
+    out["failed_rolled_back"] = s2_after_fail == "suggested" and receipts_after_fail == 1
+    out["retry_applied"] = applied_retry
+    out["c1_status"] = s1
+    out["c2_status"] = s2
+    out["inbox_row_count"] = len(rows)
+    out["all_processed"] = all(r.status == InboxStatus.PROCESSED.value for r in rows)
+    out["raw_contact_refused"] = refused
+    print(
+        "\n(exactly-once local effect; failed processing retries cleanly; opaque payloads only; "
+        "no paid action)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

@@ -80,6 +80,23 @@ class OutboxStatus(str, Enum):
     DELIVERED = "delivered"
 
 
+class InboxStatus(str, Enum):
+    """Processing state of an inbound-event receipt (DCA-028).
+
+    ``PROCESSED`` — the event was handled and its receipt committed in the SAME unit of work as the
+    handler's local change (transactional handler completion). Receipts are created ``PROCESSED`` by
+    :class:`~app.inbox.sink.InboxSink` because completion is transactional here.
+
+    ``PENDING`` — reserved for a future, currently-disabled at-least-once *claim/lease* capability
+    (claim the event in one transaction, complete it in another). No path creates a ``PENDING``
+    receipt in this story; :meth:`~app.inbox.sink.InboxSink.mark_processed` models the transition for
+    that future capability but is never driven by a receive path here.
+    """
+
+    PENDING = "pending"
+    PROCESSED = "processed"
+
+
 class TenantAgent(Base):
     """One row per business that has a DCA agent registered. Disabled until explicitly enabled.
 
@@ -281,6 +298,61 @@ class OutboxMessage(TenantOwned, Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class InboxReceipt(TenantOwned, Base):
+    """DCA-028 — a durable, idempotent-receiver receipt for one inbound event (tenant-owned).
+
+    The inbound counterpart of the DCA-027 outbox: where the outbox makes a tenant's *outgoing*
+    intents idempotent, the inbox makes *incoming* events idempotent. One receipt records that a
+    given event — identified by its external ``(event_source, event_id)`` natural key — has been
+    handled for a business.
+
+    The guarantee is the headline acceptance criterion of this story. The receipt is staged into the
+    *caller's* session by :class:`~app.inbox.sink.InboxSink`, so it commits in the SAME transaction as
+    the handler's local change (transactional handler completion). Because
+    ``(business_id, event_source, event_id)`` is unique:
+
+    - **A replay cannot apply the local change twice.** Re-handling the same event re-stages the same
+      receipt; the unique constraint rejects it at commit, so the caller rolls back and the handler's
+      change is rolled back with it — the local effect is applied exactly once.
+    - **Failed processing can retry safely.** If the handler fails, the caller rolls back; the receipt
+      is removed along with the partial change, leaving nothing to block a clean re-run.
+
+    The external ``event_id`` is NOT re-derived (unlike the outbox's deterministic id): the natural
+    key comes from the sending system and is unique per business here, so two tenants may legitimately
+    receive the same source + id and neither constrains the other.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 row-level-security
+    policy like every other tenant data table. ``event_source`` / ``event_id`` / ``event_type`` and
+    every ``payload`` value are screened opaque (ids / row keys) by the sink before anything is
+    staged — the receipt never holds secrets or contact data.
+    """
+
+    __tablename__ = "inbox_receipts"
+    # The receipt is unique PER business on its external natural key: the same (source, id) may repeat
+    # across tenants but never within one — that is what makes a replay a constraint violation.
+    __table_args__ = (tenant_unique("event_source", "event_id", name="uq_inbox_event"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # WHERE the event came from — a controlled source code (e.g. "effortlesspromo-api"); the first
+    # half of the dedup key. Screened opaque.
+    event_source: Mapped[str] = mapped_column(String(128), index=True)
+    # The sending system's own event id — the second half of the dedup key. Screened opaque.
+    event_id: Mapped[str] = mapped_column(String(200), index=True)
+    # WHAT kind of event — an optional controlled type code (e.g. "candidate.enriched").
+    event_type: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=InboxStatus.PROCESSED.value,
+        server_default=InboxStatus.PROCESSED.value,
+        index=True,
+    )
+    # Opaque references only (ids / row keys) — guarded free of secrets/contact data before staging.
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # Set when the handler completed; populated at receive time because completion is transactional.
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class AiInvocation(TenantOwned, Base):

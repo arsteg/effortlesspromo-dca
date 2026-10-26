@@ -47,6 +47,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "ai_invocations",
         "audit_events",
         "outbox_messages",
+        "inbox_receipts",
     }
 
 
