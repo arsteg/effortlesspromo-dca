@@ -217,6 +217,7 @@ def configure_logging(
         redactor.register_secret(getattr(settings, "service_auth_token", None))
         redactor.register_secret(getattr(settings, "ai_service_token", None))
         redactor.register_secret(getattr(settings, "auth_token_signing_secret", None))
+        redactor.register_secret(getattr(settings, "platform_service_credential", None))
 
     logger = logging.getLogger(_LOGGER_NAME)
     # Drop any handler a previous configure_logging installed so handlers never accumulate.

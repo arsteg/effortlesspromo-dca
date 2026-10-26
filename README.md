@@ -40,6 +40,11 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
 - Candidate lifecycle: suggested → accepted/dismissed/expired. **Acceptance is not recipient
   consent** and places nothing into platform audiences (platform-side export is a later story,
   blocked on DCA-001 B1 — no service-to-service path into the .NET API exists).
+- Platform HTTP transport (DCA-032, `app/clients/platform_transport.py`): a hardened, generic
+  transport **mechanism** for calling the .NET platform API — single allowlisted origin, mandatory
+  scoped credential (redacted in logs), explicit timeouts, correlation ids, stable/safe error
+  mapping. **Off by default** (needs base URL + credential) and **not wired to any route**; the
+  business adapters built on it stay disabled until B1 ships. See `docs/DCA-032-*.md`.
 
 - Database sessions: a **sync** engine backs the SQLite-friendly dev/test surface; an **async**
   engine (`app/db/base.py` `make_async_engine` / `transactional_session`, dependency

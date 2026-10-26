@@ -2282,6 +2282,175 @@ def _dca_031(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-032",
+    "platform HTTP transport: success/timeout/unauthorized via a fake host; off-allowlist refused",
+)
+def _dca_032(ctx: CheckContext) -> dict:
+    """Drive the platform HTTP transport against a FAKE host (``httpx.MockTransport``, no network) and
+    show, side by side, the real transport outputs for:
+
+      1. a success                         -> SUCCESS result, exactly one call on the wire;
+      2. a 401 unauthorized                -> UNAUTHORIZED result (classified, not raised);
+      3. a timeout (connect AND read)      -> both classify identically as a stable ``timeout``;
+      4. an off-allowlist path             -> REFUSED before any I/O (the fake host is never called).
+
+    Also proves the scoped credential is sent as ``Authorization: Bearer <cred>`` yet never appears in
+    the emitted logs (central DCA-012 redaction). No real network, no AI, no paid action; read-only.
+    """
+    import io
+    import json as jsonlib
+    import logging
+
+    import httpx
+
+    from app.clients.platform_transport import (
+        PlatformEndpointNotAllowed,
+        PlatformHttpTransport,
+        PlatformTransportError,
+    )
+    from app.core.logging import configure_logging
+
+    base = "https://platform.internal/svc"
+    cred = "scoped-platform-credential-SENTINEL-xyz"  # synthetic, local-only
+
+    class FakeHost:
+        """Records every request it is asked to serve and returns a scripted response/exception.
+
+        The ``calls`` counter is the state-change probe: a refused (allowlisted) request must never
+        reach here, so the counter stays put on a denial.
+        """
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.last: httpx.Request | None = None
+            self.script: object = httpx.Response(200, json={"ok": True})
+
+        def __call__(self, request: httpx.Request) -> httpx.Response:
+            self.calls += 1
+            self.last = request
+            if isinstance(self.script, Exception):
+                raise self.script
+            assert isinstance(self.script, httpx.Response)
+            return self.script
+
+    host = FakeHost()
+
+    # Capture the dca log stream so we can grep it for the credential literal afterwards.
+    buffer = io.StringIO()
+    configure_logging(
+        type(ctx.settings)(
+            _env_file=None,  # type: ignore[call-arg]
+            environment="development",
+            database_url="sqlite+pysqlite:///:memory:",
+            platform_base_url=base,
+            platform_service_credential=cred,
+        ),
+        stream=buffer,
+    )
+
+    transport = PlatformHttpTransport(base, cred, transport=httpx.MockTransport(host))
+    out: dict = {}
+
+    print(f"\nplatform transport allowlisted to: {base}")
+    print("(fake host via httpx.MockTransport — no real network, no AI, no paid action)\n")
+
+    # 1) success
+    host.script = httpx.Response(200, json={"tenant": "A", "status": "ok"})
+    before = host.calls
+    ok = transport.request("GET", "tenants/A", correlation_id="trace-ok")
+    print(
+        f"1) GET tenants/A (host 200)        -> class={ok.response_class.value:12} "
+        f"status={ok.status_code} url={ok.url} calls={host.calls - before}"
+    )
+    out["success"] = {
+        "class": ok.response_class.value,
+        "status": ok.status_code,
+        "url": ok.url,
+        "json": ok.json,
+    }
+    sent_auth = host.last.headers.get("Authorization") if host.last else None
+    sent_cid = host.last.headers.get("X-Correlation-Id") if host.last else None
+    print(
+        f"   credential header sent          -> Authorization={sent_auth!r} "
+        f"(== 'Bearer <cred>'); X-Correlation-Id={sent_cid!r}"
+    )
+    out["credential_header_is_bearer"] = sent_auth == f"Bearer {cred}"
+    out["correlation_propagated"] = sent_cid == "trace-ok"
+
+    # 2) unauthorized (classified, not raised)
+    host.script = httpx.Response(401, json={"error": "nope"})
+    denied = transport.request("GET", "tenants/A", correlation_id="trace-401")
+    print(
+        f"2) GET tenants/A (host 401)        -> class={denied.response_class.value:12} "
+        f"status={denied.status_code} (returned, not raised)"
+    )
+    out["unauthorized"] = {"class": denied.response_class.value, "status": denied.status_code}
+
+    # 3) timeout — connect-phase AND read-phase both classify identically (stable)
+    timeout_kinds: dict[str, str] = {}
+    for label, exc in (
+        ("connect", httpx.ConnectTimeout("connect timed out")),
+        ("read", httpx.ReadTimeout("read timed out")),
+    ):
+        host.script = exc
+        try:
+            transport.request("GET", "tenants/A")
+            timeout_kinds[label] = "UNEXPECTED SUCCESS"
+        except PlatformTransportError as err:
+            timeout_kinds[label] = err.kind.value
+            leaked = cred in str(err)
+            print(
+                f"3) GET tenants/A ({label}-timeout)  -> raised {type(err).__name__} "
+                f"kind={err.kind.value!r} (credential in message? {leaked})"
+            )
+    out["timeout_kinds"] = timeout_kinds
+    out["timeout_classification_stable"] = (
+        timeout_kinds.get("connect") == timeout_kinds.get("read") == "timeout"
+    )
+
+    # 4) off-allowlist path — refused before any I/O (no state change on the wire)
+    host.script = httpx.Response(200, json={"should": "never be reached"})
+    calls_before = host.calls
+    refused = False
+    for bad in ("https://evil.example/steal", "//evil.example/x", "../../escape"):
+        try:
+            transport.request("GET", bad)
+        except PlatformEndpointNotAllowed as err:
+            refused = True
+            print(f"4) GET {bad:32} -> REFUSED ({err}) — no call reached the host")
+    out["off_allowlist_refused"] = refused
+    out["off_allowlist_calls_on_wire"] = host.calls - calls_before
+
+    transport.close()
+
+    # Credential redaction over everything the transport logged.
+    raw = buffer.getvalue()
+    logging.getLogger("dca.platform").info("explicit leaky line with %s", cred)
+    raw = buffer.getvalue()
+    lines = [jsonlib.loads(line) for line in raw.splitlines() if line.strip()]
+    present = cred in raw
+    print("\nemitted transport log lines (credential must be redacted):")
+    for line in lines[-4:]:
+        print(f"  {jsonlib.dumps(line)}")
+    print(f"\ncredential literal present in logs? {present} (expect False)")
+    out["credential_in_logs"] = present
+
+    print(
+        "\nchecks: "
+        f"success={out['success']['class'] == 'success'}  "
+        f"unauthorized={out['unauthorized']['class'] == 'unauthorized'}  "
+        f"timeout_stable={out['timeout_classification_stable']}  "
+        f"off_allowlist_refused={refused and out['off_allowlist_calls_on_wire'] == 0}  "
+        f"credential_redacted={not present}"
+    )
+    print(
+        "\n(every call stayed within the allowlisted endpoint; the credential never left a log line; "
+        "no real network, no AI, no paid action, no state changed)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

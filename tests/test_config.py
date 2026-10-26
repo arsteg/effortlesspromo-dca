@@ -141,3 +141,52 @@ def test_non_env_secret_source_passes_with_references():
         service_auth_token_secret_ref="secret/dca/svc",
     )
     validate_required(ok)  # AI disabled => no ai ref required
+
+
+# --- DCA-032: platform HTTP transport configuration ---
+
+
+def test_platform_transport_off_by_default():
+    s = _base()
+    assert s.platform_base_url is None
+    assert s.platform_transport_configured is False
+    validate_required(s)  # unconfigured => valid
+
+
+def test_platform_base_url_without_credential_is_rejected():
+    bad = _base(platform_base_url="https://platform.internal/svc")
+    assert bad.platform_transport_configured is False
+    with pytest.raises(RuntimeError, match="EFFORTLESSPROMO_DCA_PLATFORM_SERVICE_CREDENTIAL"):
+        validate_required(bad)
+
+
+def test_platform_transport_configured_passes():
+    ok = _base(
+        platform_base_url="https://platform.internal/svc",
+        platform_service_credential="scoped-cred",
+    )
+    assert ok.platform_transport_configured is True
+    validate_required(ok)  # no raise
+
+
+def test_platform_timeouts_must_be_positive():
+    with pytest.raises(RuntimeError, match="PLATFORM_.*TIMEOUT_SECONDS"):
+        validate_required(
+            _base(
+                platform_base_url="https://platform.internal/svc",
+                platform_service_credential="scoped-cred",
+                platform_connect_timeout_seconds=0,
+            )
+        )
+
+
+def test_platform_transport_non_env_secret_source_requires_reference():
+    bad = _base(
+        secret_source=SecretSource.VAULT,
+        database_url_secret_ref="secret/dca/db",
+        service_auth_token_secret_ref="secret/dca/svc",
+        platform_base_url="https://platform.internal/svc",
+        platform_service_credential="scoped-cred",
+    )
+    with pytest.raises(RuntimeError, match="PLATFORM_SERVICE_CREDENTIAL_SECRET_REF"):
+        validate_required(bad)

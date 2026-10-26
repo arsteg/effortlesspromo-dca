@@ -122,6 +122,22 @@ class Settings(BaseSettings):
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
     ai_timeout_seconds: float = 100.0  # matches the .NET caller's effective default
 
+    # --- outbound: the platform (.NET API) HTTP transport (DCA-032) — OFF by default ---
+    # The hardened transport MECHANISM for calling the platform API: single allowlisted origin,
+    # mandatory scoped credential, explicit timeouts, correlation ids, safe error mapping. It is only
+    # the transport — business adapters (suppression/CRM/entitlement/delivery) are separate and stay
+    # disabled until DCA-001 blocker B1 (a scoped service contract into the .NET API) ships. Disabled
+    # until BOTH a base URL and a scoped credential are set (fail-closed); an empty base URL => off.
+    # The credential VALUE arrives out-of-band (env/secret manager); config carries only a reference
+    # (``*_secret_ref``), never the value itself — same stance as every other DCA secret.
+    platform_base_url: str | None = None  # empty => platform transport disabled
+    platform_service_credential: str | None = None  # scoped credential VALUE (injected out-of-band)
+    platform_service_credential_secret_ref: str | None = None
+    platform_credential_header: str = "Authorization"
+    platform_credential_scheme: str = "Bearer"  # "" => send the bare credential with no scheme word
+    platform_connect_timeout_seconds: float = 5.0
+    platform_timeout_seconds: float = 30.0
+
     # --- DCA feature flag (DCA-021) — OFF by default ---
     # The platform-level master switch for the Data Concierge feature. Off => no business can start
     # work regardless of its own enablement. Enabling it is the *platform* enablement; each business
@@ -162,6 +178,16 @@ class Settings(BaseSettings):
     def ai_enabled(self) -> bool:
         """AI integration stays disabled until a base URL is explicitly configured."""
         return bool((self.ai_base_url or "").strip())
+
+    @property
+    def platform_transport_configured(self) -> bool:
+        """The platform HTTP transport is active only when BOTH a base URL and a scoped credential
+        are set. A base URL without a credential is rejected at boot (``validate_required``); unset
+        => disabled (fail-closed — no transport, so every adapter built on it stays off, B1)."""
+        return bool(
+            (self.platform_base_url or "").strip()
+            and (self.platform_service_credential or "").strip()
+        )
 
     @property
     def end_user_auth_configured(self) -> bool:
@@ -223,6 +249,23 @@ def validate_required(settings: Settings) -> None:
         raise RuntimeError(
             "AI integration is enabled (EFFORTLESSPROMO_DCA_AI_BASE_URL set) but "
             "EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN is missing"
+        )
+
+    # DCA-032: the platform HTTP transport, when its base URL is set, MUST carry a scoped credential —
+    # an allowlisted endpoint with no credential would call the platform unauthenticated. Fail-closed
+    # in every environment (a half-wired transport is never useful). Timeouts must be positive so a
+    # call is never unbounded.
+    if (settings.platform_base_url or "").strip() and not (
+        settings.platform_service_credential or ""
+    ).strip():
+        raise RuntimeError(
+            "platform transport base URL is set (EFFORTLESSPROMO_DCA_PLATFORM_BASE_URL) but "
+            "EFFORTLESSPROMO_DCA_PLATFORM_SERVICE_CREDENTIAL is missing"
+        )
+    if settings.platform_connect_timeout_seconds <= 0 or settings.platform_timeout_seconds <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_PLATFORM_CONNECT_TIMEOUT_SECONDS and "
+            "EFFORTLESSPROMO_DCA_PLATFORM_TIMEOUT_SECONDS must be positive"
         )
 
     # DCA-015: end-user token authentication. Only HS256 (symmetric) is implemented; asymmetric
@@ -322,6 +365,11 @@ def validate_required(settings: Settings) -> None:
             missing_refs.append("EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN_SECRET_REF")
         if settings.ai_enabled and not (settings.ai_service_token_secret_ref or "").strip():
             missing_refs.append("EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN_SECRET_REF")
+        if (
+            settings.platform_transport_configured
+            and not (settings.platform_service_credential_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_PLATFORM_SERVICE_CREDENTIAL_SECRET_REF")
         if (
             settings.end_user_auth_configured
             and not (settings.auth_token_signing_secret_ref or "").strip()
