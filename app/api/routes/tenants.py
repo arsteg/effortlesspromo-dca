@@ -21,8 +21,8 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_session
 from app.core.security import require_service_auth
-from app.db.models import DiscoveryRun, IcpProfile, ProspectCandidate, TenantAgent
-from app.services.discovery import DiscoveryError, run_discovery
+from app.db.models import DataMode, DiscoveryRun, IcpProfile, ProspectCandidate, TenantAgent
+from app.services.discovery import REASON_FEATURE_DISABLED, DiscoveryError, run_discovery
 
 router = APIRouter(
     prefix="/v1/tenants", tags=["tenants"], dependencies=[Depends(require_service_auth)]
@@ -42,6 +42,25 @@ class IcpBody(BaseModel):
     roles: list[str] = []
     exclusions: list[str] = []
     status: str = "active"
+
+
+class AgentConfigBody(BaseModel):
+    # dataMode is a plain string so an unsupported value (e.g. "auto_accept") yields our own clear
+    # 422 rather than a generic schema error. enabled is optional (only changed when provided).
+    dataMode: str
+    enabled: bool | None = None
+    autoAccept: bool = False  # future capability; must stay false
+
+
+def _config_view(tenant: TenantAgent) -> dict:
+    return {
+        "businessId": tenant.business_id,
+        "enabled": tenant.enabled,
+        "dataMode": tenant.data_mode,
+        "autoAccept": False,  # disabled until its later story
+        # Explicit: choosing suggestion mode never grants any sending right (the DCA has no send path).
+        "suggestionModeGrantsSend": False,
+    }
 
 
 def _tenant(session: Session, business_id: str) -> TenantAgent:
@@ -97,12 +116,43 @@ def upsert_icp(business_id: str, body: IcpBody, session: SessionDep) -> dict:
     return {"businessId": business_id, "version": icp.version, "status": icp.status}
 
 
+@router.get("/{business_id}/config")
+def get_config(business_id: str, session: SessionDep) -> dict:
+    return _config_view(_tenant(session, business_id))
+
+
+@router.put("/{business_id}/config")
+def put_config(business_id: str, body: AgentConfigBody, session: SessionDep) -> dict:
+    tenant = _tenant(session, business_id)
+    # Auto-accept is a later story and stays disabled — never settable here.
+    if body.autoAccept:
+        raise HTTPException(status_code=422, detail="auto_accept_disabled")
+    try:
+        mode = DataMode(body.dataMode)
+    except ValueError as exc:
+        # Unsupported mode (e.g. "auto_accept"): reject without touching any state.
+        raise HTTPException(status_code=422, detail="unsupported_data_mode") from exc
+    tenant.data_mode = mode.value
+    if body.enabled is not None:
+        tenant.enabled = body.enabled
+    session.commit()
+    return _config_view(tenant)
+
+
 @router.post("/{business_id}/discovery/run")
 def trigger_discovery(business_id: str, request: Request, session: SessionDep) -> dict:
     try:
-        run = run_discovery(session, request.app.state.settings, business_id)
+        run = run_discovery(
+            session,
+            request.app.state.settings,
+            business_id,
+            entitlement_client=getattr(request.app.state, "entitlement_client", None),
+        )
     except DiscoveryError as exc:
-        raise HTTPException(status_code=409, detail=exc.code) from exc
+        # Gate denials (feature off / entitlement) are 403 (not permitted); other cycle problems are
+        # 409 conflicts.
+        gated = exc.code == REASON_FEATURE_DISABLED or exc.code.startswith("entitlement_")
+        raise HTTPException(status_code=403 if gated else 409, detail=exc.code) from exc
     return {
         "runId": run.id,
         "status": run.status,

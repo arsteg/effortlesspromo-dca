@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routes import auth, health, tenants
+from app.api.routes import auth, authz, health, service_integration, tenants
 from app.core.config import Settings, get_settings, validate_required
 from app.core.errors import install_error_handling
 from app.core.logging import CorrelationIdMiddleware, configure_logging
@@ -23,7 +23,24 @@ from app.db.base import (
     make_engine,
     make_session_factory,
 )
+from app.identity import IdentityContractDisabled, build_identity_client
+from app.identity.contract import IdentityClient
+from app.identity.service_credentials import build_service_credential_verifier
 from app.identity.tokens import build_token_verifier
+from app.services.entitlement_gate import default_entitlement_client
+
+
+def _resolve_identity_client(settings: Settings) -> IdentityClient | None:
+    """The identity client for this deployment, or ``None`` when the contract is disabled.
+
+    DCA-016 resolves tenant scope through this client. Only the dev/test fake exists today; the live
+    platform adapter (B1) is unbuilt, so production has no client and tenant resolution fails closed
+    (every scoped call 403) rather than silently trusting a header.
+    """
+    try:
+        return build_identity_client(settings)
+    except IdentityContractDisabled:
+        return None
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -68,6 +85,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.async_session_factory = async_session_factory
     # DCA-015: the end-user token verifier (None when the contract is disabled — fail-closed).
     app.state.token_verifier = build_token_verifier(settings)
+    # DCA-016: the identity client used to verify membership before resolving a tenant scope
+    # (None when the contract is disabled — tenant resolution then fails closed).
+    app.state.identity_client = _resolve_identity_client(settings)
+    # DCA-020: the scoped service-credential verifier (None when disabled — fail-closed).
+    app.state.service_credential_verifier = build_service_credential_verifier(settings)
+    # DCA-023: the entitlement client used to gate chargeable operations (None when the contract is
+    # disabled — the gate then fails closed).
+    app.state.entitlement_client = default_entitlement_client(settings)
     # DCA-012: resolve/publish the per-request correlation id (reaches endpoints, handlers, logs).
     app.add_middleware(CorrelationIdMiddleware)
     # DCA-011: one standardized error envelope + correlation id for every error response.
@@ -75,4 +100,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(tenants.router)
     app.include_router(auth.router)
+    app.include_router(authz.router)
+    app.include_router(service_integration.router)
     return app

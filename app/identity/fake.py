@@ -29,6 +29,7 @@ BUSINESS_B = "00000000-0000-4000-8000-00000000000b"
 # Synthetic subjects (opaque platform user ids). Deterministic, obviously fake.
 USER_ALICE = "00000000-0000-4000-9000-0000000a11ce"
 USER_BOB = "00000000-0000-4000-9000-00000000b0b0"
+USER_CAROL = "00000000-0000-4000-9000-0000000ca201"  # ordinary business user (viewer) in A
 
 _PAST = datetime(2020, 1, 1, tzinfo=UTC)
 _FUTURE = datetime(2999, 1, 1, tzinfo=UTC)
@@ -49,9 +50,11 @@ class _Link:
     expires_at: datetime | None = None
 
 
-# Two distinct users with distinct, deterministic standings covering active / expired / revoked:
-#   Alice — active owner of A; her B link has lapsed (expired).
-#   Bob   — active admin of B; his A link was revoked.
+# Distinct users with deterministic standings covering active / expired / revoked and the admin vs
+# ordinary-user split the permission model (DCA-019) needs:
+#   Alice — active owner of A (business administrator); her B link has lapsed (expired).
+#   Bob   — active admin of B (business administrator); his A link was revoked.
+#   Carol — active viewer of A (ordinary business user): authenticated member, no admin scopes.
 _DEFAULT_LINKS: dict[str, dict[str, _Link]] = {
     USER_ALICE: {
         BUSINESS_A: _Link(roles=("owner", "campaign.admin"), expires_at=_FUTURE),
@@ -60,6 +63,9 @@ _DEFAULT_LINKS: dict[str, dict[str, _Link]] = {
     USER_BOB: {
         BUSINESS_B: _Link(roles=("admin",), expires_at=_FUTURE),
         BUSINESS_A: _Link(roles=("owner",), revoked=True),
+    },
+    USER_CAROL: {
+        BUSINESS_A: _Link(roles=("viewer",), expires_at=_FUTURE),
     },
 }
 

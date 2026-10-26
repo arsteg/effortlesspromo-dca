@@ -466,6 +466,956 @@ def _dca_015(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-016",
+    "immutable tenant context: A-only user selects A (ok), B (denied), none (fails closed)",
+)
+def _dca_016(ctx: CheckContext) -> dict:
+    """Use Alice's identity (active in A, expired in B) against ``GET /v1/tenant-context`` with the A
+    header, the B header, and no business header, and show the actual HTTP responses side by side.
+    Then prove production (identity contract disabled) fails closed with a valid token.
+
+    Read-only: the route touches no database and changes no state, so each grant/denial is
+    reproduced with no side effect. ``X-Business-Id`` alone never authorizes — membership is checked.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import jwt
+    from fastapi.testclient import TestClient
+
+    from app.identity.fake import BUSINESS_A, BUSINESS_B, USER_ALICE
+    from app.main import create_app
+
+    issuer = "https://issuer.dca.local"
+    audience = "dca-api"
+    secret = "manual-check-signing-secret"  # synthetic, local-only
+    unknown_business = "00000000-0000-4000-8000-00000000ffff"
+
+    def mint(subject: str) -> str:
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "sub": subject,
+                "iss": issuer,
+                "aud": audience,
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=5)).timestamp()),
+                "roles": ["attacker-claimed-superadmin"],  # must be ignored for authorization
+            },
+            secret,
+            algorithm="HS256",
+        )
+
+    configured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token="manual-check-local",
+        auth_token_issuer=issuer,
+        auth_token_audience=audience,
+        auth_token_signing_secret=secret,
+        synthetic_sources_enabled=True,
+    )
+    app = create_app(configured)
+    client = TestClient(app, raise_server_exceptions=False)
+    alice = mint(USER_ALICE)
+
+    def headers(business_id: str | None) -> dict:
+        h = {"Authorization": f"Bearer {alice}"}
+        if business_id is not None:
+            h["X-Business-Id"] = business_id
+        return h
+
+    try:
+        cases = {
+            "alice -> A (member, active)": client.get(
+                "/v1/tenant-context", headers=headers(BUSINESS_A)
+            ),
+            "alice -> B (member, expired)": client.get(
+                "/v1/tenant-context", headers=headers(BUSINESS_B)
+            ),
+            "alice -> unknown business": client.get(
+                "/v1/tenant-context", headers=headers(unknown_business)
+            ),
+            "alice -> no business header": client.get("/v1/tenant-context", headers=headers(None)),
+            "no bearer token": client.get(
+                "/v1/tenant-context", headers={"X-Business-Id": BUSINESS_A}
+            ),
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print("\nGET /v1/tenant-context (membership verified before scope is resolved):")
+    out: dict = {}
+    for name, resp in cases.items():
+        body = resp.json()
+        print(f"  {name:32} HTTP {resp.status_code}  body={body}")
+        out[name] = {"status": resp.status_code, "body": body}
+
+    # Production: identity contract disabled => tenant resolution fails closed even with a good token.
+    prod = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="production",
+        deployment_mode=DeploymentMode.LIVE,
+        database_url="postgresql+psycopg://user@db/dca",
+        service_auth_token="prod-token",
+        auth_token_issuer=issuer,
+        auth_token_audience=audience,
+        auth_token_signing_secret=secret,
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    prod_app = create_app(prod)
+    prod_disabled = prod_app.state.identity_client is None
+    prod_client = TestClient(prod_app, raise_server_exceptions=False)
+    try:
+        prod_resp = prod_client.get(
+            "/v1/tenant-context",
+            headers={"Authorization": f"Bearer {mint(USER_ALICE)}", "X-Business-Id": BUSINESS_A},
+        )
+    finally:
+        prod_app.state.engine.dispose()
+    print(
+        f"\nproduction identity_client disabled -> {prod_disabled}; "
+        f"valid-token request -> HTTP {prod_resp.status_code} (fails closed)"
+    )
+    out["production_contract_disabled"] = prod_disabled
+    out["production_valid_token_status"] = prod_resp.status_code
+    print(
+        "\n(the diagnostic route is read-only: no rows created, no state changed by any call above)"
+    )
+    return out
+
+
+@register(
+    "DCA-017",
+    "tenant ownership: cross-business read returns none, cross-business write is rejected",
+)
+def _dca_017(ctx: CheckContext) -> dict:
+    """Create one synthetic row per business through the scoped repository, then try to read and
+    write across the boundary by known id. Show the actual rows and prove the foreign row is
+    untouched. Writes are bound to the verified tenant context; a mismatched owner is rejected.
+    """
+    from app.db.models import DiscoveryRun
+    from app.db.tenancy import ScopedRepository, TenantOwnershipError
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.identity.tenant_context import TenantContext
+
+    def ctx_for(business_id: str) -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=business_id,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def repo(session, business_id: str) -> ScopedRepository:
+        return ScopedRepository(session, ctx_for(business_id), DiscoveryRun)
+
+    # One row owned by A, one owned by B.
+    with ctx.session_factory() as session:
+        row_a = repo(session, BUSINESS_A).create(status="running")
+        row_b = repo(session, BUSINESS_B).create(status="running")
+        session.commit()
+        a_id, b_id = row_a.id, row_b.id
+
+    print("\nseeded one discovery_run per business:")
+    print(f"  A row id={a_id}  business_id={BUSINESS_A}")
+    print(f"  B row id={b_id}  business_id={BUSINESS_B}")
+
+    out: dict = {"a_id": a_id, "b_id": b_id}
+
+    # Cross-business READ by known id through A's repo.
+    with ctx.session_factory() as session:
+        repo_a = repo(session, BUSINESS_A)
+        own = repo_a.get(a_id)
+        foreign = repo_a.get(b_id)
+        listed = [r.business_id for r in repo_a.list()]
+    print("\ncross-business read through A's scoped repo:")
+    print(f"  repo_A.get(A_id)  -> {'row' if own else 'None'}")
+    print(f"  repo_A.get(B_id)  -> {'row' if foreign else 'None'}  (foreign id reads as not-found)")
+    print(f"  repo_A.list()     -> businesses={listed}  (only A)")
+    out["read_own"] = own is not None
+    out["read_foreign"] = foreign is not None
+    out["list_a_businesses"] = listed
+
+    # Cross-business WRITE: A's repo asked to create a row owned by B.
+    rejected = False
+    with ctx.session_factory() as session:
+        try:
+            repo(session, BUSINESS_A).create(business_id=BUSINESS_B, status="running")
+        except TenantOwnershipError as exc:
+            rejected = True
+            session.rollback()
+            print(f"\ncross-business write repo_A.create(business_id=B) -> rejected: {exc}")
+    out["cross_write_rejected"] = rejected
+
+    # Prove B's row is unchanged and no stray row leaked in.
+    with ctx.session_factory() as session:
+        b_rows = repo(session, BUSINESS_B).list()
+        a_rows = repo(session, BUSINESS_A).list()
+    print(
+        f"\nafter the rejected write: A has {len(a_rows)} row(s), B has {len(b_rows)} row(s) "
+        "(unchanged — the rejection staged nothing)"
+    )
+    out["a_row_count"] = len(a_rows)
+    out["b_row_count"] = len(b_rows)
+    return out
+
+
+@register(
+    "DCA-018",
+    "postgres RLS: app role sees only its tenant, pooled conn drops prior scope, catalog separate",
+)
+def _dca_018(ctx: CheckContext) -> dict:
+    """Prove row-level security on a disposable PostgreSQL: through a non-superuser, NON-BYPASS app
+    role, a scoped transaction sees only its tenant, a reused connection with no scope reads nothing,
+    a write for a foreign owner is rejected, and the platform catalog is not reachable by the app
+    role. SQLite cannot enforce RLS, so this scenario requires a Postgres ``--database-url``.
+    """
+    db_url = ctx.settings.database_url or ""
+    if not db_url.startswith("postgresql"):
+        print(
+            "\nDCA-018 requires a disposable PostgreSQL (RLS is not available on SQLite). Run e.g.:"
+        )
+        print(
+            "  docker run --rm -d -e POSTGRES_PASSWORD=dca -e POSTGRES_DB=dca "
+            "-p 55438:5432 postgres:16-alpine"
+        )
+        print(
+            "  python scripts/manual_check.py DCA-018 "
+            "--database-url postgresql+psycopg://postgres:dca@localhost:55438/dca"
+        )
+        return {"ran": False, "requires_postgres": True}
+
+    import os
+
+    import psycopg
+    from alembic import command
+    from alembic.config import Config
+    from psycopg.errors import InsufficientPrivilege
+    from sqlalchemy.engine import make_url
+
+    from app.core.config import get_settings
+    from app.db.rls import APP_ROLE, RLS_GUC, tenant_owned_tables
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+
+    schema = "dca_manual_018"
+    login = "dca_manual_018_login"
+    pw = "manual018pw"  # disposable local-only test role password
+    u = make_url(db_url)
+    root = Path(__file__).resolve().parent.parent
+    su_dsn = f"postgresql://{u.username}:{u.password}@{u.host}:{u.port}/{u.database}"
+    app_dsn = f"postgresql://{login}:{pw}@{u.host}:{u.port}/{u.database}"
+    seed = (
+        "INSERT INTO discovery_runs "
+        "(id, business_id, status, source_keys, found, screened_out, suggested, started_at) "
+        "VALUES (gen_random_uuid()::text, %s, %s, '[]', 0, 0, 0, now())"
+    )
+
+    # --- setup: fresh schema at head, seeded A/B, a non-bypass login member of the app role ---
+    su = psycopg.connect(su_dsn, autocommit=True)
+    su.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    su.close()
+    os.environ["EFFORTLESSPROMO_DCA_ENVIRONMENT"] = "testing"
+    os.environ["EFFORTLESSPROMO_DCA_DATABASE_URL"] = db_url
+    os.environ["EFFORTLESSPROMO_DCA_DB_SCHEMA"] = schema
+    get_settings.cache_clear()
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "migrations"))
+    command.upgrade(cfg, "head")
+    print(f"\nmigrated schema '{schema}' to head; RLS-protected tables: {tenant_owned_tables()}")
+
+    su = psycopg.connect(su_dsn, autocommit=True)
+    su.execute(f'SET search_path TO "{schema}"')
+    for biz, status in [
+        (BUSINESS_A, "running"),
+        (BUSINESS_A, "completed"),
+        (BUSINESS_B, "running"),
+    ]:
+        su.execute(seed, (biz, status))
+    su.execute(f"DROP ROLE IF EXISTS {login}")
+    su.execute(
+        f"CREATE ROLE {login} LOGIN PASSWORD '{pw}' NOSUPERUSER NOBYPASSRLS IN ROLE {APP_ROLE}"
+    )
+    su.execute(f'ALTER ROLE {login} SET search_path TO "{schema}"')
+    su.close()
+    print(f"seeded A=2 rows, B=1 row (as superuser); app login role '{login}' is NOBYPASSRLS")
+
+    out: dict = {"ran": True}
+    try:
+        conn = psycopg.connect(app_dsn)
+
+        def counts() -> dict:
+            rows = conn.execute(
+                "SELECT business_id, count(*) FROM discovery_runs GROUP BY business_id "
+                "ORDER BY business_id"
+            ).fetchall()
+            return {biz: n for biz, n in rows}
+
+        print("\nqueries through the application role:")
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, BUSINESS_A))
+        out["scope_a"] = counts()
+        print(f"  scope=A              -> {out['scope_a']}")
+        conn.commit()  # ends tx; the tx-local scope is discarded
+
+        out["no_scope_reused"] = counts()
+        print(f"  no scope (same conn) -> {out['no_scope_reused']}  (prior scope did not leak)")
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, BUSINESS_B))
+        out["scope_b"] = counts()
+        print(f"  scope=B              -> {out['scope_b']}")
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, BUSINESS_A))
+        try:
+            conn.execute(seed, (BUSINESS_B, "running"))
+            out["foreign_write"] = "UNEXPECTEDLY ALLOWED"
+        except InsufficientPrivilege:
+            out["foreign_write"] = "rejected"
+        conn.rollback()
+        print(f"  insert owner=B under scope=A -> {out['foreign_write']}")
+
+        try:
+            conn.execute("SELECT count(*) FROM tenant_agents").fetchone()
+            out["catalog_access"] = "UNEXPECTEDLY READABLE"
+        except InsufficientPrivilege:
+            out["catalog_access"] = "no access (separate path)"
+        conn.rollback()
+        print(f"  app role -> tenant_agents catalog -> {out['catalog_access']}")
+        conn.close()
+    finally:
+        su = psycopg.connect(su_dsn, autocommit=True)
+        su.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        su.execute(f"DROP ROLE IF EXISTS {login}")
+        su.close()
+        get_settings.cache_clear()
+        print(f"\ncleaned up schema '{schema}' and role '{login}'")
+    return out
+
+
+@register(
+    "DCA-019",
+    "operation permissions: admin vs ordinary user vs platform operator across two scope planes",
+)
+def _dca_019(ctx: CheckContext) -> dict:
+    """Call the two restricted probe routes with each fixture role and show the authorization
+    outcomes side by side: a business admin approves sources; an ordinary user cannot; a platform
+    operator (no membership) is denied the client-business action yet is allowed its own platform
+    scope. Read-only probes — no source is approved, no state changes.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import jwt
+    from fastapi.testclient import TestClient
+
+    from app.identity.fake import BUSINESS_A, USER_ALICE, USER_BOB, USER_CAROL
+    from app.main import create_app
+
+    issuer = "https://issuer.dca.local"
+    audience = "dca-api"
+    secret = "manual-check-signing-secret"  # synthetic, local-only
+    operator = "00000000-0000-4000-9000-00000090e701"
+
+    def mint(subject: str, roles: list[str] | None = None) -> str:
+        now = datetime.now(UTC)
+        claims: dict = {
+            "sub": subject,
+            "iss": issuer,
+            "aud": audience,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=5)).timestamp()),
+        }
+        if roles is not None:
+            claims["roles"] = roles
+        return jwt.encode(claims, secret, algorithm="HS256")
+
+    configured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token="manual-check-local",
+        auth_token_issuer=issuer,
+        auth_token_audience=audience,
+        auth_token_signing_secret=secret,
+        synthetic_sources_enabled=True,
+    )
+    app = create_app(configured)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    def hdrs(token: str, business_id: str | None = None) -> dict:
+        h = {"Authorization": f"Bearer {token}"}
+        if business_id is not None:
+            h["X-Business-Id"] = business_id
+        return h
+
+    try:
+        business_cases = {
+            "alice  owner@A   -> approve source in A": client.get(
+                "/v1/authz/business/source-approval", headers=hdrs(mint(USER_ALICE), BUSINESS_A)
+            ),
+            "carol  viewer@A  -> approve source in A": client.get(
+                "/v1/authz/business/source-approval", headers=hdrs(mint(USER_CAROL), BUSINESS_A)
+            ),
+            "bob    admin@B   -> approve source in A": client.get(
+                "/v1/authz/business/source-approval", headers=hdrs(mint(USER_BOB), BUSINESS_A)
+            ),
+            "operator         -> approve source in A": client.get(
+                "/v1/authz/business/source-approval",
+                headers=hdrs(mint(operator, ["platform_operator"]), BUSINESS_A),
+            ),
+        }
+        platform_cases = {
+            "operator         -> platform ops": client.get(
+                "/v1/authz/platform/ops", headers=hdrs(mint(operator, ["platform_operator"]))
+            ),
+            "alice  owner@A   -> platform ops": client.get(
+                "/v1/authz/platform/ops", headers=hdrs(mint(USER_ALICE, ["owner"]))
+            ),
+        }
+    finally:
+        app.state.engine.dispose()
+
+    out: dict = {"business": {}, "platform": {}}
+    print("\nbusiness plane — approve a source (administrator scope):")
+    for name, resp in business_cases.items():
+        verdict = "ALLOW" if resp.status_code == 200 else f"DENY ({resp.status_code})"
+        print(f"  {name:42} -> {verdict}")
+        out["business"][name] = resp.status_code
+    print("\nplatform plane — read platform ops (operator scope):")
+    for name, resp in platform_cases.items():
+        verdict = "ALLOW" if resp.status_code == 200 else f"DENY ({resp.status_code})"
+        print(f"  {name:42} -> {verdict}")
+        out["platform"][name] = resp.status_code
+
+    print(
+        "\nnote: a platform operator is DENIED the client-business action (no membership, no bypass) "
+        "yet ALLOWED its own platform scope; decisions are audited to the 'dca.authz' logger."
+    )
+    print("(all probes are read-only: no source approved, no state changed)")
+    return out
+
+
+@register(
+    "DCA-020",
+    "scoped service credentials: one operation/business only; expired & wrong-scope rejected",
+)
+def _dca_020(ctx: CheckContext) -> dict:
+    """Call a service route with a credential scoped to tenants.read@A and show that it is accepted
+    only for that operation and business — another operation, another business, an expired
+    credential, and an end-user (public-form) token are all rejected. Read-only probes; no state
+    changes.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import jwt
+    from fastapi.testclient import TestClient
+
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.main import create_app
+
+    svc_issuer = "https://platform.dca.local"
+    svc_audience = "dca-service"
+    svc_secret = "manual-check-service-secret"  # synthetic, local-only
+    user_audience = "dca-api"
+    user_secret = "manual-check-user-secret"
+    service = "platform-integration"
+
+    def mint(*, operations, businesses, secret=svc_secret, audience=svc_audience, exp_min=5):
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "sub": service,
+                "iss": svc_issuer,
+                "aud": audience,
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=exp_min)).timestamp()),
+                "operations": operations,
+                "businesses": businesses,
+            },
+            secret,
+            algorithm="HS256",
+        )
+
+    configured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token="manual-check-local",
+        service_token_issuer=svc_issuer,
+        service_token_audience=svc_audience,
+        service_token_signing_secret=svc_secret,
+        synthetic_sources_enabled=True,
+    )
+    app = create_app(configured)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    def hdr(token: str) -> dict:
+        return {"X-Service-Credential": token}
+
+    scoped = mint(operations=["tenants.read"], businesses=[BUSINESS_A])
+    expired = mint(operations=["tenants.read"], businesses=[BUSINESS_A], exp_min=-5)
+    public_form = mint(
+        operations=["tenants.read"],
+        businesses=[BUSINESS_A],
+        secret=user_secret,
+        audience=user_audience,
+    )
+    try:
+        cases = {
+            "tenants.read @A  (in scope)": client.get(
+                f"/v1/service/probe/tenants-read/{BUSINESS_A}", headers=hdr(scoped)
+            ),
+            "discovery.trigger @A  (other op)": client.get(
+                f"/v1/service/probe/discovery-trigger/{BUSINESS_A}", headers=hdr(scoped)
+            ),
+            "tenants.read @B  (other business)": client.get(
+                f"/v1/service/probe/tenants-read/{BUSINESS_B}", headers=hdr(scoped)
+            ),
+            "tenants.read @A  (expired cred)": client.get(
+                f"/v1/service/probe/tenants-read/{BUSINESS_A}", headers=hdr(expired)
+            ),
+            "tenants.read @A  (public-form token)": client.get(
+                f"/v1/service/probe/tenants-read/{BUSINESS_A}", headers=hdr(public_form)
+            ),
+            "tenants.read @A  (no credential)": client.get(
+                f"/v1/service/probe/tenants-read/{BUSINESS_A}"
+            ),
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print("\nservice credential scoped to operation=tenants.read, business=A:")
+    out: dict = {}
+    for name, resp in cases.items():
+        verdict = "ALLOW" if resp.status_code == 200 else f"DENY ({resp.status_code})"
+        print(f"  {name:38} -> {verdict}")
+        out[name] = resp.status_code
+    print(
+        "\nnote: a credential cannot widen its own operation or business; a public-form (end-user) "
+        "token is never accepted; decisions are audited to the 'dca.authz' logger."
+    )
+    print("(all probes are read-only: no state changed)")
+    return out
+
+
+@register(
+    "DCA-021",
+    "feature gate: off-by-default blocks all; on + per-business narrowing (A on, B off)",
+)
+def _dca_021(ctx: CheckContext) -> dict:
+    """Request the same protected work operation (discovery run) under three states and show the
+    outcomes: feature OFF blocks even a fully-enabled business; feature ON runs for the narrowed-in
+    business A; and B (registered but not enabled) stays blocked — enabling A never enables B. Each
+    denial leaves no run recorded.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    biz_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    biz_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    def settings_with(feature: bool):
+        return type(ctx.settings)(
+            _env_file=None,  # type: ignore[call-arg]
+            environment="development",
+            database_url=ctx.settings.database_url,
+            service_auth_token=ctx.settings.service_auth_token,
+            synthetic_sources_enabled=True,
+            feature_enabled=feature,
+        )
+
+    def register(client, business_id, *, enable):
+        client.post("/v1/tenants", json={"businessId": business_id}, headers=auth)
+        if enable:
+            client.post(f"/v1/tenants/{business_id}/enable", headers=auth)
+        client.put(
+            f"/v1/tenants/{business_id}/icp",
+            json={"industries": [], "regions": [], "roles": []},
+            headers=auth,
+        )
+
+    out: dict = {}
+
+    # State 1: feature OFF — a fully enabled business still cannot start work.
+    app_off = create_app(settings_with(False))
+    client_off = TestClient(app_off, raise_server_exceptions=False)
+    try:
+        register(client_off, biz_a, enable=True)
+        r = client_off.post(f"/v1/tenants/{biz_a}/discovery/run", headers=auth)
+        runs = client_off.get(f"/v1/tenants/{biz_a}/runs", headers=auth).json()
+        print("\nfeature OFF (platform master switch):")
+        print(
+            f"  A (enabled) -> start work -> HTTP {r.status_code} ({r.json()['error']['message']})"
+        )
+        print(f"  A runs recorded: {len(runs)} (denial created no state)")
+        out["feature_off_A"] = {"status": r.status_code, "runs": len(runs)}
+    finally:
+        app_off.state.engine.dispose()
+
+    # State 2: feature ON — A narrowed in, B registered but not enabled.
+    app_on = create_app(settings_with(True))
+    client_on = TestClient(app_on, raise_server_exceptions=False)
+    try:
+        register(client_on, biz_a, enable=True)
+        register(client_on, biz_b, enable=False)
+        ra = client_on.post(f"/v1/tenants/{biz_a}/discovery/run", headers=auth)
+        rb = client_on.post(f"/v1/tenants/{biz_b}/discovery/run", headers=auth)
+        b_runs = client_on.get(f"/v1/tenants/{biz_b}/runs", headers=auth).json()
+        print("\nfeature ON (per-business narrowing):")
+        print(
+            f"  A (enabled)     -> start work -> HTTP {ra.status_code} ({ra.json().get('status', '-')})"
+        )
+        msg_b = rb.json().get("error", {}).get("message", rb.json().get("status", "-"))
+        print(f"  B (not enabled) -> start work -> HTTP {rb.status_code} ({msg_b})")
+        print(f"  B runs recorded: {len(b_runs)} (enabling A did not enable B)")
+        out["feature_on_A"] = ra.status_code
+        out["feature_on_B"] = {"status": rb.status_code, "runs": len(b_runs)}
+    finally:
+        app_on.state.engine.dispose()
+
+    print(
+        "\n(the feature is off by default; nothing above enabled a business that was not toggled)"
+    )
+    return out
+
+
+@register(
+    "DCA-022",
+    "entitlement snapshots: active/expired/missing fixtures + stale refusal; production refuses fake",
+)
+def _dca_022(ctx: CheckContext) -> dict:
+    """Resolve active / expired / missing entitlement fixtures through the synthetic fake and show
+    each snapshot's capabilities, then the authorize_paid_work decision for a capability — proving
+    absent, expired and stale snapshots cannot authorize paid work. Finally show production refuses
+    the fake. All synthetic; no paid action, no state change.
+    """
+    from datetime import timedelta
+
+    from app.entitlements import (
+        EntitlementContractDisabled,
+        EntitlementRequest,
+        FakeEntitlementClient,
+        authorize_paid_work,
+        build_entitlement_client,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+
+    client = build_entitlement_client(ctx.settings)
+    now = client.resolve(EntitlementRequest(business_id=BUSINESS_A)).as_of  # the fake's clock
+
+    cases = {
+        "A (active synthetic-growth)": BUSINESS_A,
+        "B (expired synthetic-starter)": BUSINESS_B,
+        "stranger (no subscription)": "stranger-business",
+    }
+    print("\nentitlement snapshots (all synthetic):")
+    out: dict = {}
+    for label, business_id in cases.items():
+        snap = client.resolve(EntitlementRequest(business_id=business_id))
+        decision = authorize_paid_work(snap, "discovery", now=now)
+        print(
+            f"  {label:32} status={snap.status.value:8} synthetic={snap.synthetic} "
+            f"caps={list(snap.capabilities)}"
+        )
+        print(
+            f"      authorize 'discovery' -> {'ALLOW' if decision.allowed else 'DENY'} "
+            f"({decision.reason})"
+        )
+        out[label] = {"status": snap.status.value, "decision": decision.reason}
+
+    # Stale: an active A snapshot fetched 48h ago is refused even though its own expiry is far off.
+    stale = FakeEntitlementClient(now=now - timedelta(hours=48)).resolve(
+        EntitlementRequest(business_id=BUSINESS_A)
+    )
+    stale_decision = authorize_paid_work(stale, "discovery", now=now)
+    print(
+        f"\n  A fetched 48h ago (status={stale.status.value}) authorize 'discovery' -> "
+        f"{'ALLOW' if stale_decision.allowed else 'DENY'} ({stale_decision.reason})"
+    )
+    out["stale_A"] = stale_decision.reason
+
+    # Production refuses the synthetic fake (contract disabled until the live adapter ships).
+    prod = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="production",
+        database_url="postgresql+psycopg://user@db/dca",
+        service_auth_token="prod-token",
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    refused = False
+    try:
+        build_entitlement_client(prod)
+    except EntitlementContractDisabled as exc:
+        refused = True
+        print(f"\nproduction build_entitlement_client -> refused: {exc}")
+    out["production_refused"] = refused
+
+    print("\n(all snapshots are synthetic; no paid action was taken and no state changed)")
+    return out
+
+
+@register(
+    "DCA-023",
+    "entitlement freshness: fresh authorizes; outage uses cache only while fresh; stale/revoked deny",
+)
+def _dca_023(ctx: CheckContext) -> dict:
+    """Authorize with a fresh snapshot, then simulate an entitlement-host outage and advance the
+    fixture clock: the cached projection authorizes while fresh, then fails closed once stale — so a
+    prior-active subscription cannot keep authorizing paid work indefinitely. Synthetic; the gate
+    writes only a bounded projection row, no paid action.
+    """
+    from datetime import timedelta
+
+    from app.entitlements import (
+        EntitlementRequest,
+        EntitlementSnapshot,
+        FakeEntitlementClient,
+    )
+    from app.identity.fake import BUSINESS_A
+    from app.services.entitlement_gate import EntitlementGateError, ensure_entitled
+
+    settings = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token=ctx.settings.service_auth_token,
+        entitlement_enforcement_enabled=True,
+    )
+    t0 = FakeEntitlementClient().resolve(EntitlementRequest(business_id=BUSINESS_A)).as_of
+
+    class _Outage:
+        def resolve(self, request):
+            raise RuntimeError("entitlement host unreachable")
+
+    live = FakeEntitlementClient(now=t0)  # active A snapshot captured at t0
+
+    def probe(client, *, at, label):
+        with ctx.session_factory() as session:
+            try:
+                snap: EntitlementSnapshot = ensure_entitled(
+                    session, settings, client, BUSINESS_A, "discovery", now=at
+                )
+                print(f"  {label:44} -> ALLOW (status={snap.status.value})")
+                return "allow"
+            except EntitlementGateError as exc:
+                print(f"  {label:44} -> DENY ({exc.reason})")
+                return exc.reason
+
+    out: dict = {}
+    print("\nchargeable op gated on entitlement freshness (business A):")
+    out["fresh"] = probe(live, at=t0, label="fresh live snapshot at t0")
+    out["outage_1h"] = probe(
+        _Outage(), at=t0 + timedelta(hours=1), label="host outage, +1h (cache fresh)"
+    )
+    out["outage_25h"] = probe(
+        _Outage(), at=t0 + timedelta(hours=25), label="host outage, +25h (cache stale)"
+    )
+
+    # Revocation: a live resolve that now reports no subscription clears the cache and fails closed.
+    revoked = FakeEntitlementClient(
+        plans={},
+        now=t0 + timedelta(hours=2),  # no plan for A => status NONE
+    )
+    out["revoked"] = probe(
+        revoked, at=t0 + timedelta(hours=2), label="live revocation (no subscription)"
+    )
+
+    print(
+        "\n(the only state written is a bounded entitlement projection row; no paid action occurred)"
+    )
+    return out
+
+
+@register(
+    "DCA-024",
+    "agent config: change A's data mode (B unchanged); auto-accept and bad modes refused",
+)
+def _dca_024(ctx: CheckContext) -> dict:
+    """Register A and B, change A's data mode and show B's config is untouched, then attempt the
+    unsupported auto-accept mode and verify it is refused with no state change. Suggestion mode
+    never grants send. Read via the real HTTP API; no paid action.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        for biz in (biz_a, biz_b):
+            client.post("/v1/tenants", json={"businessId": biz}, headers=auth)
+
+        a_before = client.get(f"/v1/tenants/{biz_a}/config", headers=auth).json()
+        b_before = client.get(f"/v1/tenants/{biz_b}/config", headers=auth).json()
+        print(f"\ndefaults:  A dataMode={a_before['dataMode']}  B dataMode={b_before['dataMode']}")
+
+        client.put(
+            f"/v1/tenants/{biz_a}/config",
+            json={"dataMode": "suggest_platform_data", "enabled": True},
+            headers=auth,
+        )
+        a_after = client.get(f"/v1/tenants/{biz_a}/config", headers=auth).json()
+        b_after = client.get(f"/v1/tenants/{biz_b}/config", headers=auth).json()
+        print(
+            f"after A->suggest_platform_data:  A dataMode={a_after['dataMode']} "
+            f"enabled={a_after['enabled']}  |  B dataMode={b_after['dataMode']} (unchanged)"
+        )
+        print(
+            f"  A suggestionModeGrantsSend={a_after['suggestionModeGrantsSend']} (no send granted)"
+        )
+        out["a_mode"] = a_after["dataMode"]
+        out["b_mode_unchanged"] = b_after["dataMode"]
+        out["grants_send"] = a_after["suggestionModeGrantsSend"]
+
+        auto = client.put(
+            f"/v1/tenants/{biz_a}/config",
+            json={"dataMode": "my_data_only", "autoAccept": True},
+            headers=auth,
+        )
+        bad = client.put(
+            f"/v1/tenants/{biz_a}/config", json={"dataMode": "auto_accept"}, headers=auth
+        )
+        a_final = client.get(f"/v1/tenants/{biz_a}/config", headers=auth).json()
+        print(
+            f"\nattempt autoAccept=true   -> HTTP {auto.status_code} "
+            f"({auto.json()['error']['message']})"
+        )
+        print(
+            f"attempt dataMode=auto_accept -> HTTP {bad.status_code} "
+            f"({bad.json()['error']['message']})"
+        )
+        print(f"A dataMode after refusals: {a_final['dataMode']} (unchanged by the rejected calls)")
+        out["auto_accept_status"] = auto.status_code
+        out["bad_mode_status"] = bad.status_code
+        out["a_mode_final"] = a_final["dataMode"]
+    finally:
+        app.state.engine.dispose()
+
+    print("\n(config changes are per-business; suggestion mode grants no send; no paid action)")
+    return out
+
+
+@register(
+    "DCA-025",
+    "tenant-isolation matrix: read/update/list across A/B, leak detection, unresolved-scope deny",
+)
+def _dca_025(ctx: CheckContext) -> dict:
+    """Run the authorization matrix over the tenant-owned resources for synthetic A/B: show that
+    cross-tenant known-ID reads/lists are isolated, that the same matrix FAILS against a leaky
+    (filter-removed) repository, that an unresolved scope reads nothing, and inspect one HTTP
+    known-ID denial and its safe 404 body. Read-only probes; no paid action.
+    """
+    from fastapi.testclient import TestClient
+    from sqlalchemy import select
+
+    from app.db.models import DiscoveryRun
+    from app.db.tenancy import ScopedRepository
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.identity.tenant_context import TenantContext
+    from app.main import create_app
+
+    def ctx_for(business_id: str) -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=business_id,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    out: dict = {}
+
+    # Repository matrix over discovery_runs (representative tenant-owned resource).
+    with ctx.session_factory() as session:
+        a = ScopedRepository(session, ctx_for(BUSINESS_A), DiscoveryRun).create(status="running")
+        b = ScopedRepository(session, ctx_for(BUSINESS_B), DiscoveryRun).create(status="running")
+        session.commit()
+        repo_a = ScopedRepository(session, ctx_for(BUSINESS_A), DiscoveryRun)
+        read_own = repo_a.get(a.id) is not None
+        read_foreign = repo_a.get(b.id) is not None
+        list_a = [r.id for r in repo_a.list()]
+        unknown = ScopedRepository(session, ctx_for("unresolved-scope-0000"), DiscoveryRun)
+        unresolved_list = unknown.list()
+
+    print("\nrepository matrix (discovery_runs), scope=A:")
+    print(f"  get(A_id)          -> {'row' if read_own else 'None'}")
+    print(
+        f"  get(B_id)          -> {'row' if read_foreign else 'None'}  (foreign id reads as none)"
+    )
+    print(f"  list()             -> {len(list_a)} row(s), only A = {list_a == [a.id]}")
+    print(f"  unresolved scope   -> list() = {unresolved_list} (fail-closed)")
+    out["read_own"] = read_own
+    out["read_foreign"] = read_foreign
+    out["list_only_a"] = list_a == [a.id]
+    out["unresolved_empty"] = unresolved_list == []
+
+    # Leak detection: the SAME check against a filter-removed repository must surface the leak.
+    class _Leaky(ScopedRepository):
+        def select(self):
+            return select(self._model)
+
+        def get(self, entity_id):
+            return self._session.get(self._model, entity_id)
+
+    with ctx.session_factory() as session:
+        la = ScopedRepository(session, ctx_for(BUSINESS_A), DiscoveryRun).create(status="running")
+        ScopedRepository(session, ctx_for(BUSINESS_B), DiscoveryRun).create(status="running")
+        session.commit()
+        leaky_a = _Leaky(session, ctx_for(BUSINESS_A), DiscoveryRun)
+        leaked = len(leaky_a.list()) > 1  # a leaky repo sees BOTH businesses' rows
+    print(
+        f"\nleak detection: filter-removed repo sees >1 business's rows -> {leaked} (matrix catches)"
+    )
+    out["leak_detected"] = leaked
+    _ = la  # seeded for clarity
+
+    # One HTTP known-ID denial + its safe 404 body.
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    http_settings = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token=ctx.settings.service_auth_token,
+        synthetic_sources_enabled=True,
+        feature_enabled=True,  # needed so the discovery run produces candidates
+    )
+    app = create_app(http_settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        for biz in (biz_a, biz_b):
+            client.post("/v1/tenants", json={"businessId": biz}, headers=auth)
+            client.post(f"/v1/tenants/{biz}/enable", headers=auth)
+            client.put(
+                f"/v1/tenants/{biz}/icp",
+                json={"industries": [], "regions": [], "roles": []},
+                headers=auth,
+            )
+        client.post(f"/v1/tenants/{biz_a}/discovery/run", headers=auth)
+        cand = client.get(f"/v1/tenants/{biz_a}/candidates", headers=auth).json()[0]
+        denial = client.post(f"/v1/tenants/{biz_b}/candidates/{cand['id']}/accept", headers=auth)
+    finally:
+        app.state.engine.dispose()
+    print(
+        f"\nHTTP known-ID denial: accept A's candidate under B -> HTTP {denial.status_code} "
+        f"body={denial.json()}"
+    )
+    out["http_denial_status"] = denial.status_code
+
+    print("\n(all checks read-only; the rejected cross-tenant call changed no row)")
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

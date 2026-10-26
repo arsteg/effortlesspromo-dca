@@ -23,6 +23,7 @@ from app.compliance.rulepacks import (
     screen,
 )
 from app.core.config import Settings
+from app.core.feature import dca_feature_enabled
 from app.db.models import (
     AcquisitionDecision,
     DiscoveryRun,
@@ -30,16 +31,27 @@ from app.db.models import (
     ProspectCandidate,
     TenantAgent,
 )
+from app.entitlements import EntitlementClient
+from app.services.entitlement_gate import (
+    EntitlementGateError,
+    default_entitlement_client,
+    ensure_entitled,
+)
 from app.sources.base import SourceAdapter
 from app.sources.synthetic_india import SyntheticIndiaRegistry
 
 
 class DiscoveryError(Exception):
-    """Raised with a stable code when a cycle cannot run (tenant disabled, no ICP, no sources)."""
+    """Raised with a stable code when a cycle cannot run (feature off, tenant disabled, no ICP,
+    no sources)."""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+# Stable reason code for the platform feature gate (mapped to 403 at the HTTP boundary).
+REASON_FEATURE_DISABLED = "dca_feature_disabled"
 
 
 def enabled_adapters(settings: Settings) -> list[SourceAdapter]:
@@ -49,7 +61,35 @@ def enabled_adapters(settings: Settings) -> list[SourceAdapter]:
     return adapters
 
 
-def run_discovery(session: Session, settings: Settings, business_id: str) -> DiscoveryRun:
+def run_discovery(
+    session: Session,
+    settings: Settings,
+    business_id: str,
+    *,
+    entitlement_client: EntitlementClient | None = None,
+    now: datetime | None = None,
+) -> DiscoveryRun:
+    # Platform gate first (DCA-021): with the feature off, NO business can start work — checked
+    # before any lookup or write, so a denial leaves no state.
+    if not dca_feature_enabled(settings):
+        raise DiscoveryError(
+            REASON_FEATURE_DISABLED, "the Data Concierge feature is disabled for this platform"
+        )
+    # Entitlement freshness gate (DCA-023): a chargeable cycle needs a fresh, active subscription.
+    # Off by default; when on, an absent/expired/stale entitlement fails closed before any work.
+    if settings.entitlement_enforcement_enabled:
+        client = (
+            entitlement_client
+            if entitlement_client is not None
+            else default_entitlement_client(settings)
+        )
+        try:
+            ensure_entitled(session, settings, client, business_id, "discovery", now=now)
+        except EntitlementGateError as exc:
+            raise DiscoveryError(
+                f"entitlement_{exc.reason}", f"entitlement check failed: {exc.reason}"
+            ) from exc
+    # Per-business narrowing: the feature being on does not enable any individual business.
     tenant = session.scalar(select(TenantAgent).where(TenantAgent.business_id == business_id))
     if tenant is None or not tenant.enabled:
         raise DiscoveryError("tenant_not_enabled", f"no enabled DCA agent for {business_id}")

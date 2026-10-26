@@ -18,6 +18,7 @@ def make_settings(**overrides) -> Settings:
         "database_url": "sqlite+pysqlite:///:memory:",
         "service_auth_token": TEST_TOKEN,
         "synthetic_sources_enabled": True,
+        "feature_enabled": True,  # DCA-021: the test profile turns the feature on (like sources)
         "worker_enabled": False,
     }
     base.update(overrides)

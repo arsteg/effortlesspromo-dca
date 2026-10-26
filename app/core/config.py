@@ -72,7 +72,20 @@ class Settings(BaseSettings):
     ai_service_token_secret_ref: str | None = None
 
     # --- inbound service auth (fail-closed, same pattern as effortlesspromo-ai) ---
+    # Coarse shared secret authenticating ANY calling service (legacy / existing /v1/tenants surface).
     service_auth_token: str | None = None
+
+    # --- inbound SCOPED service credentials (DCA-020): signed, per-operation/per-business ---
+    # A distinct credential type for platform integration requests: a JWT bound to issuer/audience/
+    # expiry plus explicit allowed operations and businesses. Deliberately NOT the end-user
+    # (public-form) token — a different audience/signing secret, so one can never stand in for the
+    # other. Only HS256; disabled (fail-closed) until issuer/audience/signing-secret are all set.
+    service_token_issuer: str | None = None
+    service_token_audience: str | None = None
+    service_token_signing_secret: str | None = None
+    service_token_signing_secret_ref: str | None = None
+    service_token_algorithm: str = "HS256"
+    service_token_leeway_seconds: int = 60
 
     # --- inbound END-USER authentication (DCA-015): validate a caller's bearer token ---
     # The service-auth gate above authenticates the calling SERVICE; this validates the end user whose
@@ -92,6 +105,21 @@ class Settings(BaseSettings):
     ai_base_url: str | None = None  # empty => AI-dependent features disabled
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
     ai_timeout_seconds: float = 100.0  # matches the .NET caller's effective default
+
+    # --- DCA feature flag (DCA-021) — OFF by default ---
+    # The platform-level master switch for the Data Concierge feature. Off => no business can start
+    # work regardless of its own enablement. Enabling it is the *platform* enablement; each business
+    # is then narrowed in by its own TenantAgent.enabled flag (business narrowing).
+    feature_enabled: bool = False
+
+    # --- entitlement enforcement (DCA-023) — OFF by default ---
+    # When on, a chargeable operation (a discovery cycle) is gated on a fresh, active subscription
+    # entitlement (DCA-022). A cached projection authorizes only while it is younger than
+    # entitlement_max_age_seconds, so a prior-active subscription cannot keep authorizing paid work
+    # indefinitely while the platform entitlement host is unreachable. Off by default (the live
+    # entitlement adapter is unbuilt; the contract stays disabled until it ships).
+    entitlement_enforcement_enabled: bool = False
+    entitlement_max_age_seconds: int = 86400  # 24h freshness bound on a cached projection
 
     # --- worker/scheduler (24/7 loop) — OFF by default ---
     worker_enabled: bool = False
@@ -129,6 +157,19 @@ class Settings(BaseSettings):
                 (self.auth_token_issuer or "").strip(),
                 (self.auth_token_audience or "").strip(),
                 (self.auth_token_signing_secret or "").strip(),
+            )
+        )
+
+    @property
+    def service_credentials_configured(self) -> bool:
+        """Scoped service-credential validation is active only when its issuer, audience AND signing
+        secret are all set. Partial configuration is rejected at boot; unset => disabled (fail-closed
+        in production)."""
+        return all(
+            (
+                (self.service_token_issuer or "").strip(),
+                (self.service_token_audience or "").strip(),
+                (self.service_token_signing_secret or "").strip(),
             )
         )
 
@@ -186,6 +227,42 @@ def validate_required(settings: Settings) -> None:
             "secret or none. missing: " + ", ".join(unset)
         )
 
+    # DCA-020: scoped service credentials. HS256 only, same stance as end-user auth.
+    if settings.service_token_algorithm.strip().upper() != "HS256":
+        raise RuntimeError(
+            f"EFFORTLESSPROMO_DCA_SERVICE_TOKEN_ALGORITHM '{settings.service_token_algorithm}' is "
+            "not supported: this build validates HS256 only"
+        )
+    svc_parts = {
+        "EFFORTLESSPROMO_DCA_SERVICE_TOKEN_ISSUER": (settings.service_token_issuer or "").strip(),
+        "EFFORTLESSPROMO_DCA_SERVICE_TOKEN_AUDIENCE": (
+            settings.service_token_audience or ""
+        ).strip(),
+        "EFFORTLESSPROMO_DCA_SERVICE_TOKEN_SIGNING_SECRET": (
+            settings.service_token_signing_secret or ""
+        ).strip(),
+    }
+    svc_set = [key for key, value in svc_parts.items() if value]
+    if svc_set and len(svc_set) != len(svc_parts):
+        unset = [key for key, value in svc_parts.items() if not value]
+        raise RuntimeError(
+            "service credentials are partially configured; set all of issuer/audience/signing "
+            "secret or none. missing: " + ", ".join(unset)
+        )
+    # Do NOT reuse public-form (end-user) tokens as service credentials: when both are configured
+    # their audiences MUST differ, so a token minted for one is never accepted by the other.
+    if (
+        settings.service_credentials_configured
+        and settings.end_user_auth_configured
+        and (settings.service_token_audience or "").strip()
+        == (settings.auth_token_audience or "").strip()
+    ):
+        raise RuntimeError(
+            "service-credential and end-user token audiences must differ "
+            "(EFFORTLESSPROMO_DCA_SERVICE_TOKEN_AUDIENCE vs EFFORTLESSPROMO_DCA_AUTH_TOKEN_AUDIENCE): "
+            "service credentials must not reuse public-form tokens"
+        )
+
     # A non-env secret source must name where each configured secret lives, or boot fails rather than
     # silently reading the value from the environment.
     if settings.secret_source is not SecretSource.ENV:
@@ -201,6 +278,11 @@ def validate_required(settings: Settings) -> None:
             and not (settings.auth_token_signing_secret_ref or "").strip()
         ):
             missing_refs.append("EFFORTLESSPROMO_DCA_AUTH_TOKEN_SIGNING_SECRET_REF")
+        if (
+            settings.service_credentials_configured
+            and not (settings.service_token_signing_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_SERVICE_TOKEN_SIGNING_SECRET_REF")
         if missing_refs:
             raise RuntimeError(
                 f"secret source '{settings.secret_source.value}' requires secret references: "

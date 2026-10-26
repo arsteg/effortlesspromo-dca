@@ -1,0 +1,87 @@
+"""DCA-019 — operation permissions: explicit scopes across two disjoint planes.
+
+Authorization here is by *explicit scope*, never a universal-admin bypass. There are two planes and
+they never overlap:
+
+- **Business plane** — scopes a subject holds *inside one business*, derived ONLY from that business's
+  membership roles (the DCA-016 verified :class:`~app.identity.tenant_context.TenantContext`). An
+  ordinary business user holds read-level scopes; approving sources/policies or changing budgets is
+  an administrator scope. A token's self-asserted roles can never grant a business scope (DCA-016).
+- **Platform plane** — scopes a platform operator holds over the *platform itself*. A platform
+  operator gets platform scopes only; it gets NO business scope for any tenant, so global operator
+  rights never authorize a client-business action. Acting *as* a client (delegated tenant support)
+  requires a separate, scoped, expiring grant — a later story — and stays disabled here.
+
+The two scope sets are disjoint, so :func:`scopes_for_business_roles` can never return a platform
+scope and :func:`scopes_for_platform_roles` can never return a business scope — crossing a plane is
+structurally impossible, not merely unchecked.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+
+
+class Scope(str, Enum):
+    """A single, explicitly-granted capability. Checks test membership in a scope set — there is no
+    wildcard and no role that implies "everything"."""
+
+    # --- business plane (granted via business membership roles only) ---
+    CANDIDATE_READ = "candidate.read"  # ordinary business user: view suggestions
+    SOURCE_APPROVE = "source.approve"  # administrator: approve a data source
+    POLICY_APPROVE = "policy.approve"  # administrator: approve a compliance policy
+    BUDGET_MANAGE = "budget.manage"  # administrator: change spend budgets
+
+    # --- platform plane (granted to platform operators only) ---
+    PLATFORM_OPS_READ = "platform.ops.read"  # operator: read platform-wide operational state
+
+
+# Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
+# that is granted the sensitive scopes, NOT a bypass of the check. Unknown roles grant nothing.
+_ADMIN_SCOPES = frozenset(
+    {Scope.CANDIDATE_READ, Scope.SOURCE_APPROVE, Scope.POLICY_APPROVE, Scope.BUDGET_MANAGE}
+)
+BUSINESS_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
+    # ordinary business users
+    "viewer": frozenset({Scope.CANDIDATE_READ}),
+    "user": frozenset({Scope.CANDIDATE_READ}),
+    "member": frozenset({Scope.CANDIDATE_READ}),
+    # business administrators
+    "admin": _ADMIN_SCOPES,
+    "owner": _ADMIN_SCOPES,
+}
+
+# The platform-operator role string and the platform scopes it grants. Kept separate from the
+# business map on purpose: membership in a business can never yield a platform scope.
+PLATFORM_OPERATOR_ROLE = "platform_operator"
+PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
+    PLATFORM_OPERATOR_ROLE: frozenset({Scope.PLATFORM_OPS_READ}),
+}
+
+_BUSINESS_SCOPES = frozenset().union(*BUSINESS_ROLE_SCOPES.values())
+_PLATFORM_SCOPES = frozenset().union(*PLATFORM_ROLE_SCOPES.values())
+assert _BUSINESS_SCOPES.isdisjoint(_PLATFORM_SCOPES), (
+    "business and platform scopes must not overlap"
+)
+
+
+def scopes_for_business_roles(roles: tuple[str, ...]) -> frozenset[Scope]:
+    """Business-plane scopes for a set of membership roles (union; unknown roles contribute none)."""
+    granted: set[Scope] = set()
+    for role in roles:
+        granted |= BUSINESS_ROLE_SCOPES.get(role, frozenset())
+    return frozenset(granted)
+
+
+def scopes_for_platform_roles(roles: tuple[str, ...]) -> frozenset[Scope]:
+    """Platform-plane scopes for a set of principal roles (union; unknown roles contribute none)."""
+    granted: set[Scope] = set()
+    for role in roles:
+        granted |= PLATFORM_ROLE_SCOPES.get(role, frozenset())
+    return frozenset(granted)
+
+
+def is_platform_operator(roles: tuple[str, ...]) -> bool:
+    """True if any role is a platform-operator role. Determined from the authenticated (signed)
+    principal, never from a bare header."""
+    return any(role in PLATFORM_ROLE_SCOPES for role in roles)

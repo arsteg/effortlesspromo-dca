@@ -21,6 +21,18 @@ from app.identity.fake import (
     IdentityContractDisabled,
     build_identity_client,
 )
+from app.identity.service_credentials import (
+    JwtServiceCredentialVerifier,
+    ServiceCredential,
+    ServiceCredentialError,
+    ServiceCredentialVerifier,
+    build_service_credential_verifier,
+)
+from app.identity.tenant_context import (
+    TenantContext,
+    TenantResolutionError,
+    resolve_tenant_context,
+)
 from app.identity.tokens import (
     AuthenticatedPrincipal,
     FakeTokenVerifier,
@@ -38,11 +50,19 @@ __all__ = [
     "IdentityContractDisabled",
     "IdentityRequest",
     "IdentityResponse",
+    "JwtServiceCredentialVerifier",
     "JwtTokenVerifier",
     "Membership",
     "MembershipStatus",
+    "ServiceCredential",
+    "ServiceCredentialError",
+    "ServiceCredentialVerifier",
+    "TenantContext",
+    "TenantResolutionError",
     "TokenValidationError",
     "TokenVerifier",
     "build_identity_client",
+    "build_service_credential_verifier",
     "build_token_verifier",
+    "resolve_tenant_context",
 ]
