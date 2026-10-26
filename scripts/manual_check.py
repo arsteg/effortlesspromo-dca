@@ -1984,6 +1984,170 @@ def _dca_029(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-030",
+    "webhook signatures: valid accepted; tampered/stale rejected; old+new keys work in overlap",
+)
+def _dca_030(ctx: CheckContext) -> dict:
+    """Prove inbound webhook transport authentication: a validly-signed, fresh body is accepted; one
+    flipped byte and a stale (replayed) timestamp are each rejected BEFORE a receiver records anything;
+    and during a key-rotation OVERLAP both the old and the new key verify. A guarded receiver verifies
+    the signature first, then records a DCA-028 inbox receipt only on success, so for synthetic
+    Business A:
+
+      1. a VALID current-key, fresh event   -> verified, then recorded (one receipt);
+      2. a TAMPERED body (one byte changed)  -> rejected (signature mismatch), no receipt;
+      3. a STALE timestamp (correctly signed, 1h old) -> rejected (replay guard), no receipt;
+      4. OLD-key and NEW-key events in the overlap -> both verified and recorded.
+
+    Shows the actual inbox rows and each rejection message, and checks the signing secret / signature
+    never appear in a rejection message. No AI/paid action, no HTTP.
+    """
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import InboxReceipt
+    from app.identity.fake import BUSINESS_A
+    from app.identity.tenant_context import TenantContext
+    from app.inbox import InboxSink
+    from app.integration import (
+        CURRENT_ENVELOPE_VERSION,
+        SignatureMismatchError,
+        StaleWebhookError,
+        WebhookAuthError,
+        WebhookKey,
+        WebhookKeyring,
+        parse_envelope,
+        sign_body,
+        verify_webhook,
+    )
+
+    now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    secret_current = (
+        "whsec_current_SENTINEL_0123456789"  # synthetic — must never appear in an error
+    )
+    secret_new = "whsec_new_SENTINEL_abcdefabcdef"
+    old_key = WebhookKey("key-2025", secret_current)
+    new_key = WebhookKey("key-2026", secret_new)
+    single = WebhookKeyring([old_key])
+    overlap = WebhookKeyring(
+        [new_key, old_key]
+    )  # new key current, old key kept through the overlap
+
+    def ctx_a() -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=BUSINESS_A,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def body_for(event_id: str) -> bytes:
+        return json.dumps(
+            {
+                "schema_version": CURRENT_ENVELOPE_VERSION,
+                "event_id": event_id,
+                "business_id": BUSINESS_A,
+                "event_type": "candidate.accepted",
+                "aggregate_version": 1,
+                "occurred_at": now.isoformat(),
+                "payload": {"candidateId": "cand-9"},
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def guarded_receive(ring: WebhookKeyring, header: str, body: bytes, *, at: datetime) -> bool:
+        """Verify the webhook signature FIRST, then parse the envelope and record a receipt."""
+        verify_webhook(keyring=ring, header=header, body=body, now=at)  # raises before any mutation
+        env = parse_envelope(json.loads(body))
+        with ctx.session_factory() as session:
+            InboxSink.for_context(session, ctx_a()).register(
+                event_source="effortlesspromo-api",
+                event_id=env.event_id,
+                event_type=env.event_type,
+                payload=env.payload,
+            )
+            session.commit()
+        return True
+
+    out: dict = {}
+    rejections: dict[str, str] = {}
+
+    def attempt(label: str, ring, header, body, expected, *, at) -> None:
+        try:
+            guarded_receive(ring, header, body, at=at)
+            rejections[label] = "NOT REJECTED!"
+        except expected as exc:
+            rejections[label] = str(exc)
+
+    # 1) valid current-key fresh event -> recorded
+    ok_body = body_for("evt-ok")
+    ok_header = sign_body(single, ok_body, timestamp=now)
+    valid_recorded = guarded_receive(single, ok_header, ok_body, at=now)
+
+    # 2) tampered body -> signature mismatch (header still signs the original body)
+    tampered = body_for("evt-tampered")
+    attempt("tampered_body", single, ok_header, tampered, SignatureMismatchError, at=now)
+
+    # 3) stale (replayed) timestamp, correctly signed -> replay guard fires
+    stale_body = body_for("evt-stale")
+    stale_header = sign_body(single, stale_body, timestamp=now - timedelta(hours=1))
+    attempt("stale_timestamp", single, stale_header, stale_body, StaleWebhookError, at=now)
+
+    # 4) rotation overlap: an OLD-key and a NEW-key event both verify
+    old_body = body_for("evt-old-key")
+    old_header = sign_body(WebhookKeyring([old_key]), old_body, timestamp=now)
+    new_body = body_for("evt-new-key")
+    new_header = sign_body(WebhookKeyring([new_key]), new_body, timestamp=now)
+    overlap_old = guarded_receive(overlap, old_header, old_body, at=now)
+    overlap_new = guarded_receive(overlap, new_header, new_body, at=now)
+
+    with ctx.session_factory() as session:
+        rows = session.scalars(select(InboxReceipt).order_by(InboxReceipt.received_at)).all()
+
+    print("\nguarded receiver (verify signature -> only then record):")
+    print(f"  1. valid current-key event   -> recorded={valid_recorded} (expected True)")
+    for label, message in rejections.items():
+        print(f"  2/3. {label:16} -> rejected: {message}")
+    print(f"  4. old-key event (overlap)   -> recorded={overlap_old}")
+    print(f"     new-key event (overlap)   -> recorded={overlap_new}")
+
+    recorded_ids = [r.event_id for r in rows]
+    print(f"\ninbox_receipts rows persisted: {len(rows)} (expected 3: valid + old-key + new-key)")
+    for r in rows:
+        print(f"  - event_id={r.event_id}")
+    print(f"recorded event ids: {recorded_ids}")
+
+    leak = any(
+        secret_current in m or secret_new in m or "SENTINEL" in m for m in rejections.values()
+    )
+    print(
+        f"\nsigning secret leak in any rejection message: {leak} "
+        f"({'LEAKED' if leak else 'clean — no secret echoed'})"
+    )
+
+    # Fail-closed: an unconfigured keyring refuses even a validly-signed body.
+    closed = False
+    try:
+        verify_webhook(keyring=None, header=ok_header, body=ok_body, now=now)
+    except WebhookAuthError as exc:
+        closed = True
+        print(f"\nunconfigured keyring -> fail-closed: {exc}")
+
+    out["valid_recorded"] = valid_recorded
+    out["rejections"] = rejections
+    out["overlap_old_recorded"] = overlap_old
+    out["overlap_new_recorded"] = overlap_new
+    out["inbox_row_count"] = len(rows)
+    out["recorded_ids"] = recorded_ids
+    out["no_secret_echo"] = not leak
+    out["unconfigured_fails_closed"] = closed
+    print("\n(rejected before any mutation; no secret echoed; no paid action)")
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

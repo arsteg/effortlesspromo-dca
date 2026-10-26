@@ -101,6 +101,22 @@ class Settings(BaseSettings):
     auth_token_algorithm: str = "HS256"
     auth_token_leeway_seconds: int = 60  # clock-skew tolerance for exp/nbf
 
+    # --- inbound webhook transport auth (DCA-030): HMAC signature + timestamp tolerance + rotation ---
+    # Authenticates the raw inbound-event bytes BEFORE the DCA-029 envelope is parsed (it does not
+    # authorize any tenant — B3). Fail-closed and OFF by default: no key configured => every webhook is
+    # refused, and no live inbound route is wired yet (this capability stays disabled until a later
+    # story mounts the transport). Secrets are VALUES injected out-of-band; config only names which key
+    # id is current/previous. A *previous* key is kept populated through a rotation OVERLAP so a message
+    # signed by either the old or the new key verifies; it is removed once every producer has moved.
+    webhook_verification_enabled: bool = False
+    webhook_signing_secret: str | None = None  # current key secret (value injected out-of-band)
+    webhook_signing_secret_ref: str | None = None
+    webhook_current_key_id: str = "current"
+    webhook_previous_signing_secret: str | None = None  # kept only during a rotation overlap
+    webhook_previous_signing_secret_ref: str | None = None
+    webhook_previous_key_id: str = "previous"
+    webhook_timestamp_tolerance_seconds: int = 300  # ±5 min replay/skew window
+
     # --- outbound: existing effortlesspromo-ai gateway (all model execution goes there) ---
     ai_base_url: str | None = None  # empty => AI-dependent features disabled
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
@@ -171,6 +187,15 @@ class Settings(BaseSettings):
                 (self.service_token_audience or "").strip(),
                 (self.service_token_signing_secret or "").strip(),
             )
+        )
+
+    @property
+    def webhook_verification_configured(self) -> bool:
+        """Inbound webhook verification is active only when it is enabled AND a current signing secret
+        is present. Enabled-but-secretless is rejected at boot; unset => disabled (fail-closed in
+        production — an empty keyring trusts nothing)."""
+        return self.webhook_verification_enabled and bool(
+            (self.webhook_signing_secret or "").strip()
         )
 
 
@@ -263,6 +288,30 @@ def validate_required(settings: Settings) -> None:
             "service credentials must not reuse public-form tokens"
         )
 
+    # DCA-030: inbound webhook verification, when enabled, must carry a current signing secret — an
+    # enabled-but-secretless gate would silently trust nothing (fail-closed) instead of doing what the
+    # operator intended. The tolerance window must be non-negative. A previous key without the feature
+    # enabled is harmless (ignored), but a configured previous secret with no current one is nonsense.
+    if (
+        settings.webhook_verification_enabled
+        and not (settings.webhook_signing_secret or "").strip()
+    ):
+        raise RuntimeError(
+            "webhook verification is enabled (EFFORTLESSPROMO_DCA_WEBHOOK_VERIFICATION_ENABLED) but "
+            "EFFORTLESSPROMO_DCA_WEBHOOK_SIGNING_SECRET is missing"
+        )
+    if settings.webhook_timestamp_tolerance_seconds < 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS must be non-negative"
+        )
+    if (settings.webhook_previous_signing_secret or "").strip() and not (
+        settings.webhook_signing_secret or ""
+    ).strip():
+        raise RuntimeError(
+            "a previous webhook signing secret is set without a current one "
+            "(EFFORTLESSPROMO_DCA_WEBHOOK_SIGNING_SECRET): a rotation overlap needs the current key"
+        )
+
     # A non-env secret source must name where each configured secret lives, or boot fails rather than
     # silently reading the value from the environment.
     if settings.secret_source is not SecretSource.ENV:
@@ -283,6 +332,17 @@ def validate_required(settings: Settings) -> None:
             and not (settings.service_token_signing_secret_ref or "").strip()
         ):
             missing_refs.append("EFFORTLESSPROMO_DCA_SERVICE_TOKEN_SIGNING_SECRET_REF")
+        if (
+            settings.webhook_verification_configured
+            and not (settings.webhook_signing_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_WEBHOOK_SIGNING_SECRET_REF")
+        if (
+            settings.webhook_verification_configured
+            and (settings.webhook_previous_signing_secret or "").strip()
+            and not (settings.webhook_previous_signing_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_WEBHOOK_PREVIOUS_SIGNING_SECRET_REF")
         if missing_refs:
             raise RuntimeError(
                 f"secret source '{settings.secret_source.value}' requires secret references: "
