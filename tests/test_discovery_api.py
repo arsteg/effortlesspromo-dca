@@ -23,19 +23,19 @@ def setup_tenant(client, business_id=BIZ, industries=None):
 def test_non_india_registration_rejected(client):
     response = client.post("/v1/tenants", json={"businessId": BIZ, "country": "US"}, headers=AUTH)
     assert response.status_code == 422
-    assert "country_not_allowed" in response.json()["detail"]
+    assert "country_not_allowed" in response.json()["error"]["message"]
 
 
 def test_discovery_blocked_until_enabled_and_icp(client):
     client.post("/v1/tenants", json={"businessId": BIZ}, headers=AUTH)
     response = client.post(f"/v1/tenants/{BIZ}/discovery/run", headers=AUTH)
     assert response.status_code == 409
-    assert response.json()["detail"] == "tenant_not_enabled"
+    assert response.json()["error"]["message"] == "tenant_not_enabled"
 
     client.post(f"/v1/tenants/{BIZ}/enable", headers=AUTH)
     response = client.post(f"/v1/tenants/{BIZ}/discovery/run", headers=AUTH)
     assert response.status_code == 409
-    assert response.json()["detail"] == "icp_missing"
+    assert response.json()["error"]["message"] == "icp_missing"
 
 
 def test_discovery_blocked_when_no_sources_enabled():
@@ -44,7 +44,7 @@ def test_discovery_blocked_when_no_sources_enabled():
         setup_tenant(client)
         response = client.post(f"/v1/tenants/{BIZ}/discovery/run", headers=AUTH)
         assert response.status_code == 409
-        assert response.json()["detail"] == "no_sources_enabled"
+        assert response.json()["error"]["message"] == "no_sources_enabled"
 
 
 def test_discovery_screens_dedupes_and_suggests(client):

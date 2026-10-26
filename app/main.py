@@ -13,6 +13,8 @@ from fastapi import FastAPI
 
 from app.api.routes import health, tenants
 from app.core.config import Settings, get_settings, validate_required
+from app.core.errors import install_error_handling
+from app.core.logging import CorrelationIdMiddleware, configure_logging
 from app.db.base import (
     Base,
     is_async_capable,
@@ -26,6 +28,10 @@ from app.db.base import (
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     validate_required(settings)
+
+    # DCA-012: structured, correlation-stamped logging with central redaction. Register this
+    # instance's secret values so their literals can never surface in a log line.
+    configure_logging(settings)
 
     database_url = settings.database_url or ""
     engine = make_engine(database_url)
@@ -59,6 +65,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = session_factory
     app.state.async_engine = async_engine
     app.state.async_session_factory = async_session_factory
+    # DCA-012: resolve/publish the per-request correlation id (reaches endpoints, handlers, logs).
+    app.add_middleware(CorrelationIdMiddleware)
+    # DCA-011: one standardized error envelope + correlation id for every error response.
+    install_error_handling(app)
     app.include_router(health.router)
     app.include_router(tenants.router)
     return app

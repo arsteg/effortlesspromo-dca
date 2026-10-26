@@ -107,6 +107,261 @@ def _dca_010(ctx: CheckContext) -> dict:
     return {"seeded": seeded, "tenant_rows": rows, "icp_count": len(icps)}
 
 
+@register("DCA-011", "standardized error envelope: validation, deliberate 404/409, and a safe 500")
+def _dca_011(ctx: CheckContext) -> dict:
+    """Show the actual error bodies for each class of failure, side by side.
+
+    Spins up an HTTP client over this run's synthetic settings, mounts a throwaway route that raises
+    an unexpected error (dev-only, never shipped), and prints the real envelopes so a human can see:
+    same shape, stable code, correlation id, and — on the 500 — no leaked exception/stack text.
+    """
+    from fastapi import APIRouter
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    app = create_app(ctx.settings)
+    boom = APIRouter()
+
+    @boom.get("/_debug/boom")
+    def _boom() -> dict:
+        raise RuntimeError("secret=TOPSECRET email=victim@example.com")
+
+    app.include_router(boom)
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    client = TestClient(app, raise_server_exceptions=False)
+
+    try:
+        cases = {
+            "validation_422": client.post("/v1/tenants", json={"country": "leak-me"}, headers=auth),
+            "not_found_404": client.post("/v1/tenants/biz-x/enable", headers=auth),
+            "unauthorized_401": client.post("/v1/tenants", json={"businessId": "b"}),
+            "unexpected_500": client.get("/_debug/boom", headers={"X-Correlation-Id": "trace-500"}),
+        }
+    finally:
+        # Release this app's own DB connection so the harness can unlink the ephemeral file (Windows).
+        app.state.engine.dispose()
+
+    out: dict = {}
+    for name, resp in cases.items():
+        body = resp.json()
+        print(f"\n{name}  (HTTP {resp.status_code})")
+        print(f"  body            : {body}")
+        print(f"  X-Correlation-Id: {resp.headers.get('X-Correlation-Id')}")
+        out[name] = {"status": resp.status_code, "body": body}
+
+    leaked = [
+        t
+        for t in ("TOPSECRET", "victim@example.com", "Traceback")
+        if t in cases["unexpected_500"].text
+    ]
+    print(
+        f"\n500 leak check    : {'LEAKED ' + str(leaked) if leaked else 'clean (no stack/PII in body)'}"
+    )
+    print(
+        f"422 value leak    : {'LEAKED' if 'leak-me' in cases['validation_422'].text else 'clean (submitted value not echoed)'}"
+    )
+    out["leak_check"] = {
+        "server_error_leaks": leaked,
+        "validation_echoes_value": "leak-me" in cases["validation_422"].text,
+    }
+    return out
+
+
+@register("DCA-012", "structured correlation logging redacts sentinel token/email/phone")
+def _dca_012(ctx: CheckContext) -> dict:
+    """Emit logs carrying sentinel secret/contact values (in the message, in structured extra, and
+    inside a request so a correlation id is attached), then show the actual JSON log lines and
+    grep them for the exact sentinels — proving none survive the central redaction policy.
+    """
+    import io
+    import json
+    import logging
+
+    from fastapi import APIRouter
+    from fastapi.testclient import TestClient
+
+    from app.core.logging import configure_logging
+    from app.main import create_app
+
+    token = "svc-tok-SENTINEL-abc123"
+    email = "a.person@synthetic-lead.example"
+    phone = "+91-98765-43210"
+
+    app = create_app(ctx.settings)
+    probe = APIRouter()
+
+    @probe.get("/_debug/log")
+    def _emit() -> dict:
+        logging.getLogger("dca.manualcheck").info(
+            "reaching lead at %s / %s", email, phone, extra={"service_auth_token": token}
+        )
+        return {"ok": True}
+
+    app.include_router(probe)
+
+    # Capture the dca log stream (registering the sentinel token as a secret) into a buffer.
+    buffer = io.StringIO()
+    configure_logging(
+        type(ctx.settings)(
+            _env_file=None,  # type: ignore[call-arg]
+            environment="development",
+            database_url="sqlite+pysqlite:///:memory:",
+            service_auth_token=token,
+        ),
+        stream=buffer,
+    )
+
+    try:
+        client = TestClient(app)
+        client.get("/_debug/log", headers={"X-Correlation-Id": "trace-dca-012"})
+        logging.getLogger("dca.manualcheck").warning(
+            "out-of-request log also scrubs token=%s", token
+        )
+    finally:
+        app.state.engine.dispose()
+
+    raw = buffer.getvalue()
+    lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    print("\nactual structured log lines:")
+    for line in lines:
+        print(f"  {json.dumps(line)}")
+
+    survivors = {s: (s in raw) for s in (token, email, phone)}
+    print("\nsentinel grep over the generated logs (expect all False):")
+    for sentinel, present in survivors.items():
+        print(f"  {sentinel!r:42} present={present}")
+    correlations = [line.get("correlationId") for line in lines]
+    print(f"\ncorrelation ids on the records: {correlations}")
+
+    return {"lines": lines, "sentinels_present": survivors, "correlation_ids": correlations}
+
+
+@register("DCA-013", "readiness fails on DB loss while liveness stays up; no credentials leaked")
+def _dca_013(ctx: CheckContext) -> dict:
+    """Show liveness vs readiness side by side, healthy then with the DB swapped out, and confirm a
+    password-bearing DSN never appears in the readiness body.
+    """
+    import os
+    import tempfile
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import create_engine
+
+    from app.core.readiness import build_readiness
+    from app.main import create_app
+
+    app = create_app(ctx.settings)  # the real ephemeral synthetic DB (reachable)
+    original_engine = app.state.engine
+    client = TestClient(app)
+
+    def snapshot(label: str) -> dict:
+        live = client.get("/health/live")
+        ready = client.get("/health/ready")
+        print(f"\n[{label}]")
+        print(f"  GET /health/live  -> {live.status_code} {live.json()}")
+        print(f"  GET /health/ready -> {ready.status_code} {ready.json()}")
+        return {
+            "live": {"status": live.status_code, "body": live.json()},
+            "ready": {"status": ready.status_code, "body": ready.json()},
+        }
+
+    try:
+        healthy = snapshot("database reachable")
+
+        # Simulate the disposable PostgreSQL being stopped: point the engine at an unopenable path.
+        missing = os.path.join(tempfile.gettempdir(), "dca-no-such-dir-xyz", "readiness.db")
+        broken = create_engine(f"sqlite:///{missing}")
+        app.state.engine = broken
+        down = snapshot("database stopped")
+    finally:
+        # Release every engine (the original holds the ephemeral file open on Windows otherwise).
+        original_engine.dispose()
+        app.state.engine.dispose()
+
+    # Prove a password-bearing DSN is never echoed: build the report straight from a secret DSN.
+    secret_pw = "SuperSecretPw"  # synthetic sentinel, not a real credential
+    secret_url = f"postgresql+psycopg://dca_user:{secret_pw}@db.internal:5432/dca"
+    secret_settings = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=secret_url,
+    )
+    report, _ = build_readiness(secret_settings, create_engine(f"sqlite:///{missing}"))
+    blob = str(report)
+    leaked = [v for v in (secret_pw, "dca_user", "db.internal", secret_url) if v in blob]
+    print(f"\nreadiness report from a secret DSN: {report}")
+    print(
+        f"credential leak check: "
+        f"{'LEAKED ' + str(leaked) if leaked else 'clean (no DSN/user/password in readiness body)'}"
+    )
+
+    return {
+        "healthy": healthy,
+        "db_down": down,
+        "liveness_stayed_up": down["live"]["status"] == 200,
+        "readiness_failed_on_db_down": down["ready"]["status"] == 503,
+        "credential_leaks": leaked,
+    }
+
+
+@register("DCA-014", "identity contract fake: two users, expired & revoked, production refuses it")
+def _dca_014(ctx: CheckContext) -> dict:
+    """Resolve valid / expired / revoked / unknown identities through the deterministic fake and show
+    the distinct responses, then prove production refuses the fake (contract disabled, B1).
+    """
+    from app.identity import (
+        FakeIdentityClient,
+        IdentityContractDisabled,
+        IdentityRequest,
+        build_identity_client,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B, USER_ALICE, USER_BOB
+
+    fake = FakeIdentityClient()
+    scenarios = {
+        "alice@A (active owner)": (USER_ALICE, BUSINESS_A),
+        "alice@B (expired)": (USER_ALICE, BUSINESS_B),
+        "bob@B (active admin)": (USER_BOB, BUSINESS_B),
+        "bob@A (revoked)": (USER_BOB, BUSINESS_A),
+        "stranger@A (no membership)": ("stranger", BUSINESS_A),
+    }
+
+    rows: dict = {}
+    print("\nidentity resolutions through the fake:")
+    for label, (subject, business_id) in scenarios.items():
+        resp = fake.resolve(IdentityRequest(subject=subject, business_id=business_id))
+        print(
+            f"  {label:30} status={resp.status.value:8} roles={list(resp.roles)} "
+            f"allowed={list(resp.allowed_businesses)} version={resp.version}"
+        )
+        rows[label] = resp.model_dump(mode="json")
+
+    # Production refusal: the contract is disabled until the live adapter ships.
+    prod_settings = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="production",
+        database_url="postgresql+psycopg://user@db/dca",
+        service_auth_token="prod-token",
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    refused = False
+    try:
+        build_identity_client(prod_settings)
+    except IdentityContractDisabled as exc:
+        refused = True
+        print(f"\nproduction build_identity_client -> refused: {exc}")
+    dev_client = build_identity_client(ctx.settings)
+    print(f"development build_identity_client -> {type(dev_client).__name__}")
+
+    return {
+        "resolutions": rows,
+        "production_refused_fake": refused,
+        "development_client": type(dev_client).__name__,
+    }
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
