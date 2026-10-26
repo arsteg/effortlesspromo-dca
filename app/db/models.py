@@ -174,6 +174,40 @@ class EntitlementProjection(Base):
     )
 
 
+class AuditEvent(TenantOwned, Base):
+    """DCA-026 — a durable, transactional audit event for a tenant-scoped mutation.
+
+    Mirrors the platform's atomic-audit rule (SEC-001/BR-122): the row is staged into the *caller's*
+    session so it commits in the SAME unit of work as the business change it describes — a failed
+    transaction leaves neither the change nor its audit entry. The :class:`~app.audit.sink.AuditSink`
+    is the only sanctioned writer; it stamps ``business_id`` (the scope) from the verified tenant
+    context and refuses any payload carrying raw secrets or contact data, so this table holds only
+    actor, scope, action, reason and OPAQUE references (ids/row keys), never personal data.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and is therefore covered by the
+    DCA-018 row-level-security policy like every other tenant data table — one tenant can never read
+    another's audit trail.
+    """
+
+    __tablename__ = "audit_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # WHO — an opaque actor id (subject/service GUID), never a name/email, plus its kind.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(
+        String(32)
+    )  # service | user | system | platform_support
+    # WHAT — a controlled action code (e.g. "candidate.accept"); never free-form user text.
+    action: Mapped[str] = mapped_column(String(128), index=True)
+    # WHY — a reason code / short server-side explanation (auditable why-allowed/blocked).
+    reason: Mapped[str] = mapped_column(Text, default="")
+    # Opaque references only: ids/row keys the event points at — guarded free of secrets/contact data.
+    references: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Trace join to the DCA-012 structured logs (nullable: writes can happen outside a request).
+    correlation_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AiInvocation(TenantOwned, Base):
     """Durable record of every effortlesspromo-ai gateway call made by this service (B2/B4)."""
 

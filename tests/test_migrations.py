@@ -32,6 +32,7 @@ DCA_TABLES = {
     "prospect_candidates",
     "acquisition_decisions",
     "ai_invocations",
+    "audit_events",
 }
 
 
@@ -138,6 +139,44 @@ def test_history_is_reproducible_on_empty_database(clean_schema):
     insp = inspect(eng)
     assert DCA_TABLES.issubset(set(insp.get_table_names(schema=clean_schema)))
     eng.dispose()
+
+
+@requires_pg
+def test_0005_creates_audit_events_on_a_preexisting_database(clean_schema):
+    """DCA-026 — the 0005 create branch (for a DB migrated before ``audit_events`` existed).
+
+    A fresh DB gets ``audit_events`` from the metadata baseline (0001) and its RLS policy from 0002,
+    so 0005 is a no-op there. To exercise 0005's real job, simulate an older DB: upgrade to head,
+    drop the table + policy, stamp history back to 0004, then upgrade to head again — 0005 must
+    recreate the table AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "audit_events" CASCADE'))  # policy drops with it
+    eng.dispose()
+
+    command.stamp(cfg, "0004_tenant_data_mode")  # pretend we predate the audit table
+    command.upgrade(cfg, "head")  # 0005 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "audit_events" in set(insp.get_table_names(schema=clean_schema))
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'audit_events' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg

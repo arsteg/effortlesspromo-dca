@@ -1416,6 +1416,130 @@ def _dca_025(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-026",
+    "transactional audit: commit one audited mutation, roll back another; refuse raw contact data",
+)
+def _dca_026(ctx: CheckContext) -> dict:
+    """Prove the audit sink is atomic with the caller's transaction and never persists raw
+    secret/contact data. For synthetic Business A: seed two candidates, then
+
+      1. COMMIT a unit of work that accepts candidate #1 AND records its audit event -> both persist;
+      2. ROLL BACK a unit of work that accepts candidate #2 AND records its audit event (a downstream
+         step fails) -> neither the status change nor the audit row survives;
+      3. attempt to audit with a RAW CONTACT reference -> refused before anything is staged.
+
+    Shows the actual candidate statuses and audit rows after each step. No AI/paid action.
+    """
+    from sqlalchemy import select
+
+    from app.audit import ActorType, AuditActor, AuditPayloadError, AuditSink
+    from app.db.models import AuditEvent, DiscoveryRun, ProspectCandidate
+    from app.identity.fake import BUSINESS_A
+    from app.identity.tenant_context import TenantContext
+
+    def ctx_a() -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=BUSINESS_A,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def seed_candidate(session, identifier: str) -> str:
+        run = DiscoveryRun(business_id=BUSINESS_A, status="completed")
+        session.add(run)
+        session.flush()
+        cand = ProspectCandidate(
+            business_id=BUSINESS_A,
+            run_id=run.id,
+            org_name="Synthetic Org",
+            org_identifier=identifier,
+            source_key="synthetic",
+            source_ref="synthetic://1",
+            trust_tier="official_registry",
+            status="suggested",
+        )
+        session.add(cand)
+        session.flush()
+        return cand.id
+
+    out: dict = {}
+
+    with ctx.session_factory() as session:
+        c1 = seed_candidate(session, "SYN-1")
+        c2 = seed_candidate(session, "SYN-2")
+        session.commit()
+
+    # 1) committed audited mutation
+    with ctx.session_factory() as session:
+        cand = session.get(ProspectCandidate, c1)
+        cand.status = "accepted"
+        AuditSink.for_context(session, ctx_a()).record(
+            action="candidate.accept", reason="ok", references={"candidateId": c1}
+        )
+        session.commit()
+
+    # 2) rolled-back audited mutation (downstream failure after staging both)
+    rolled_back = False
+    session = ctx.session_factory()
+    try:
+        cand = session.get(ProspectCandidate, c2)
+        cand.status = "accepted"
+        AuditSink.for_context(session, ctx_a()).record(
+            action="candidate.accept", reason="ok", references={"candidateId": c2}
+        )
+        raise RuntimeError("simulated downstream failure")
+    except RuntimeError:
+        session.rollback()
+        rolled_back = True
+    finally:
+        session.close()
+
+    # 3) refuse a raw-contact reference (service actor this time) — nothing staged
+    refused = False
+    refusal = ""
+    with ctx.session_factory() as session:
+        try:
+            AuditSink(
+                session,
+                business_id=BUSINESS_A,
+                actor=AuditActor("platform-api", ActorType.SERVICE),
+            ).record(action="candidate.accept", references={"ownerEmail": "founder@acme.co.in"})
+        except AuditPayloadError as exc:
+            refused = True
+            refusal = str(exc)
+        session.commit()
+
+    # Inspect the actual persisted state.
+    with ctx.session_factory() as session:
+        s1 = session.get(ProspectCandidate, c1).status
+        s2 = session.get(ProspectCandidate, c2).status
+        audits = session.scalars(select(AuditEvent).order_by(AuditEvent.created_at)).all()
+
+    print("\ncandidate statuses after the three steps:")
+    print(f"  #1 (committed)    status={s1}   (expected: accepted)")
+    print(f"  #2 (rolled back)  status={s2}  (expected: suggested — change discarded)")
+    print(
+        f"\naudit_events rows persisted: {len(audits)} (expected: 1 — only the committed mutation)"
+    )
+    for a in audits:
+        print(
+            f"  - actor={a.actor_type}:{a.actor_id}  scope={a.business_id}  "
+            f"action={a.action}  reason={a.reason}  refs={a.references}"
+        )
+    print(f"\nrolled-back unit of work: {rolled_back} (no audit row for #2)")
+    print(f"raw-contact audit refused: {refused}  ({refusal if refused else 'NOT REFUSED!'})")
+
+    out["c1_status"] = s1
+    out["c2_status"] = s2
+    out["audit_row_count"] = len(audits)
+    out["rolled_back"] = rolled_back
+    out["raw_contact_refused"] = refused
+    print("\n(atomic with the caller's transaction; opaque references only; no paid action)")
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
