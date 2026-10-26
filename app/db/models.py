@@ -50,7 +50,9 @@ class TenantAgent(Base):
     country: Mapped[str] = mapped_column(String(2), default="IN")
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
 
 
 class IcpProfile(Base):
@@ -61,13 +63,15 @@ class IcpProfile(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     business_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     industries: Mapped[list] = mapped_column(JSON, default=list)
-    regions: Mapped[list] = mapped_column(JSON, default=list)         # states/cities within India
-    roles: Mapped[list] = mapped_column(JSON, default=list)           # roles sought, e.g. "owner"
+    regions: Mapped[list] = mapped_column(JSON, default=list)  # states/cities within India
+    roles: Mapped[list] = mapped_column(JSON, default=list)  # roles sought, e.g. "owner"
     exclusions: Mapped[list] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(16), default="active")  # active | paused
     version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now, onupdate=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
 
 
 class DiscoveryRun(Base):
@@ -97,11 +101,11 @@ class ProspectCandidate(Base):
     business_id: Mapped[str] = mapped_column(String(36), index=True)
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("discovery_runs.id"))
     org_name: Mapped[str] = mapped_column(String(300))
-    org_identifier: Mapped[str] = mapped_column(String(64))   # CIN / GSTIN / registry ref
+    org_identifier: Mapped[str] = mapped_column(String(64))  # CIN / GSTIN / registry ref
     contact: Mapped[dict] = mapped_column(JSON, default=dict)  # {kind, email?, phone?, role?}
     source_key: Mapped[str] = mapped_column(String(64))
-    source_ref: Mapped[str] = mapped_column(String(500))       # registry URL / record locator
-    trust_tier: Mapped[str] = mapped_column(String(32))        # official_registry | public_web | …
+    source_ref: Mapped[str] = mapped_column(String(500))  # registry URL / record locator
+    trust_tier: Mapped[str] = mapped_column(String(32))  # official_registry | public_web | …
     match_score: Mapped[float] = mapped_column(Float, default=0.0)
     rationale: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="suggested", index=True)
@@ -118,8 +122,8 @@ class AcquisitionDecision(Base):
     run_id: Mapped[str] = mapped_column(String(36), ForeignKey("discovery_runs.id"), index=True)
     business_id: Mapped[str] = mapped_column(String(36), index=True)
     org_identifier: Mapped[str] = mapped_column(String(64))
-    decision: Mapped[str] = mapped_column(String(32))          # suggested | screened_out
-    reason_code: Mapped[str] = mapped_column(String(64))       # ok | source_tier_disallowed | …
+    decision: Mapped[str] = mapped_column(String(32))  # suggested | screened_out
+    reason_code: Mapped[str] = mapped_column(String(64))  # ok | source_tier_disallowed | …
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -131,11 +135,13 @@ class AiInvocation(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     business_id: Mapped[str] = mapped_column(String(36), index=True)
-    job_id: Mapped[str] = mapped_column(String(64))            # "dca:<id>" — DCA-owned namespace
-    request_id: Mapped[str] = mapped_column(String(64))        # X-Request-Id (deterministic)
+    job_id: Mapped[str] = mapped_column(String(64))  # "dca:<id>" — DCA-owned namespace
+    request_id: Mapped[str] = mapped_column(String(64))  # X-Request-Id (deterministic)
     capability: Mapped[str] = mapped_column(String(64))
     dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
-    status: Mapped[str] = mapped_column(String(16), default="pending")  # pending|completed|failed|unavailable
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending"
+    )  # pending|completed|failed|unavailable
     response_status: Mapped[str | None] = mapped_column(String(16), default=None)
     cost_amount: Mapped[float] = mapped_column(Float, default=0.0)
     cost_currency: Mapped[str] = mapped_column(String(8), default="USD")

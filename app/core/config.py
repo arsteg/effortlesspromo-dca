@@ -8,60 +8,166 @@ Contract notes (see docs/DCA-001-integration-contracts.md):
   authorization (B3) — this service is responsible for only ever asserting business IDs it has
   itself authorized, and for never exposing an endpoint that lets one tenant act as another.
 - AI-side idempotency is in-memory (B4) — this service keeps its own durable AiInvocation rows.
+
+Secrets are NEVER ordinary configuration (SEC-007 / BR-125, same stance as effortlesspromo-ai):
+the *values* arrive out-of-band (env var, injected file, or a secret manager named by the
+``*_secret_ref`` fields below). Config only ever carries a *reference* to where a secret lives,
+never the secret itself in code. **No model-provider API key exists here at all** — all model
+execution is delegated to effortlesspromo-ai, which owns the only provider keys (ADR-0004 / DCA
+boundary).
 """
 
 from __future__ import annotations
 
+from enum import Enum
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class DeploymentMode(str, Enum):
+    """How this instance is wired to the outside world.
+
+    ``FAKE`` is the safe local/demo profile: synthetic fixtures, stubbable AI, throwaway DB — nothing
+    real can leave the box. ``LIVE`` is the real profile: real DB, real inbound auth, and (if AI is
+    configured) a real AI service token. Production MUST be ``LIVE`` — fake mode is rejected at boot.
+    """
+
+    FAKE = "fake"
+    LIVE = "live"
+
+
+class SecretSource(str, Enum):
+    """Where secret *values* are sourced from. The config only ever holds a reference, never a value.
+
+    ``ENV`` — secrets injected as environment variables / local .env (dev default).
+    ``AWS_SECRETS_MANAGER`` / ``VAULT`` — secrets resolved out-of-band from the named ``*_secret_ref``.
+    No secret manager client is wired yet; selecting a non-env source requires the matching refs so a
+    misconfiguration fails at boot rather than silently falling back to env (a later story adds the
+    resolver — see README deferrals).
+    """
+
+    ENV = "env"
+    AWS_SECRETS_MANAGER = "aws_secrets_manager"
+    VAULT = "vault"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="EFFORTLESSPROMO_DCA_", env_file=".env")
 
     # --- required (validate_required fails the boot when missing) ---
-    environment: str | None = None          # development | testing | production
-    database_url: str | None = None         # the DCA-owned database; never the platform DB (ADR-0005)
+    environment: str | None = None  # development | testing | production
+    deployment_mode: DeploymentMode = (
+        DeploymentMode.FAKE
+    )  # production rejects FAKE (see validate_required)
+
+    # --- the DCA-owned datastore (its own database + schema; never the platform DB, ADR-0005) ---
+    database_url: str | None = None  # required; the DCA-owned database
+    db_schema: str = "dca"  # logical schema namespace within the DCA database
+
+    # --- secret handling (values are out-of-band; config carries references only, never values) ---
+    secret_source: SecretSource = SecretSource.ENV
+    database_url_secret_ref: str | None = None  # e.g. an AWS Secrets Manager ARN / Vault path
+    service_auth_token_secret_ref: str | None = None
+    ai_service_token_secret_ref: str | None = None
 
     # --- inbound service auth (fail-closed, same pattern as effortlesspromo-ai) ---
     service_auth_token: str | None = None
 
     # --- outbound: existing effortlesspromo-ai gateway (all model execution goes there) ---
-    ai_base_url: str | None = None          # empty => AI-dependent features disabled
-    ai_service_token: str | None = None     # must equal the AI service's service_auth_token
-    ai_timeout_seconds: float = 100.0       # matches the .NET caller's effective default
+    ai_base_url: str | None = None  # empty => AI-dependent features disabled
+    ai_service_token: str | None = None  # must equal the AI service's service_auth_token
+    ai_timeout_seconds: float = 100.0  # matches the .NET caller's effective default
 
     # --- worker/scheduler (24/7 loop) — OFF by default ---
     worker_enabled: bool = False
     worker_interval_seconds: int = 3600
 
     # --- sources — nothing fetches anything until explicitly enabled ---
-    synthetic_sources_enabled: bool = False  # local synthetic fixtures only; no live source exists yet
+    synthetic_sources_enabled: bool = (
+        False  # local synthetic fixtures only; no live source exists yet
+    )
 
     # --- scope guards ---
-    allowed_countries: list[str] = ["IN"]    # India-only build (DCA story boundary)
+    allowed_countries: list[str] = ["IN"]  # India-only build (DCA story boundary)
     candidate_ttl_days: int = 30
 
     # --- schema management (no Alembic yet; see README) ---
-    auto_create_schema: bool = True          # dev/test convenience; set false once migrations exist
+    auto_create_schema: bool = True  # dev/test convenience; set false once migrations exist
+
+    # --- derived helpers (not config; convenience for the rest of the app) ---
+    @property
+    def is_production(self) -> bool:
+        return (self.environment or "").strip().lower() == "production"
+
+    @property
+    def ai_enabled(self) -> bool:
+        """AI integration stays disabled until a base URL is explicitly configured."""
+        return bool((self.ai_base_url or "").strip())
 
 
 REQUIRED_KEYS = ("environment", "database_url")
 
 
 def validate_required(settings: Settings) -> None:
+    """Fail fast on unsafe configuration, naming the offending key only (never leaking any value)."""
     missing = [key for key in REQUIRED_KEYS if not getattr(settings, key)]
     if missing:
         raise RuntimeError(
             "missing required configuration: "
             + ", ".join(f"EFFORTLESSPROMO_DCA_{key.upper()}" for key in missing)
         )
+
     for country in settings.allowed_countries:
         if country != "IN":
             raise RuntimeError(
                 f"country '{country}' is not supported: this build is India-only (DCA boundary)"
             )
+
+    # AI integration, when enabled, must carry its service token — else every gateway call 401s
+    # fail-closed. This holds in every environment (a half-wired AI client is never useful).
+    if settings.ai_enabled and not (settings.ai_service_token or "").strip():
+        raise RuntimeError(
+            "AI integration is enabled (EFFORTLESSPROMO_DCA_AI_BASE_URL set) but "
+            "EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN is missing"
+        )
+
+    # A non-env secret source must name where each configured secret lives, or boot fails rather than
+    # silently reading the value from the environment.
+    if settings.secret_source is not SecretSource.ENV:
+        missing_refs: list[str] = []
+        if not (settings.database_url_secret_ref or "").strip():
+            missing_refs.append("EFFORTLESSPROMO_DCA_DATABASE_URL_SECRET_REF")
+        if not (settings.service_auth_token_secret_ref or "").strip():
+            missing_refs.append("EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN_SECRET_REF")
+        if settings.ai_enabled and not (settings.ai_service_token_secret_ref or "").strip():
+            missing_refs.append("EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN_SECRET_REF")
+        if missing_refs:
+            raise RuntimeError(
+                f"secret source '{settings.secret_source.value}' requires secret references: "
+                + ", ".join(missing_refs)
+            )
+
+    if settings.is_production:
+        _validate_production(settings)
+
+
+def _validate_production(settings: Settings) -> None:
+    """Production refuses fake mode and every demo/fail-open default — names only, no values."""
+    if settings.deployment_mode is DeploymentMode.FAKE:
+        raise RuntimeError(
+            "production rejects fake deployment mode: set EFFORTLESSPROMO_DCA_DEPLOYMENT_MODE=live"
+        )
+    problems: list[str] = []
+    if not (settings.service_auth_token or "").strip():
+        # fail-open inbound auth is never acceptable in production
+        problems.append("EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN")
+    if settings.synthetic_sources_enabled:
+        problems.append("EFFORTLESSPROMO_DCA_SYNTHETIC_SOURCES_ENABLED must be false in production")
+    if settings.auto_create_schema:
+        problems.append("EFFORTLESSPROMO_DCA_AUTO_CREATE_SCHEMA must be false in production")
+    if problems:
+        raise RuntimeError("invalid production configuration: " + ", ".join(problems))
 
 
 @lru_cache

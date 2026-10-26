@@ -17,7 +17,9 @@ import hmac
 from fastapi import Header, HTTPException, Request
 
 
-def require_service_auth(request: Request, x_service_auth: str | None = Header(default=None)) -> None:
+def require_service_auth(
+    request: Request, x_service_auth: str | None = Header(default=None)
+) -> None:
     expected = request.app.state.settings.service_auth_token
     if not expected:
         raise HTTPException(status_code=401, detail="service auth not configured")

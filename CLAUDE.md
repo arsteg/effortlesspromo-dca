@@ -7,7 +7,11 @@ anything to another app — it records the real contracts and the open blockers 
 ## Build & test
 - `pip install -r requirements-dev.txt` · `pytest` (in-memory SQLite, no network, no Docker).
 - Run: `uvicorn app.asgi:app --reload --port 8100`. Env prefix `EFFORTLESSPROMO_DCA_` (see `.env.example`).
-- `ruff check` manually (line-length 100, same as effortlesspromo-ai).
+- Dev seed: `effortlesspromo-dca seed` (`app/db/seed.py`) — idempotent synthetic Business A/B; refuses in production.
+- Manual-check: `python scripts/manual_check.py <STORY-ID>` (`scripts/manual_check.py`) — per-story inspectable scenario, local synthetic only, refuses production, scoped cleanup. Register new scenarios with `@register`.
+- Quality gate (all config in `pyproject.toml`, all nonzero-on-failure):
+  `ruff check .` (lint) · `ruff format --check .` (format) · `mypy` (types, scans `app/`) · `pytest`.
+  line-length 100, same as effortlesspromo-ai.
 
 ## Hard boundaries (violations fail review)
 - All model execution via the existing effortlesspromo-ai gateway over HTTP (`app/clients/ai_client.py`

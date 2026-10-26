@@ -1,6 +1,12 @@
 import pytest
 
-from app.core.config import Settings, validate_required
+from app.core.config import DeploymentMode, SecretSource, Settings, validate_required
+
+
+def _base(**overrides) -> Settings:
+    base = {"_env_file": None, "environment": "testing", "database_url": "sqlite://"}
+    base.update(overrides)
+    return Settings(**base)
 
 
 def test_missing_required_fails_fast():
@@ -12,7 +18,10 @@ def test_missing_required_fails_fast():
 
 def test_india_only_boundary_enforced():
     bad = Settings(
-        _env_file=None, environment="testing", database_url="sqlite://", allowed_countries=["IN", "US"]
+        _env_file=None,
+        environment="testing",
+        database_url="sqlite://",
+        allowed_countries=["IN", "US"],
     )
     with pytest.raises(RuntimeError, match="India-only"):
         validate_required(bad)
@@ -23,3 +32,112 @@ def test_risky_features_default_off():
     assert s.worker_enabled is False
     assert s.synthetic_sources_enabled is False
     assert s.service_auth_token is None  # fail-closed: no token => 401 everywhere privileged
+    assert s.deployment_mode is DeploymentMode.FAKE  # safe default; prod must opt into LIVE
+    assert s.secret_source is SecretSource.ENV
+    assert s.ai_enabled is False  # integrations disabled until explicitly configured
+
+
+# --- DCA-004: no model-provider keys live here (they belong only to effortlesspromo-ai) ---
+
+
+def test_no_provider_api_keys_in_settings():
+    names = set(Settings.model_fields)
+    assert not any("api_key" in n or "openai" in n or "anthropic" in n for n in names), names
+
+
+# --- DCA-004: production rejects fake mode ---
+
+
+def test_production_rejects_fake_deployment_mode():
+    bad = _base(
+        environment="production",
+        deployment_mode=DeploymentMode.FAKE,
+        service_auth_token="real",
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    with pytest.raises(RuntimeError, match="production rejects fake deployment mode"):
+        validate_required(bad)
+
+
+def test_production_live_mode_passes_when_hardened():
+    ok = _base(
+        environment="production",
+        deployment_mode=DeploymentMode.LIVE,
+        service_auth_token="real",
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    validate_required(ok)  # no raise
+
+
+def test_production_rejects_failopen_and_demo_defaults():
+    # names only, never the value
+    with pytest.raises(RuntimeError, match="EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN"):
+        validate_required(
+            _base(
+                environment="production",
+                deployment_mode=DeploymentMode.LIVE,
+                synthetic_sources_enabled=False,
+                auto_create_schema=False,
+            )
+        )
+    with pytest.raises(RuntimeError, match="SYNTHETIC_SOURCES_ENABLED"):
+        validate_required(
+            _base(
+                environment="production",
+                deployment_mode=DeploymentMode.LIVE,
+                service_auth_token="real",
+                synthetic_sources_enabled=True,
+                auto_create_schema=False,
+            )
+        )
+    with pytest.raises(RuntimeError, match="AUTO_CREATE_SCHEMA"):
+        validate_required(
+            _base(
+                environment="production",
+                deployment_mode=DeploymentMode.LIVE,
+                service_auth_token="real",
+                synthetic_sources_enabled=False,
+                auto_create_schema=True,
+            )
+        )
+
+
+# --- DCA-004: AI integration references ---
+
+
+def test_disabled_ai_integration_needs_no_token():
+    # no base url => AI disabled => no credential required, valid config
+    s = _base()
+    assert s.ai_enabled is False
+    validate_required(s)  # no raise
+
+
+def test_enabled_ai_without_service_token_is_rejected():
+    bad = _base(ai_base_url="http://ai.internal:8000")
+    assert bad.ai_enabled is True
+    with pytest.raises(RuntimeError, match="EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN"):
+        validate_required(bad)
+
+
+def test_enabled_ai_with_service_token_passes():
+    validate_required(_base(ai_base_url="http://ai.internal:8000", ai_service_token="shared"))
+
+
+# --- DCA-004: secret references ---
+
+
+def test_non_env_secret_source_requires_references():
+    bad = _base(secret_source=SecretSource.AWS_SECRETS_MANAGER)
+    with pytest.raises(RuntimeError, match="DATABASE_URL_SECRET_REF"):
+        validate_required(bad)
+
+
+def test_non_env_secret_source_passes_with_references():
+    ok = _base(
+        secret_source=SecretSource.VAULT,
+        database_url_secret_ref="secret/dca/db",
+        service_auth_token_secret_ref="secret/dca/svc",
+    )
+    validate_required(ok)  # AI disabled => no ai ref required

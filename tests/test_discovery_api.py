@@ -11,7 +11,10 @@ OTHER = "22222222-2222-2222-2222-222222222222"
 
 
 def setup_tenant(client, business_id=BIZ, industries=None):
-    assert client.post("/v1/tenants", json={"businessId": business_id}, headers=AUTH).status_code == 201
+    assert (
+        client.post("/v1/tenants", json={"businessId": business_id}, headers=AUTH).status_code
+        == 201
+    )
     assert client.post(f"/v1/tenants/{business_id}/enable", headers=AUTH).status_code == 200
     body = {"industries": industries or [], "regions": [], "roles": []}
     assert client.put(f"/v1/tenants/{business_id}/icp", json=body, headers=AUTH).status_code == 200
@@ -86,7 +89,9 @@ def test_accept_and_dismiss_lifecycle(client):
 
     # Double-accept conflicts; dismiss after accept is allowed.
     assert (
-        client.post(f"/v1/tenants/{BIZ}/candidates/{candidate['id']}/accept", headers=AUTH).status_code
+        client.post(
+            f"/v1/tenants/{BIZ}/candidates/{candidate['id']}/accept", headers=AUTH
+        ).status_code
         == 409
     )
     assert (

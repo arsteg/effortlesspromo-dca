@@ -134,9 +134,7 @@ def list_runs(business_id: str, session: SessionDep) -> list[dict]:
 
 
 @router.get("/{business_id}/candidates")
-def list_candidates(
-    business_id: str, session: SessionDep, status: str | None = None
-) -> list[dict]:
+def list_candidates(business_id: str, session: SessionDep, status: str | None = None) -> list[dict]:
     query = select(ProspectCandidate).where(ProspectCandidate.business_id == business_id)
     if status:
         query = query.where(ProspectCandidate.status == status)

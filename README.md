@@ -11,7 +11,14 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
 ## What exists (foundation increment)
 
 - FastAPI app (`app/main.py` factory, `app/asgi.py` entrypoint), fail-fast config
-  (`EFFORTLESSPROMO_DCA_*`, see `.env.example`).
+  (`EFFORTLESSPROMO_DCA_*`, see `.env.example`). Typed runtime settings cover environment,
+  the DCA-owned database + `db_schema`, `deployment_mode` (`fake` default | `live`),
+  `secret_source` (+ `*_secret_ref` references — values stay out-of-band), and the
+  effortlesspromo-ai base URL / token references. **Production rejects `fake` mode** and every
+  fail-open default (missing inbound token, synthetic sources on, `auto_create_schema` on);
+  AI, when its base URL is set, requires its service token. **No model-provider API key exists
+  here** — those belong only to effortlesspromo-ai. Validation errors name the offending key only,
+  never a value.
 - Inbound auth: `X-Service-Auth` shared secret, fail-closed (401 when unconfigured) —
   authenticates the calling *service* only; tenant authority is the platform's job (DCA-001 B3).
 - Own schema (SQLAlchemy 2): `tenant_agents`, `icp_profiles`, `discovery_runs`,
@@ -33,6 +40,23 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
   consent** and places nothing into platform audiences (platform-side export is a later story,
   blocked on DCA-001 B1 — no service-to-service path into the .NET API exists).
 
+- Database sessions: a **sync** engine backs the SQLite-friendly dev/test surface; an **async**
+  engine (`app/db/base.py` `make_async_engine` / `transactional_session`, dependency
+  `app/api/deps.py:get_async_session`) provides one session per request/task with an explicit
+  transaction scope for the DCA-owned PostgreSQL — commit on success, rollback **before** the
+  connection returns to the pool. Async is wired only for `postgresql*` URLs (reusing the `postgres`
+  extra's psycopg3 driver); on SQLite the async dependency is fail-closed (503). The async
+  transaction/isolation tests run against a disposable Postgres, never SQLite:
+
+  ```bash
+  pip install .[postgres]
+  docker run --rm -d --name dca-pg -e POSTGRES_PASSWORD=dca -e POSTGRES_DB=dca -p 55432:5432 postgres:16-alpine
+  DCA_TEST_DATABASE_URL="postgresql+psycopg://postgres:dca@localhost:55432/dca" pytest tests/test_async_session.py
+  ```
+
+  (On Windows, psycopg3 async needs the selector event loop — the test module sets it; the Linux
+  deployment is unaffected.)
+
 ## Run
 
 ```bash
@@ -45,14 +69,85 @@ effortlesspromo-dca                      # console entry point (after pip instal
 `requirements.lock` pins the full transitive runtime set (generated from a clean `pip install .`;
 regenerate with `pip freeze` in a fresh venv when bumping dependencies).
 
+### Quality commands
+
+The dev extra (`pip install -r requirements-dev.txt`, or `pip install .[dev]`) installs the full
+quality gate. Each command exits **nonzero on failure** (CI-ready); config lives in `pyproject.toml`.
+
+```bash
+ruff check .            # lint
+ruff format --check .   # formatting gate (drop --check to auto-format)
+mypy                    # type check (configured to scan the app/ package)
+pytest                  # tests (in-memory SQLite, no network, no Docker)
+```
+
+Run all four in sequence before pushing:
+
+```bash
+ruff check . && ruff format --check . && mypy && pytest
+```
+
 Minimum env: `EFFORTLESSPROMO_DCA_ENVIRONMENT`, `EFFORTLESSPROMO_DCA_DATABASE_URL`,
 `EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN` (else every privileged call 401s).
 PostgreSQL: `pip install .[postgres]` and use `postgresql+psycopg://...`.
 
+### Migrations (Alembic)
+
+Alembic is configured against the **DCA-owned schema only** (`EFFORTLESSPROMO_DCA_DB_SCHEMA`,
+default `dca`). `migrations/env.py` resolves the DB URL + schema from DCA settings (never from
+`alembic.ini`) and refuses to migrate into a host-owned schema (`app/db/schema_guard.py` —
+PostgreSQL system schemas, `public`, and platform names are rejected). Everything, including
+`alembic_version`, lives in the DCA schema (the connection `search_path` is pinned to it).
+
+```bash
+pip install .[postgres]
+EFFORTLESSPROMO_DCA_DATABASE_URL="postgresql+psycopg://…" alembic upgrade head
+```
+
+Production must run `alembic upgrade head` and set `EFFORTLESSPROMO_DCA_AUTO_CREATE_SCHEMA=false`
+(the `auto_create_schema` metadata path remains for SQLite dev/test only).
+
+### Seed test data (development only)
+
+`effortlesspromo-dca seed` (or `python -m app.cli seed`) idempotently seeds two isolated synthetic
+test businesses — **A** (`…00000000000a`) and **B** (`…00000000000b`) — each a `TenantAgent` plus a
+synthetic `IcpProfile`. All data is fake (deterministic GUIDs, synthetic operator labels, synthetic
+org identifiers `SYNTH-A/B-*`); **no real contacts or credentials**. Re-running is idempotent (row
+counts and ids stay stable). The command **refuses under production** (`EFFORTLESSPROMO_DCA_ENVIRONMENT=production` → exit 1, no writes).
+
+```bash
+EFFORTLESSPROMO_DCA_ENVIRONMENT=development \
+EFFORTLESSPROMO_DCA_DATABASE_URL="postgresql+psycopg://…" \
+effortlesspromo-dca seed        # run twice → identical rows; config is the only input
+```
+
+### Manual-check runner (developer-controlled)
+
+`python scripts/manual_check.py <STORY-ID>` runs one story's narrow, inspectable scenario against
+**local synthetic resources only**, printing real state (rows/decisions) for a human to eyeball. It
+is not a test runner and never marks approval.
+
+- `--list` shows registered scenarios; an unknown id exits nonzero with the known list.
+- Default datastore is an ephemeral synthetic SQLite file, **deleted at the end** (`--keep` retains
+  it; `--database-url` uses your own store and is never deleted — point it at a disposable Postgres
+  for real persistence checks).
+- A production `--environment` is **refused** unless `--allow-production` is passed; AI stays
+  disabled either way (no paid/model action). Scenarios may still refuse on their own (the DCA-010
+  self-check seeds, and seeding is dev-only).
+
+Each future story registers its own scenario with `@register("DCA-0NN", "…")` in
+`scripts/manual_check.py`.
+
+```bash
+python scripts/manual_check.py DCA-010          # seed synthetic A/B, list rows, auto-clean
+python scripts/manual_check.py DCA-010 --keep   # keep the synthetic db for inspection
+```
+
 ## Deliberate deferrals
 
-- **No Alembic yet** — schema is created via `auto_create_schema` (dev/test). First production
-  deploy must introduce migrations and set `EFFORTLESSPROMO_DCA_AUTO_CREATE_SCHEMA=false`.
+- **Autogenerate not wired** — the baseline revision is driven from `Base.metadata`; subsequent
+  schema changes get explicit, hand-written revisions. `auto_create_schema` (metadata `create_all`)
+  remains for SQLite dev/test; production uses Alembic (above).
 - Suppression/objection registry, Art-14-style notification, platform export, web/admin UI,
   AI capabilities, live MCA/GSTIN adapters: later stories (several blocked — see B1/B5 in
   `docs/DCA-001-integration-contracts.md`).

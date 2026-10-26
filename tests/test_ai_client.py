@@ -52,7 +52,9 @@ def test_invoke_sends_contract_headers_and_payload():
 
 
 def test_body_level_failure_is_returned_not_raised():
-    failed = dict(COMPLETED, status="failed", error={"code": "validation_failed", "retryable": False})
+    failed = dict(
+        COMPLETED, status="failed", error={"code": "validation_failed", "retryable": False}
+    )
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=failed)  # 200 envelope with status=failed, per AI-001

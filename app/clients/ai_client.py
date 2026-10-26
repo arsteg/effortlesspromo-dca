@@ -78,7 +78,9 @@ class AiClient:
             raise AiServiceUnavailable(f"AI service returned {response.status_code}")
         if response.status_code >= 400:
             # 4xx is a caller bug (bad capability/auth) — not retryable; surface loudly.
-            raise RuntimeError(f"AI service rejected the call: {response.status_code} {response.text}")
+            raise RuntimeError(
+                f"AI service rejected the call: {response.status_code} {response.text}"
+            )
         return response.json()
 
     def close(self) -> None:
