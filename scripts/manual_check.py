@@ -1540,6 +1540,159 @@ def _dca_026(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-027",
+    "transactional outbox: commit one intent, roll back another; dup intent & raw contact refused",
+)
+def _dca_027(ctx: CheckContext) -> dict:
+    """Prove the outbox sink stages durable integration intents atomically with the local change and
+    never persists raw secret/contact data — and performs NO remote delivery. For synthetic Business
+    A: seed two candidates, then
+
+      1. COMMIT a unit of work that accepts candidate #1 AND stages its outbox intent -> both persist
+         (the row is PENDING, with a stable event id derived from the logical intent);
+      2. ROLL BACK a unit of work that accepts candidate #2 AND stages its outbox intent (a downstream
+         step fails) -> neither the status change NOR the outbox intent survives;
+      3. re-stage candidate #1's SAME logical intent in a fresh transaction -> rejected by the
+         (business_id, event_id) uniqueness constraint; nothing changes;
+      4. attempt to stage an intent carrying a RAW CONTACT payload -> refused before anything staged.
+
+    Shows the actual candidate statuses and outbox rows after each step. No AI/paid action, no HTTP.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db.models import DiscoveryRun, OutboxMessage, OutboxStatus, ProspectCandidate
+    from app.identity.fake import BUSINESS_A
+    from app.identity.tenant_context import TenantContext
+    from app.outbox import OutboxPayloadError, OutboxSink
+
+    def ctx_a() -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=BUSINESS_A,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def seed_candidate(session, identifier: str) -> str:
+        run = DiscoveryRun(business_id=BUSINESS_A, status="completed")
+        session.add(run)
+        session.flush()
+        cand = ProspectCandidate(
+            business_id=BUSINESS_A,
+            run_id=run.id,
+            org_name="Synthetic Org",
+            org_identifier=identifier,
+            source_key="synthetic",
+            source_ref="synthetic://1",
+            trust_tier="official_registry",
+            status="suggested",
+        )
+        session.add(cand)
+        session.flush()
+        return cand.id
+
+    out: dict = {}
+
+    with ctx.session_factory() as session:
+        c1 = seed_candidate(session, "SYN-1")
+        c2 = seed_candidate(session, "SYN-2")
+        session.commit()
+
+    # 1) committed local change + staged outbox intent
+    with ctx.session_factory() as session:
+        cand = session.get(ProspectCandidate, c1)
+        cand.status = "accepted"
+        OutboxSink.for_context(session, ctx_a()).enqueue(
+            event_type="candidate.accepted",
+            dedup_key=f"{c1}:accept",
+            payload={"candidateId": c1},
+        )
+        session.commit()
+
+    # 2) rolled-back local change + outbox intent (downstream failure after staging both)
+    rolled_back = False
+    session = ctx.session_factory()
+    try:
+        cand = session.get(ProspectCandidate, c2)
+        cand.status = "accepted"
+        OutboxSink.for_context(session, ctx_a()).enqueue(
+            event_type="candidate.accepted",
+            dedup_key=f"{c2}:accept",
+            payload={"candidateId": c2},
+        )
+        raise RuntimeError("simulated downstream failure")
+    except RuntimeError:
+        session.rollback()
+        rolled_back = True
+    finally:
+        session.close()
+
+    # 3) duplicate logical intent for candidate #1 is rejected by the uniqueness constraint
+    dup_rejected = False
+    with ctx.session_factory() as session:
+        OutboxSink.for_context(session, ctx_a()).enqueue(
+            event_type="candidate.accepted",
+            dedup_key=f"{c1}:accept",
+            payload={"attempt": 2},
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            dup_rejected = True
+            session.rollback()
+
+    # 4) refuse a raw-contact payload — nothing staged
+    refused = False
+    refusal = ""
+    with ctx.session_factory() as session:
+        try:
+            OutboxSink.for_context(session, ctx_a()).enqueue(
+                event_type="candidate.accepted",
+                dedup_key=f"{c1}:notify",
+                payload={"ownerEmail": "founder@acme.co.in"},
+            )
+        except OutboxPayloadError as exc:
+            refused = True
+            refusal = str(exc)
+        session.commit()
+
+    # Inspect the actual persisted state.
+    with ctx.session_factory() as session:
+        s1 = session.get(ProspectCandidate, c1).status
+        s2 = session.get(ProspectCandidate, c2).status
+        rows = session.scalars(select(OutboxMessage).order_by(OutboxMessage.created_at)).all()
+
+    print("\ncandidate statuses after the four steps:")
+    print(f"  #1 (committed)    status={s1}   (expected: accepted)")
+    print(f"  #2 (rolled back)  status={s2}  (expected: suggested — change discarded)")
+    print(
+        f"\noutbox_messages rows persisted: {len(rows)} (expected: 1 — only the committed intent)"
+    )
+    for r in rows:
+        print(
+            f"  - event_type={r.event_type}  status={r.status}  version={r.version}  "
+            f"event_id={r.event_id}  dedup_key={r.dedup_key}  payload={r.payload}"
+        )
+    print(f"\nrolled-back unit of work: {rolled_back} (no outbox intent for #2)")
+    print(f"duplicate logical intent refused: {dup_rejected} (uniqueness constraint)")
+    print(f"raw-contact intent refused: {refused}  ({refusal if refused else 'NOT REFUSED!'})")
+
+    out["c1_status"] = s1
+    out["c2_status"] = s2
+    out["outbox_row_count"] = len(rows)
+    out["outbox_statuses"] = [r.status for r in rows]
+    out["all_pending"] = all(r.status == OutboxStatus.PENDING.value for r in rows)
+    out["rolled_back"] = rolled_back
+    out["duplicate_rejected"] = dup_rejected
+    out["raw_contact_refused"] = refused
+    print(
+        "\n(atomic with the local change; opaque payloads only; NO remote delivery, no paid action)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

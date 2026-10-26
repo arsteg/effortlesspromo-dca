@@ -33,6 +33,7 @@ DCA_TABLES = {
     "acquisition_decisions",
     "ai_invocations",
     "audit_events",
+    "outbox_messages",
 }
 
 
@@ -176,6 +177,48 @@ def test_0005_creates_audit_events_on_a_preexisting_database(clean_schema):
             {"s": clean_schema},
         ).first()
     eng.dispose()
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0006_creates_outbox_messages_on_a_preexisting_database(clean_schema):
+    """DCA-027 — the 0006 create branch (for a DB migrated before ``outbox_messages`` existed).
+
+    Same shape as the 0005 test: a fresh DB gets the table from the metadata baseline (0001) and its
+    RLS policy from 0002, so 0006 is a no-op there. To exercise 0006's real job, upgrade to head, drop
+    the table + policy, stamp history back to 0005, then upgrade to head again — 0006 must recreate
+    the table (with its unique intent constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "outbox_messages" CASCADE'))  # policy drops with it
+    eng.dispose()
+
+    command.stamp(cfg, "0005_audit_events")  # pretend we predate the outbox table
+    command.upgrade(cfg, "head")  # 0006 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "outbox_messages" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("outbox_messages", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'outbox_messages' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_outbox_event" in uniques  # the duplicate-intent constraint travelled with the table
     assert policy is not None  # RLS re-established, not just the bare table
 
 

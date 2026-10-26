@@ -107,8 +107,17 @@ def _reject_if_sensitive_text(where: str, value: str) -> None:
     probe = _UUID_RE.sub(" ", value)
     if get_redactor().redact_text(probe) != probe:
         raise AuditPayloadError(
-            f"{where} contains raw secret/contact data; audit references must be opaque"
+            f"{where} contains raw secret/contact data; references must be opaque"
         )
+
+
+def assert_opaque_text(where: str, value: str) -> None:
+    """Refuse a single string that carries raw secret/contact data (shared opaque-text screen).
+
+    Raises :class:`AuditPayloadError` if ``value`` contains an email, a phone number, or a registered
+    secret; returns ``None`` when the text is opaque. Reused by other transactional writers (e.g. the
+    DCA-027 outbox sink) so the single DCA-012 redaction policy governs every durable payload."""
+    _reject_if_sensitive_text(where, value)
 
 
 def _screen(where: str, value: Any) -> None:

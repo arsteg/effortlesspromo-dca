@@ -11,6 +11,7 @@ from app.audit.sink import (
     AuditPayloadError,
     AuditSink,
     assert_opaque_references,
+    assert_opaque_text,
 )
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "AuditPayloadError",
     "AuditSink",
     "assert_opaque_references",
+    "assert_opaque_text",
 ]

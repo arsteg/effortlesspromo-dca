@@ -42,6 +42,18 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+# Fixed namespace for deriving a STABLE outbox event id from a tenant's logical intent. uuid5 over
+# ``(business_id, event_type, dedup_key)`` is deterministic, so re-staging the SAME logical intent
+# always yields the SAME event id — the id is stable across retries, and the uniqueness constraint
+# (below) turns a duplicate logical intent into a duplicate event id that the database rejects.
+_OUTBOX_EVENT_NS = uuid.UUID("f0c1d2e3-4b5a-4c6d-8e7f-0a1b2c3d4e5f")
+
+
+def outbox_event_id(business_id: str, event_type: str, dedup_key: str) -> str:
+    """The stable, deterministic event id for one logical outbox intent within a business."""
+    return str(uuid.uuid5(_OUTBOX_EVENT_NS, f"{business_id}\x1f{event_type}\x1f{dedup_key}"))
+
+
 class DataMode(str, Enum):
     """How the agent is allowed to source prospects for a business (DCA-024).
 
@@ -53,6 +65,19 @@ class DataMode(str, Enum):
 
     MY_DATA_ONLY = "my_data_only"
     SUGGEST_PLATFORM_DATA = "suggest_platform_data"
+
+
+class OutboxStatus(str, Enum):
+    """Delivery state of a transactional outbox message (DCA-027).
+
+    ``PENDING`` — staged and committed with the local change, not yet handed to any consumer.
+    ``DELIVERED`` — a later relay story (currently disabled) marked it handed off. This story only
+    persists the record and its status; it performs NO remote delivery, so rows are only ever created
+    ``PENDING`` here (``mark_delivered`` exists to model the lifecycle but is never driven by a send).
+    """
+
+    PENDING = "pending"
+    DELIVERED = "delivered"
 
 
 class TenantAgent(Base):
@@ -206,6 +231,56 @@ class AuditEvent(TenantOwned, Base):
     # Trace join to the DCA-012 structured logs (nullable: writes can happen outside a request).
     correlation_id: Mapped[str | None] = mapped_column(String(64), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class OutboxMessage(TenantOwned, Base):
+    """DCA-027 — a durable, transactional outbox record for a tenant-scoped integration intent.
+
+    Mirrors the platform's transactional-outbox discipline and this service's own atomic-audit rule
+    (SEC-001/BR-122): the row is staged into the *caller's* session by
+    :class:`~app.outbox.sink.OutboxSink`, so it commits in the SAME unit of work as the local state
+    change it describes. A rolled-back transaction leaves neither the local change NOR its outbox
+    intent — the headline acceptance criterion.
+
+    Three load-bearing columns:
+
+    - ``event_id`` — a STABLE, deterministic id (:func:`outbox_event_id`) derived from the logical
+      intent, so re-staging the same intent re-derives the same id rather than inventing a new one.
+    - ``version`` — the payload-contract version, so a later relay/consumer can evolve the envelope.
+    - ``status`` — ``pending`` → ``delivered``; rows are created ``pending`` and NO remote delivery
+      happens in this story (future relay capability stays disabled).
+
+    ``(business_id, event_id)`` is unique, so a duplicate logical intent (same business, same derived
+    event id) is rejected by the database — duplicate intents are constrained, not silently doubled.
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 row-level-security
+    policy like every other tenant data table. Payload/keys hold only OPAQUE references (ids/row
+    keys) — screened free of secrets/contact data by the sink before anything is staged.
+    """
+
+    __tablename__ = "outbox_messages"
+    # The logical intent is unique PER business: the stable event id (derived from the intent) may
+    # legitimately repeat across tenants but never within one.
+    __table_args__ = (tenant_unique("event_id", name="uq_outbox_event"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # Stable, deterministic id for the logical intent (uuid5 over business + type + dedup key).
+    event_id: Mapped[str] = mapped_column(String(36), index=True)
+    # WHAT kind of event — a controlled type code (e.g. "candidate.accepted"); never free-form text.
+    event_type: Mapped[str] = mapped_column(String(128), index=True)
+    # The caller's logical-intent key (e.g. a row id + action); screened opaque, scoped per business.
+    dedup_key: Mapped[str] = mapped_column(String(200))
+    # Payload-contract version so a later consumer can evolve the envelope without ambiguity.
+    version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Opaque references only (ids/row keys) — guarded free of secrets/contact data before staging.
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=OutboxStatus.PENDING.value,
+        server_default=OutboxStatus.PENDING.value,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class AiInvocation(TenantOwned, Base):
