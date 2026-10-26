@@ -138,6 +138,18 @@ class Settings(BaseSettings):
     platform_connect_timeout_seconds: float = 5.0
     platform_timeout_seconds: float = 30.0
 
+    # --- outbound: the DCA-034 outbox publisher — OFF by default ---
+    # The relay MECHANISM that delivers PENDING outbox messages (DCA-027) through the platform
+    # transport above, keyed by each message's STABLE event id (the Idempotency-Key), so a retry
+    # after a lost acknowledgment is the SAME logical event rather than a fresh one. It is only the
+    # publisher; it still rides the DCA-032 transport and so stays disabled until that transport is
+    # configured AND a relay path is set. ``platform_outbox_publish_path`` is the relative path under
+    # the allowlisted platform base URL that accepts an outbox event; empty => the publisher is
+    # disabled (fail-closed — a missing relay contract stays disabled, B1). No live relay path is
+    # wired in this story; it is driven against the DCA-033 fake contract server in tests.
+    platform_outbox_publish_path: str | None = None  # empty => outbox publisher disabled
+    outbox_publish_batch_size: int = 50  # max PENDING messages drained per publish pass
+
     # --- DCA feature flag (DCA-021) — OFF by default ---
     # The platform-level master switch for the Data Concierge feature. Off => no business can start
     # work regardless of its own enablement. Enabling it is the *platform* enablement; each business
@@ -187,6 +199,15 @@ class Settings(BaseSettings):
         return bool(
             (self.platform_base_url or "").strip()
             and (self.platform_service_credential or "").strip()
+        )
+
+    @property
+    def outbox_publisher_configured(self) -> bool:
+        """The DCA-034 outbox publisher is active only when the platform transport is configured AND
+        a relay path is set. Unset path => disabled (fail-closed): the publisher rides the platform
+        transport, so a missing relay contract keeps the whole capability off (B1)."""
+        return self.platform_transport_configured and bool(
+            (self.platform_outbox_publish_path or "").strip()
         )
 
     @property
@@ -267,6 +288,20 @@ def validate_required(settings: Settings) -> None:
             "EFFORTLESSPROMO_DCA_PLATFORM_CONNECT_TIMEOUT_SECONDS and "
             "EFFORTLESSPROMO_DCA_PLATFORM_TIMEOUT_SECONDS must be positive"
         )
+
+    # DCA-034: the outbox publisher rides the platform transport. A relay path set without the
+    # transport configured would be a publisher that can never call anything — a half-wired
+    # capability. Fail closed, naming the missing key only.
+    if (settings.platform_outbox_publish_path or "").strip() and not (
+        settings.platform_transport_configured
+    ):
+        raise RuntimeError(
+            "an outbox relay path is set (EFFORTLESSPROMO_DCA_PLATFORM_OUTBOX_PUBLISH_PATH) but the "
+            "platform transport is not configured (set EFFORTLESSPROMO_DCA_PLATFORM_BASE_URL and "
+            "EFFORTLESSPROMO_DCA_PLATFORM_SERVICE_CREDENTIAL)"
+        )
+    if settings.outbox_publish_batch_size <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_OUTBOX_PUBLISH_BATCH_SIZE must be positive")
 
     # DCA-015: end-user token authentication. Only HS256 (symmetric) is implemented; asymmetric
     # (RS256/JWKS) and token introspection are a later story and stay disabled — a missing contract is

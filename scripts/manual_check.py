@@ -2569,6 +2569,154 @@ def _dca_033(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-034",
+    "idempotent outbox publisher: stage a PENDING event, lose its acknowledgment, retry, and show "
+    "the fake host recorded ONE logical event (same stable Idempotency-Key)",
+)
+def _dca_034(ctx: CheckContext) -> dict:
+    """Drive the real DCA-034 outbox publisher against the DCA-033 FAKE CONTRACT SERVER, showing:
+
+      1. a PENDING outbox message staged by the DCA-027 sink (its stable event id);
+      2. publish with the acknowledgment LOST (transport timeout) -> the row is UNCHANGED: still
+         PENDING, no delivered_at, the SAME event id — never a fresh key (the headline criterion);
+      3. retry (host now acknowledges) -> the row flips to DELIVERED;
+      4. BOTH attempts carried the SAME Idempotency-Key (the stable event id), so the fake host saw
+         ONE logical event across two HTTP calls;
+      5. the publisher is DISABLED (fail-closed) when no relay path is configured.
+
+    Local synthetic only: the publisher's transport is an ``httpx.MockTransport`` over the fake
+    server, so no real network/AI/paid action occurs and nothing leaves the box.
+    """
+    from sqlalchemy import select
+
+    from app.core.config import Settings
+    from app.db.models import OutboxMessage, OutboxStatus
+    from app.identity.tenant_context import TenantContext
+    from app.outbox import OutboxSink, PublishOutcome, build_outbox_publisher
+    from app.testing import FixtureOutcome, build_fake_contract_server
+
+    A = "00000000-0000-4000-8000-00000000000a"
+    base = "https://platform.internal/svc"
+    cred = "scoped-platform-credential-SENTINEL-xyz"  # synthetic, local-only
+    path = "/outbox/events"
+    out: dict = {}
+
+    def _key(call) -> str | None:
+        for name, value in call.headers.items():
+            if name.lower() == "idempotency-key":
+                return value
+        return None
+
+    # A non-production settings profile with the platform transport + relay path configured, so the
+    # publisher is BUILT; the transport is pointed at the fake server (no socket ever opens).
+    pub_settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        environment=ctx.settings.environment,
+        database_url="sqlite+pysqlite:///:memory:",  # placeholder; the real factory is ctx's
+        platform_base_url=base,
+        platform_service_credential=cred,
+        platform_outbox_publish_path=path,
+    )
+    server = build_fake_contract_server(ctx.settings, base_path="/svc")
+    print(f"\n{server.banner()}\n")
+
+    # 1) stage a PENDING outbox intent for synthetic Business A.
+    ctx_a = TenantContext(
+        subject="00000000-0000-4000-9000-0000000a11ce",
+        business_id=A,
+        roles=("owner",),
+        membership_version="v1",
+    )
+    with ctx.session_factory() as session:
+        row = OutboxSink.for_context(session, ctx_a).enqueue(
+            event_type="candidate.accepted",
+            dedup_key="cand-123:accept",
+            payload={"candidateId": "cand-123", "runId": "run-9"},
+        )
+        session.commit()
+        event_id = row.event_id
+    out["event_id"] = event_id
+    print(f"1) staged PENDING outbox event  -> event_id={event_id}")
+
+    publisher = build_outbox_publisher(
+        pub_settings,
+        ctx.session_factory,  # type: ignore[arg-type]
+        transport=server.as_transport(),
+    )
+    assert publisher is not None
+
+    # 2) publish with the acknowledgment LOST (transport timeout).
+    server.set_route("POST", path, FixtureOutcome.timeout())
+    first = publisher.publish_pending(A)[0]
+    out["first_outcome"] = first.outcome.value
+    out["first_key"] = _key(server.last_call)
+    with ctx.session_factory() as check:
+        r = check.scalars(select(OutboxMessage)).one()
+        out["after_timeout_status"] = r.status
+        out["after_timeout_delivered_at"] = r.delivered_at
+        out["after_timeout_event_id"] = r.event_id
+    print(
+        f"2) publish (ack LOST -> timeout) -> outcome={first.outcome.value} "
+        f"row.status={out['after_timeout_status']} delivered_at={out['after_timeout_delivered_at']} "
+        f"event_id_unchanged={out['after_timeout_event_id'] == event_id}"
+    )
+
+    # 3) retry: the host acknowledges now.
+    server.set_route("POST", path, FixtureOutcome.response(202, json={"accepted": True}))
+    second = publisher.publish_pending(A)[0]
+    out["second_outcome"] = second.outcome.value
+    out["second_key"] = _key(server.last_call)
+    with ctx.session_factory() as check:
+        r = check.scalars(select(OutboxMessage)).one()
+        out["after_retry_status"] = r.status
+        out["after_retry_event_id"] = r.event_id
+    print(
+        f"3) retry (host acknowledges)     -> outcome={second.outcome.value} "
+        f"row.status={out['after_retry_status']}"
+    )
+
+    # 4) one logical event across two HTTP attempts: same stable Idempotency-Key both times.
+    posts = [c for c in server.calls if c.method == "POST"]
+    keys = {_key(c) for c in posts}
+    out["post_attempts"] = len(posts)
+    out["distinct_idempotency_keys"] = sorted(k for k in keys if k)
+    print(
+        f"4) fake host saw {len(posts)} HTTP POSTs, Idempotency-Key(s)={out['distinct_idempotency_keys']} "
+        f"-> one logical event={keys == {event_id}}"
+    )
+
+    # 5) disabled-by-default: no relay path => no publisher is built (fail-closed denial).
+    disabled_settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        environment=ctx.settings.environment,
+        database_url="sqlite+pysqlite:///:memory:",
+        platform_base_url=base,
+        platform_service_credential=cred,
+        # platform_outbox_publish_path deliberately unset
+    )
+    disabled = build_outbox_publisher(disabled_settings, ctx.session_factory)  # type: ignore[arg-type]
+    out["disabled_without_relay_path"] = disabled is None
+    print(f"5) no relay path configured      -> publisher built? {disabled is not None} (disabled)")
+
+    print(
+        "\nchecks: "
+        f"timeout_retryable={out['first_outcome'] == PublishOutcome.RETRY_TIMEOUT.value}  "
+        f"no_state_change_on_timeout="
+        f"{out['after_timeout_status'] == OutboxStatus.PENDING.value and out['after_timeout_delivered_at'] is None}  "
+        f"same_identity={out['after_timeout_event_id'] == event_id}  "
+        f"retry_delivered="
+        f"{out['second_outcome'] == PublishOutcome.DELIVERED.value and out['after_retry_status'] == OutboxStatus.DELIVERED.value}  "
+        f"one_logical_event={keys == {event_id}}  "
+        f"disabled_without_contract={out['disabled_without_relay_path']}"
+    )
+    print(
+        "\n(no real network, no AI, no paid action; the publisher only rides the one allowlisted "
+        "platform transport and stays disabled without a relay contract)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

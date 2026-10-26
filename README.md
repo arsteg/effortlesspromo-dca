@@ -45,6 +45,13 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
   scoped credential (redacted in logs), explicit timeouts, correlation ids, stable/safe error
   mapping. **Off by default** (needs base URL + credential) and **not wired to any route**; the
   business adapters built on it stay disabled until B1 ships. See `docs/DCA-032-*.md`.
+- Outbox publisher (DCA-034, `app/outbox/publisher.py`): the idempotent relay that drains PENDING
+  outbox messages (DCA-027) through the DCA-032 transport, keyed by each message's **stable** event
+  id (the `Idempotency-Key`), so a lost acknowledgment is retried as the **same** logical event —
+  never a fresh key. Only a 2xx ack marks a row `DELIVERED`; a timeout/unreachable/5xx/429 leaves it
+  PENDING with its identity intact; a 4xx is a surfaced denial that also changes no state. **Off by
+  default** (needs the transport + `platform_outbox_publish_path`); no live relay route is wired —
+  driven against the DCA-033 fake server in tests. See `docs/DCA-034-*.md`.
 
 - Database sessions: a **sync** engine backs the SQLite-friendly dev/test surface; an **async**
   engine (`app/db/base.py` `make_async_engine` / `transactional_session`, dependency
