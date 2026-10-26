@@ -2451,6 +2451,124 @@ def _dca_032(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-033",
+    "fake contract-test server: simulate success/timeout/unreachable, 404 on an unknown contract, "
+    "and refuse production",
+)
+def _dca_033(ctx: CheckContext) -> dict:
+    """Drive the real platform transport against the reusable FAKE CONTRACT SERVER (DCA-033), showing:
+
+      1. the explicit non-production synthetic-mode banner;
+      2. a registered route served as a SUCCESS;
+      3. that SAME route switched to a TIMEOUT response (the manual-test step) — classified timeout;
+      4. a route configured UNREACHABLE — classified unreachable;
+      5. an UNKNOWN route -> a deliberate 404 'no_fixture_configured' (no invented contract), recorded
+         in the call log as unmatched;
+      6. that ``build_fake_contract_server`` REFUSES production settings.
+
+    No real network, no AI, no paid action; nothing is written. Uses ``httpx.MockTransport`` only.
+    """
+    from app.clients.platform_transport import (
+        PlatformHttpTransport,
+        PlatformTransportError,
+        TransportErrorKind,
+    )
+    from app.core.config import Settings
+    from app.testing import (
+        FakeServerForbiddenInProduction,
+        FixtureOutcome,
+        build_fake_contract_server,
+    )
+
+    base = "https://platform.internal/svc"
+    cred = "scoped-platform-credential-SENTINEL-xyz"  # synthetic, local-only
+    out: dict = {}
+
+    # The harness must refuse production selection — build it from NON-production settings here. The
+    # transport base URL is mounted under ``/svc``, so the server strips that prefix before matching.
+    server = build_fake_contract_server(ctx.settings, base_path="/svc")
+    print(f"\n{server.banner()}\n")
+    out["banner"] = server.banner()
+    out["banner_is_non_production"] = "NON-PRODUCTION" in server.banner()
+
+    transport = PlatformHttpTransport(base, cred, transport=server.as_transport())
+
+    # 2) success on a registered route
+    server.set_route("GET", "/tenants/A", FixtureOutcome.response(200, json={"tenant": "A"}))
+    ok = transport.request("GET", "tenants/A", correlation_id="trace-ok")
+    print(
+        f"1) GET tenants/A (registered 200)  -> class={ok.response_class.value:12} "
+        f"status={ok.status_code} json={ok.json}"
+    )
+    out["success_class"] = ok.response_class.value
+
+    # 3) switch the SAME route to a timeout (the manual-test step)
+    server.set_route("GET", "/tenants/A", FixtureOutcome.timeout())
+    try:
+        transport.request("GET", "tenants/A")
+        out["timeout_kind"] = "UNEXPECTED SUCCESS"
+    except PlatformTransportError as err:
+        out["timeout_kind"] = err.kind.value
+        print(
+            f"2) GET tenants/A (switched->timeout) -> raised {type(err).__name__} "
+            f"kind={err.kind.value!r} (credential in message? {cred in str(err)})"
+        )
+
+    # 4) unreachable
+    server.set_route("GET", "/down", FixtureOutcome.unreachable())
+    try:
+        transport.request("GET", "down")
+        out["unreachable_kind"] = "UNEXPECTED SUCCESS"
+    except PlatformTransportError as err:
+        out["unreachable_kind"] = err.kind.value
+        print(f"3) GET down (unreachable)          -> raised kind={err.kind.value!r}")
+
+    # 5) an UNKNOWN contract -> deliberate 404, recorded as unmatched (no invented contract)
+    calls_before = server.call_count
+    unknown = transport.request("GET", "suppression/check")
+    last = server.last_call
+    print(
+        f"4) GET suppression/check (no fixture) -> status={unknown.status_code} "
+        f"error={unknown.json.get('error') if unknown.json else None!r} "
+        f"recorded_unmatched={last.matched is False if last else None}"
+    )
+    out["unknown_status"] = unknown.status_code
+    out["unknown_error"] = unknown.json.get("error") if unknown.json else None
+    out["unknown_recorded_unmatched"] = bool(last and last.matched is False)
+    out["unknown_added_one_call"] = server.call_count - calls_before == 1
+
+    transport.close()
+
+    # 6) production refusal
+    prod_settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="production",
+        database_url="sqlite+pysqlite:///:memory:",
+    )
+    try:
+        build_fake_contract_server(prod_settings)
+        out["refuses_production"] = False
+    except FakeServerForbiddenInProduction as err:
+        out["refuses_production"] = True
+        print(f"5) build under production settings  -> REFUSED ({type(err).__name__})")
+
+    print(
+        "\nchecks: "
+        f"banner={out['banner_is_non_production']}  "
+        f"success={out['success_class'] == 'success'}  "
+        f"timeout_stable={out['timeout_kind'] == TransportErrorKind.TIMEOUT.value}  "
+        f"unreachable={out['unreachable_kind'] == TransportErrorKind.UNREACHABLE.value}  "
+        f"no_invented_contract={out['unknown_status'] == 404 and out['unknown_recorded_unmatched']}  "
+        f"refuses_production={out['refuses_production']}"
+    )
+    print(
+        "\n(no real network, no AI, no paid action; the harness never invented a missing contract "
+        "and refuses production selection)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
