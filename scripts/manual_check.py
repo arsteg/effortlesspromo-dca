@@ -1856,6 +1856,134 @@ def _dca_028(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-029",
+    "integration envelope: accept valid; reject future-version/malformed/leaky before any mutation",
+)
+def _dca_029(ctx: CheckContext) -> dict:
+    """Prove the versioned integration-event envelope validates an inbound event BEFORE a receiver
+    touches state, and rejects an incompatible / malformed / non-opaque event without echoing its
+    payload. A guarded receiver parses first and records a DCA-028 inbox receipt only on success, so
+    for synthetic Business A:
+
+      1. a VALID current-version event  -> validated, then recorded (one receipt);
+      2. a FUTURE-version event         -> rejected (unsupported version), no receipt;
+      3. a MALFORMED event (empty id / aggregate_version=0) -> rejected, no receipt;
+      4. a NON-OPAQUE payload (raw contact) -> rejected, no receipt, and the raw value is NOT in the
+         rejection message.
+
+    Shows the actual inbox rows and each rejection message. No AI/paid action, no HTTP.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import InboxReceipt
+    from app.identity.fake import BUSINESS_A
+    from app.identity.tenant_context import TenantContext
+    from app.inbox import InboxSink
+    from app.integration import (
+        CURRENT_ENVELOPE_VERSION,
+        EnvelopeError,
+        MalformedEnvelopeError,
+        UnsupportedEnvelopeVersionError,
+        parse_envelope,
+    )
+
+    source = "effortlesspromo-api"
+    secret_email = "founder@acme.co.in"  # synthetic sentinel — must never appear in a rejection
+
+    def ctx_a() -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=BUSINESS_A,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def valid_raw(**overrides: object) -> dict:
+        base: dict = {
+            "schema_version": CURRENT_ENVELOPE_VERSION,
+            "event_id": "evt-ok",
+            "business_id": BUSINESS_A,
+            "event_type": "candidate.accepted",
+            "aggregate_version": 3,
+            "occurred_at": "2026-01-01T12:00:00+00:00",
+            "payload": {"candidateId": "cand-9"},
+        }
+        base.update(overrides)
+        return base
+
+    def guarded_receive(raw: object) -> bool:
+        """Validate the envelope, then (only if valid) record a receipt. Raises before any mutation."""
+        env = parse_envelope(raw)
+        with ctx.session_factory() as session:
+            InboxSink.for_context(session, ctx_a()).register(
+                event_source=source,
+                event_id=env.event_id,
+                event_type=env.event_type,
+                payload=env.payload,
+            )
+            session.commit()
+        return True
+
+    out: dict = {}
+
+    # 1) valid event — validated then recorded
+    recorded = guarded_receive(valid_raw())
+
+    # 2) future-version, 3) malformed, 4) non-opaque payload — each rejected before mutation
+    rejections: dict[str, str] = {}
+
+    def attempt(label: str, raw: object, expected: type[EnvelopeError]) -> None:
+        try:
+            guarded_receive(raw)
+            rejections[label] = "NOT REJECTED!"
+        except expected as exc:
+            rejections[label] = str(exc)
+
+    attempt(
+        "future_version",
+        valid_raw(event_id="evt-future", schema_version=2),
+        UnsupportedEnvelopeVersionError,
+    )
+    attempt(
+        "malformed",
+        valid_raw(event_id="", aggregate_version=0),
+        MalformedEnvelopeError,
+    )
+    attempt(
+        "non_opaque_payload",
+        valid_raw(event_id="evt-leak", payload={"owner": secret_email}),
+        MalformedEnvelopeError,
+    )
+
+    # Inspect the actual persisted state.
+    with ctx.session_factory() as session:
+        rows = session.scalars(select(InboxReceipt).order_by(InboxReceipt.received_at)).all()
+
+    print("\nguarded receiver (validate -> only then record):")
+    print(f"  valid current-version event -> recorded={recorded} (expected: True)")
+    for label, message in rejections.items():
+        print(f"  {label:20} -> rejected: {message}")
+
+    print(f"\ninbox_receipts rows persisted: {len(rows)} (expected: 1 — only the valid event)")
+    for r in rows:
+        print(f"  - source={r.event_source}  event_id={r.event_id}  payload={r.payload}")
+
+    leak = any(secret_email in message for message in rejections.values())
+    print(
+        f"\nsensitive-value leak in any rejection message: {leak} "
+        f"({'LEAKED' if leak else 'clean — raw contact value never echoed'})"
+    )
+
+    out["valid_recorded"] = recorded
+    out["inbox_row_count"] = len(rows)
+    out["only_valid_recorded"] = len(rows) == 1 and rows[0].event_id == "evt-ok"
+    out["rejections"] = rejections
+    out["no_sensitive_echo"] = not leak
+    print("\n(rejected before any mutation; opaque payloads only; no paid action)")
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
