@@ -74,6 +74,20 @@ class Settings(BaseSettings):
     # --- inbound service auth (fail-closed, same pattern as effortlesspromo-ai) ---
     service_auth_token: str | None = None
 
+    # --- inbound END-USER authentication (DCA-015): validate a caller's bearer token ---
+    # The service-auth gate above authenticates the calling SERVICE; this validates the end user whose
+    # bearer token the caller forwards. Only HS256 (symmetric) is implemented here; asymmetric
+    # (RS256/JWKS) and token introspection are a later story (the live platform adapter, B1) and stay
+    # disabled until then. When none of issuer/audience/signing-secret are set the contract is
+    # disabled: production fails closed (every call 401), dev/test falls back to the obviously-fake
+    # verifier (never in production — mirrors the identity fake and the .NET dev raw-id fallback).
+    auth_token_issuer: str | None = None  # expected `iss` claim
+    auth_token_audience: str | None = None  # expected `aud` claim
+    auth_token_signing_secret: str | None = None  # HS256 shared secret (value injected out-of-band)
+    auth_token_signing_secret_ref: str | None = None
+    auth_token_algorithm: str = "HS256"
+    auth_token_leeway_seconds: int = 60  # clock-skew tolerance for exp/nbf
+
     # --- outbound: existing effortlesspromo-ai gateway (all model execution goes there) ---
     ai_base_url: str | None = None  # empty => AI-dependent features disabled
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
@@ -105,6 +119,19 @@ class Settings(BaseSettings):
         """AI integration stays disabled until a base URL is explicitly configured."""
         return bool((self.ai_base_url or "").strip())
 
+    @property
+    def end_user_auth_configured(self) -> bool:
+        """End-user token validation is active only when issuer, audience AND signing secret are all
+        set. A partial configuration is rejected at boot (``validate_required``) so auth is never
+        half-wired; when nothing is set the contract is disabled (fail-closed in production)."""
+        return all(
+            (
+                (self.auth_token_issuer or "").strip(),
+                (self.auth_token_audience or "").strip(),
+                (self.auth_token_signing_secret or "").strip(),
+            )
+        )
+
 
 REQUIRED_KEYS = ("environment", "database_url")
 
@@ -132,6 +159,33 @@ def validate_required(settings: Settings) -> None:
             "EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN is missing"
         )
 
+    # DCA-015: end-user token authentication. Only HS256 (symmetric) is implemented; asymmetric
+    # (RS256/JWKS) and token introspection are a later story and stay disabled — a missing contract is
+    # never silently served, so an unsupported algorithm fails boot rather than mis-validating.
+    if settings.auth_token_algorithm.strip().upper() != "HS256":
+        raise RuntimeError(
+            f"EFFORTLESSPROMO_DCA_AUTH_TOKEN_ALGORITHM '{settings.auth_token_algorithm}' is not "
+            "supported: this build validates HS256 only (asymmetric/JWKS/introspection is a later "
+            "story and stays disabled)"
+        )
+
+    # End-user auth must be fully wired or not at all: a half-set trio would silently disable
+    # validation (fake in dev, closed in prod) instead of doing what the operator intended.
+    auth_parts = {
+        "EFFORTLESSPROMO_DCA_AUTH_TOKEN_ISSUER": (settings.auth_token_issuer or "").strip(),
+        "EFFORTLESSPROMO_DCA_AUTH_TOKEN_AUDIENCE": (settings.auth_token_audience or "").strip(),
+        "EFFORTLESSPROMO_DCA_AUTH_TOKEN_SIGNING_SECRET": (
+            settings.auth_token_signing_secret or ""
+        ).strip(),
+    }
+    set_parts = [key for key, value in auth_parts.items() if value]
+    if set_parts and len(set_parts) != len(auth_parts):
+        unset = [key for key, value in auth_parts.items() if not value]
+        raise RuntimeError(
+            "end-user authentication is partially configured; set all of issuer/audience/signing "
+            "secret or none. missing: " + ", ".join(unset)
+        )
+
     # A non-env secret source must name where each configured secret lives, or boot fails rather than
     # silently reading the value from the environment.
     if settings.secret_source is not SecretSource.ENV:
@@ -142,6 +196,11 @@ def validate_required(settings: Settings) -> None:
             missing_refs.append("EFFORTLESSPROMO_DCA_SERVICE_AUTH_TOKEN_SECRET_REF")
         if settings.ai_enabled and not (settings.ai_service_token_secret_ref or "").strip():
             missing_refs.append("EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN_SECRET_REF")
+        if (
+            settings.end_user_auth_configured
+            and not (settings.auth_token_signing_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_AUTH_TOKEN_SIGNING_SECRET_REF")
         if missing_refs:
             raise RuntimeError(
                 f"secret source '{settings.secret_source.value}' requires secret references: "

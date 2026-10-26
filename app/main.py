@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.routes import health, tenants
+from app.api.routes import auth, health, tenants
 from app.core.config import Settings, get_settings, validate_required
 from app.core.errors import install_error_handling
 from app.core.logging import CorrelationIdMiddleware, configure_logging
@@ -23,6 +23,7 @@ from app.db.base import (
     make_engine,
     make_session_factory,
 )
+from app.identity.tokens import build_token_verifier
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -65,10 +66,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.session_factory = session_factory
     app.state.async_engine = async_engine
     app.state.async_session_factory = async_session_factory
+    # DCA-015: the end-user token verifier (None when the contract is disabled — fail-closed).
+    app.state.token_verifier = build_token_verifier(settings)
     # DCA-012: resolve/publish the per-request correlation id (reaches endpoints, handlers, logs).
     app.add_middleware(CorrelationIdMiddleware)
     # DCA-011: one standardized error envelope + correlation id for every error response.
     install_error_handling(app)
     app.include_router(health.router)
     app.include_router(tenants.router)
+    app.include_router(auth.router)
     return app

@@ -21,14 +21,28 @@ from app.identity.fake import (
     IdentityContractDisabled,
     build_identity_client,
 )
+from app.identity.tokens import (
+    AuthenticatedPrincipal,
+    FakeTokenVerifier,
+    JwtTokenVerifier,
+    TokenValidationError,
+    TokenVerifier,
+    build_token_verifier,
+)
 
 __all__ = [
+    "AuthenticatedPrincipal",
     "FakeIdentityClient",
+    "FakeTokenVerifier",
     "IdentityClient",
     "IdentityContractDisabled",
     "IdentityRequest",
     "IdentityResponse",
+    "JwtTokenVerifier",
     "Membership",
     "MembershipStatus",
+    "TokenValidationError",
+    "TokenVerifier",
     "build_identity_client",
+    "build_token_verifier",
 ]

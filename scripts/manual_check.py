@@ -362,6 +362,110 @@ def _dca_014(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-015", "end-user API auth: valid vs forged/expired/wrong-aud bearer tokens; fake/prod"
+)
+def _dca_015(ctx: CheckContext) -> dict:
+    """Call the protected diagnostic route ``GET /v1/whoami`` with a valid token and with each
+    rejected variant (forged signature, expired, wrong audience, 'alg: none', missing header), show
+    the actual HTTP responses side by side, then prove the dev fake works while production refuses it.
+
+    Read-only: ``/v1/whoami`` touches no database and changes no state, so every denial is reproduced
+    with no side effect.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import jwt
+    from fastapi.testclient import TestClient
+
+    from app.identity.tokens import build_token_verifier
+    from app.main import create_app
+
+    issuer = "https://issuer.dca.local"
+    audience = "dca-api"
+    secret = "manual-check-signing-secret"  # synthetic, local-only
+    subject = "00000000-0000-4000-9000-0000000a11ce"
+
+    def mint(*, sec=secret, iss=issuer, aud=audience, exp_min=5, alg="HS256", key_override=None):
+        now = datetime.now(UTC)
+        claims = {
+            "sub": subject,
+            "iss": iss,
+            "aud": aud,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=exp_min)).timestamp()),
+        }
+        return jwt.encode(claims, key_override if key_override is not None else sec, algorithm=alg)
+
+    # A LIVE-configured app (real JWT verifier active) over this run's synthetic, AI-disabled settings.
+    configured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token="manual-check-local",
+        auth_token_issuer=issuer,
+        auth_token_audience=audience,
+        auth_token_signing_secret=secret,
+        synthetic_sources_enabled=True,
+    )
+    app = create_app(configured)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    def bearer(tok: str) -> dict:
+        return {"Authorization": f"Bearer {tok}"}
+
+    try:
+        cases = {
+            "valid": client.get("/v1/whoami", headers=bearer(mint())),
+            "forged_signature": client.get(
+                "/v1/whoami", headers=bearer(mint(key_override="attacker-secret"))
+            ),
+            "expired": client.get("/v1/whoami", headers=bearer(mint(exp_min=-5))),
+            "wrong_audience": client.get("/v1/whoami", headers=bearer(mint(aud="other-api"))),
+            "alg_none": client.get("/v1/whoami", headers=bearer(mint(alg="none", key_override=""))),
+            "missing_header": client.get("/v1/whoami"),
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print("\nGET /v1/whoami with each token (real HS256 verifier active):")
+    out: dict = {}
+    for name, resp in cases.items():
+        body = resp.json()
+        print(f"  {name:18} HTTP {resp.status_code}  body={body}")
+        out[name] = {"status": resp.status_code, "body": body}
+
+    # Fake verifier: works in development, refused in production (contract disabled, fail-closed).
+    dev_unconfigured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+    )
+    prod_unconfigured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="production",
+        deployment_mode=DeploymentMode.LIVE,
+        database_url="postgresql+psycopg://user@db/dca",
+        service_auth_token="prod-token",
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    dev_verifier = type(build_token_verifier(dev_unconfigured)).__name__
+    prod_verifier = build_token_verifier(prod_unconfigured)
+    print(f"\nunconfigured development verifier -> {dev_verifier}")
+    print(
+        "unconfigured production verifier  -> "
+        f"{prod_verifier!r} (None = disabled, every call fails closed)"
+    )
+
+    out["fake_dev_verifier"] = dev_verifier
+    out["production_verifier_disabled"] = prod_verifier is None
+    print(
+        "\n(the diagnostic route is read-only: no rows created, no state changed by any call above)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
