@@ -14,15 +14,22 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_session
 from app.api.idempotency import IdempotencyContext, commit_idempotent, idempotency
+from app.core.logging import get_correlation_id
 from app.core.security import require_service_auth
 from app.db.models import BusinessProfileDraft, TenantAgent
+from app.profiles import PlatformProfileClient
+from app.services.profile_importer import (
+    REASON_IMPORT_CONTRACT_DISABLED,
+    ProfileImportError,
+    import_profile_snapshot,
+)
 from app.services.profile_store import ProfileDraftInput, ProfileError, ProfileStore
 
 router = APIRouter(
@@ -31,6 +38,14 @@ router = APIRouter(
 
 SessionDep = Annotated[Session, Depends(get_session)]
 IdempotencyDep = Annotated[IdempotencyContext, Depends(idempotency)]
+
+
+def _platform_profile_client(request: Request) -> PlatformProfileClient | None:
+    """The DCA-037 platform-profile client, or ``None`` when the contract is disabled (fail-closed)."""
+    return getattr(request.app.state, "platform_profile_client", None)
+
+
+ProfileClientDep = Annotated[PlatformProfileClient | None, Depends(_platform_profile_client)]
 
 
 class ProfileDraftBody(BaseModel):
@@ -61,6 +76,10 @@ def _draft_view(draft: BusinessProfileDraft) -> dict:
         "languages": draft.languages,
         "confirmedFacts": draft.confirmed_facts,
         "unknowns": draft.unknowns,
+        # DCA-037 provenance — empty for a manually-authored draft; populated on an import.
+        "source": draft.source,
+        "sourceVersion": draft.source_version,
+        "provenance": draft.provenance or {},
         "createdAt": draft.created_at.isoformat() if draft.created_at else None,
     }
 
@@ -70,6 +89,8 @@ def _draft_summary(draft: BusinessProfileDraft) -> dict:
         "version": draft.version,
         "status": draft.status,
         "unknowns": draft.unknowns,
+        "source": draft.source,
+        "sourceVersion": draft.source_version,
         "createdAt": draft.created_at.isoformat() if draft.created_at else None,
     }
 
@@ -90,6 +111,37 @@ def save_draft(
             unknowns=body.unknowns,
         )
     )
+    # Flush so the DB-assigned fields (created_at) are populated for the response view.
+    session.flush()
+    return commit_idempotent(session, idem, _draft_view(draft), status_code=201)
+
+
+@router.post("/{business_id}/profile/import", status_code=201)
+def import_profile(
+    business_id: str,
+    request: Request,
+    session: SessionDep,
+    idem: IdempotencyDep,
+    client: ProfileClientDep,
+) -> dict:
+    """DCA-037 — import an authorized platform profile snapshot into a new, provenance-bearing draft.
+
+    Fetches the business's own profile + Brand KB facts through the typed platform-profile contract
+    (the fake today; no host-table access) and stages them as a new draft version that retains the
+    snapshot's source version and business scope and stays a ``draft``. Retry-safe (DCA-035).
+
+    Fail-closed with no state change on refusal: a disabled contract (production) → 503; the platform
+    reporting no profile for the business → 404. Both refuse before any row is staged.
+    """
+    _require_tenant(session, business_id)
+    try:
+        draft = import_profile_snapshot(
+            session, client, business_id, correlation_id=get_correlation_id()
+        )
+    except ProfileImportError as exc:
+        # A disabled contract is a disabled capability (503); an absent source profile is a 404.
+        status = 503 if exc.code == REASON_IMPORT_CONTRACT_DISABLED else 404
+        raise HTTPException(status_code=status, detail=exc.code) from exc
     # Flush so the DB-assigned fields (created_at) are populated for the response view.
     session.flush()
     return commit_idempotent(session, idem, _draft_view(draft), status_code=201)

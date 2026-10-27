@@ -29,6 +29,7 @@ from app.identity.contract import IdentityClient
 from app.identity.service_credentials import build_service_credential_verifier
 from app.identity.tokens import build_token_verifier
 from app.services.entitlement_gate import default_entitlement_client
+from app.services.profile_importer import default_platform_profile_client
 
 
 def _resolve_identity_client(settings: Settings) -> IdentityClient | None:
@@ -94,6 +95,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # DCA-023: the entitlement client used to gate chargeable operations (None when the contract is
     # disabled — the gate then fails closed).
     app.state.entitlement_client = default_entitlement_client(settings)
+    # DCA-037: the platform-profile client used to import an authorized profile snapshot into a
+    # provenance-bearing draft (None when the contract is disabled — the import then fails closed).
+    app.state.platform_profile_client = default_platform_profile_client(settings)
     # DCA-012: resolve/publish the per-request correlation id (reaches endpoints, handlers, logs).
     app.add_middleware(CorrelationIdMiddleware)
     # DCA-011: one standardized error envelope + correlation id for every error response.

@@ -61,7 +61,12 @@ class ProfileError(Exception):
 class ProfileDraftInput:
     """One draft's content as supplied by the caller. ``unknowns`` is the caller's explicit list of
     aspects it declares not-yet-known; the store augments it with any canonical aspect left empty and
-    removes any aspect that is actually populated, so the stored unknowns are honest and disjoint."""
+    removes any aspect that is actually populated, so the stored unknowns are honest and disjoint.
+
+    ``source`` / ``source_version`` / ``provenance`` carry the optional DCA-037 provenance of an
+    imported draft (empty for a manually-authored one): the origin contract, the exact snapshot/
+    contract version the facts were read at, and the full self-describing provenance record.
+    """
 
     products: list[str] = field(default_factory=list)
     business_type: str = ""
@@ -69,6 +74,9 @@ class ProfileDraftInput:
     languages: list[str] = field(default_factory=list)
     confirmed_facts: list[str] = field(default_factory=list)
     unknowns: list[str] = field(default_factory=list)
+    source: str = ""
+    source_version: str = ""
+    provenance: dict = field(default_factory=dict)
 
 
 def _is_empty(aspect: str, data: ProfileDraftInput) -> bool:
@@ -174,6 +182,10 @@ class ProfileStore:
             confirmed_facts=list(data.confirmed_facts),
             unknowns=_retained_unknowns(data),
             status=ProfileStatus.DRAFT.value,  # confirmation is a disabled future capability
+            # DCA-037 provenance (empty for a manually-authored draft; set only on an import).
+            source=data.source.strip(),
+            source_version=data.source_version.strip(),
+            provenance=dict(data.provenance),
         )
         self._session.add(draft)
         return draft

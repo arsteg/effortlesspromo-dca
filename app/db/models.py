@@ -143,6 +143,15 @@ class BusinessProfileDraft(TenantOwned, Base):
     only ever stages ``status='draft'`` rows and never mutates an existing one, so a draft can never
     silently replace the confirmed profile.
 
+    ``source`` / ``source_version`` / ``provenance`` carry the DCA-037 *provenance* of an imported
+    draft: a draft built by importing an authorized platform profile snapshot records WHERE the facts
+    came from (``source``, e.g. ``platform_profile_snapshot``) and the exact source contract/snapshot
+    version (``source_version``) they were read at, so an imported draft always retains its source
+    version and stays a reviewable DRAFT. ``provenance`` is the self-describing record (source, source
+    version, the snapshot's ``as_of``, whether it was synthetic). A manually-authored draft (DCA-036)
+    leaves all three empty; only an import populates them. The draft's business scope is its
+    ``business_id`` — an imported snapshot is always stored under the tenant it was fetched for.
+
     This is the tenant's OWN business content (not prospect contact data or secrets), so — unlike the
     audit/outbox/inbox/revision payloads — its fields are NOT opaque-reference screened. Tenant-owned:
     it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant
@@ -175,6 +184,13 @@ class BusinessProfileDraft(TenantOwned, Base):
         server_default=ProfileStatus.DRAFT.value,
         index=True,
     )
+    # DCA-037 provenance — empty for a manually-authored draft; populated when a draft is imported from
+    # an authorized platform profile snapshot. ``source`` names the origin contract; ``source_version``
+    # is the exact snapshot/contract version the facts were read at (retained so an imported draft can
+    # always be traced back to its source version). ``provenance`` is the full self-describing record.
+    source: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

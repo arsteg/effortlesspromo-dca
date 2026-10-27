@@ -2952,6 +2952,125 @@ def _dca_036(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-037",
+    "import an authorized platform profile snapshot: A/B import distinct provenance-bearing drafts; "
+    "the import creates no confirmed profile; the disabled-contract and nothing-to-import denials "
+    "change no state",
+)
+def _dca_037(ctx: CheckContext) -> dict:
+    """Drive the real DCA-037 platform-profile import over the HTTP API against synthetic A and B,
+    following the developer manual-test steps:
+
+      1. register A and B;
+      2. import A -> a NEW draft version, status 'draft', carrying the platform's facts + Brand KB
+         facts and provenance (source + source_version); import B -> a DISTINCT draft (different
+         products/business type), proving per-business scope;
+      3. GET the confirmed profile -> none exists (importing a draft never creates a confirmed profile);
+      4. with the live contract disabled (production, B1) the import fails closed (503
+         'profile_import_contract_disabled') and stages NO draft;
+      5. with a profile-less fake (nothing on record) the import is 404 'platform_profile_not_found'
+         and stages NO draft.
+
+    Local synthetic only (AI disabled, ephemeral DB); the contract is the deterministic fake (no
+    host-table access). Every call is shown with its real body so a human can compare against the
+    acceptance criteria rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.profiles import FakePlatformProfileClient
+    from app.services.profile_importer import (
+        REASON_IMPORT_CONTRACT_DISABLED,
+        REASON_PROFILE_NOT_FOUND,
+    )
+
+    # The fake's synthetic businesses (A/B) have fixture profiles on record.
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    biz_b = "00000000-0000-4000-8000-00000000000b"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        for biz in (biz_a, biz_b):
+            client.post("/v1/tenants", json={"businessId": biz}, headers=auth)
+
+        # 2) import A and B — distinct, provenance-bearing drafts
+        a = client.post(f"/v1/tenants/{biz_a}/profile/import", headers=auth)
+        b = client.post(f"/v1/tenants/{biz_b}/profile/import", headers=auth)
+        a_body, b_body = a.json(), b.json()
+        print(f"\n1) import A -> HTTP {a.status_code}")
+        print(
+            f"   A: version={a_body['version']} status={a_body['status']} "
+            f"source={a_body['source']} sourceVersion={a_body['sourceVersion']}"
+        )
+        print(f"      products={a_body['products']} facts={a_body['confirmedFacts']}")
+        print(f"2) import B -> HTTP {b.status_code}")
+        print(
+            f"   B: version={b_body['version']} status={b_body['status']} "
+            f"businessType={b_body['businessType']} products={b_body['products']}"
+        )
+        out["a"] = {"status": a.status_code, "body": a_body}
+        out["b"] = {"status": b.status_code, "body": b_body}
+
+        # 3) importing created no confirmed profile
+        confirmed = client.get(f"/v1/tenants/{biz_a}/profile/confirmed", headers=auth).json()
+        print(f"3) GET A confirmed profile -> confirmed={confirmed['confirmed']} (still none)")
+        out["confirmed"] = confirmed
+
+        # 4) disabled contract (production): import fails closed, stages nothing
+        drafts_before = client.get(f"/v1/tenants/{biz_a}/profile/drafts", headers=auth).json()
+        app.state.platform_profile_client = None
+        disabled = client.post(f"/v1/tenants/{biz_a}/profile/import", headers=auth)
+        drafts_after = client.get(f"/v1/tenants/{biz_a}/profile/drafts", headers=auth).json()
+        print(
+            f"4) import with contract DISABLED -> HTTP {disabled.status_code} "
+            f"({disabled.json()['error']['message']}); drafts unchanged="
+            f"{drafts_after == drafts_before}"
+        )
+        out["contract_disabled"] = {
+            "status": disabled.status_code,
+            "message": disabled.json()["error"]["message"],
+            "drafts_unchanged": drafts_after == drafts_before,
+        }
+
+        # 5) nothing on record: import is 404, stages nothing
+        app.state.platform_profile_client = FakePlatformProfileClient(fixtures={})
+        none_before = client.get(f"/v1/tenants/{biz_b}/profile/drafts", headers=auth).json()
+        empty = client.post(f"/v1/tenants/{biz_b}/profile/import", headers=auth)
+        none_after = client.get(f"/v1/tenants/{biz_b}/profile/drafts", headers=auth).json()
+        print(
+            f"5) import with NO profile on record -> HTTP {empty.status_code} "
+            f"({empty.json()['error']['message']}); drafts unchanged={none_after == none_before}"
+        )
+        out["nothing_to_import"] = {
+            "status": empty.status_code,
+            "message": empty.json()["error"]["message"],
+            "drafts_unchanged": none_after == none_before,
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"a_imported={out['a']['status'] == 201 and out['a']['body']['status'] == 'draft'}  "
+        f"provenance_retained={out['a']['body']['sourceVersion'] != ''}  "
+        f"distinct_ab={out['a']['body']['products'] != out['b']['body']['products']}  "
+        f"no_confirmed={out['confirmed']['confirmed'] is False}  "
+        "contract_disabled_no_change="
+        f"{out['contract_disabled']['status'] == 503 and out['contract_disabled']['message'] == REASON_IMPORT_CONTRACT_DISABLED and out['contract_disabled']['drafts_unchanged']}  "
+        "nothing_to_import_no_change="
+        f"{out['nothing_to_import']['status'] == 404 and out['nothing_to_import']['message'] == REASON_PROFILE_NOT_FOUND and out['nothing_to_import']['drafts_unchanged']}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; imports used the fake contract — no host-table "
+        "access; the two denials created no draft and no confirmed profile)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

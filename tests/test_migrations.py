@@ -412,6 +412,56 @@ def test_0010_creates_business_profile_drafts_on_a_preexisting_database(clean_sc
 
 
 @requires_pg
+def test_0011_adds_provenance_columns_on_a_preexisting_database(clean_schema):
+    """DCA-037 — the 0011 add-column branch (for a DB migrated before the provenance columns existed).
+
+    A fresh DB gets ``business_profile_drafts`` WITH ``source``/``source_version``/``provenance`` from
+    the metadata baseline (0001), so 0011 is a no-op there. To exercise 0011's real job, upgrade to
+    head, DROP the three columns, stamp history back to 0010, then upgrade to head again — 0011 must
+    re-add exactly those columns (backfilling existing rows), with no new table and nothing leaked.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        # Seed one pre-existing (pre-provenance) draft row to prove the backfill.
+        conn.execute(
+            text(
+                'ALTER TABLE "business_profile_drafts" DROP COLUMN "provenance", '
+                'DROP COLUMN "source_version", DROP COLUMN "source"'
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO business_profile_drafts "
+                "(id, business_id, version, products, business_type, value_proposition, "
+                "languages, confirmed_facts, unknowns, status, created_at) VALUES "
+                "('row-1', 'biz-legacy', 1, '[]', '', '', '[]', '[]', '[]', 'draft', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0010_business_profile_drafts")  # pretend we predate the provenance columns
+    command.upgrade(cfg, "head")  # 0011 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("business_profile_drafts", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text("SELECT source, source_version FROM business_profile_drafts WHERE id = 'row-1'")
+        ).first()
+    eng.dispose()
+    assert {"source", "source_version", "provenance"}.issubset(cols)  # columns re-added
+    assert backfilled == ("", "")  # the pre-existing row backfilled to "not imported"
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 
