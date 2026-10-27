@@ -46,6 +46,7 @@ DCA_TABLES = {
     "source_terms",
     "source_term_approvals",
     "business_source_entitlements",
+    "compliance_policy_rulepacks",
 }
 
 

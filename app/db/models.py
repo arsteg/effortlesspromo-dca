@@ -258,6 +258,85 @@ class SourceApprovalStatus(str, Enum):
     REVOKED = "revoked"
 
 
+class RuleEffect(str, Enum):
+    """The decision one rulepack rule expresses (DCA-052).
+
+    ``ALLOW`` — the rule permits the action/channel it scopes (under its conditions). ``DENY`` — the
+    rule forbids it. A rule is never ambiguous: it is exactly one of these. Two rules in the SAME pack
+    that scope the identical (action, channel, authority, conditions) with OPPOSITE effects over an
+    overlapping validity window are *contradictory* and the pack is refused before anything is staged.
+    """
+
+    ALLOW = "allow"
+    DENY = "deny"
+
+
+class RuleAuthority(str, Enum):
+    """Where a rule's force originates (DCA-052) — the distinction the story requires.
+
+    A rulepack keeps three kinds of default apart so a reader can tell WHY a rule exists and which
+    outranks which:
+
+    - ``LAW`` — a statutory/regulatory default (e.g. an Indian data-protection or telecom rule). The
+      strongest authority; a product/provider default can never widen past it.
+    - ``PROVIDER`` — a default imposed by a data source / channel provider's terms.
+    - ``PRODUCT`` — a conservative platform (product) default we choose for ourselves.
+
+    Opposite effects across DIFFERENT authorities are NOT a contradiction (that is precedence, resolved
+    LAW > PROVIDER > PRODUCT); only opposite effects WITHIN the same authority and scope are.
+    """
+
+    LAW = "law"
+    PROVIDER = "provider"
+    PRODUCT = "product"
+
+
+class RuleAction(str, Enum):
+    """The acquisition/contact action a rulepack rule governs (DCA-052; India-only policy).
+
+    Controlled vocabulary — a rule naming an action outside this set is malformed and refused. These
+    mirror the data lifecycle the DCA touches; expressing a rule grants nothing (the pack is a draft).
+    """
+
+    ACQUIRE = "acquire"  # obtain a prospect record from a source at all
+    STORE = "store"  # retain the record durably
+    ENRICH = "enrich"  # derive/augment facts about the record
+    PROFILE = "profile"  # build a targeting/scoring profile from it
+    CONTACT = (
+        "contact"  # reach the prospect over a channel (the platform still gates the actual send)
+    )
+
+
+class RuleChannel(str, Enum):
+    """The channel a rulepack rule scopes (DCA-052). ``ANY`` means the rule is channel-independent.
+
+    Controlled vocabulary — an unrecognized channel is malformed and refused. A ``CONTACT`` rule is
+    naturally channel-specific; a data-lifecycle rule (acquire/store/enrich/profile) uses ``ANY``.
+    """
+
+    ANY = "any"
+    EMAIL = "email"
+    SMS = "sms"
+    WHATSAPP = "whatsapp"
+    VOICE = "voice"
+    POSTAL = "postal"
+
+
+class PolicyRulepackStatus(str, Enum):
+    """Lifecycle state of a compliance policy rulepack version (DCA-052).
+
+    ``DRAFT`` — a reviewable, NOT-in-force rulepack version. Every pack is created here as a draft:
+    defining rules documents what the policy *would* decide, but puts nothing in force on its own —
+    ``no rule becomes live just by existing``. ``ACTIVE`` is the state a future, DISABLED approval
+    capability (its own later story, gated behind a policy review) would promote one reviewed version
+    to. No path in this service writes an ``ACTIVE`` pack, so saving a draft can never silently make a
+    rule enforceable.
+    """
+
+    DRAFT = "draft"
+    ACTIVE = "active"
+
+
 class BusinessProfileDraft(TenantOwned, Base):
     """DCA-036 — a scoped, versioned draft of a business's profile (tenant-owned, RLS-protected).
 
@@ -821,6 +900,71 @@ class SourceTermsApproval(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     revocation_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CompliancePolicyRulepack(Base):
+    """DCA-052 — one *version* of the India compliance policy rulepack (platform control-plane).
+
+    A rulepack is the deterministic, auditable data structure that a FUTURE (disabled) policy engine
+    would consult to decide whether an acquisition/contact ``action`` over a ``channel`` is allowed in
+    a jurisdiction, under explicit ``conditions``, backed by ``evidence``, within an effective-date
+    window, and labelled by its ``authority`` (law vs provider vs product default). This story defines
+    and VALIDATES the schema; it enforces nothing.
+
+    ``rules`` is the validated, normalized list of rules (see
+    :mod:`app.services`/:mod:`app.compliance.policy_rulepacks`). Each rule carries: ``effect``
+    (allow/deny), ``action`` (:class:`RuleAction`), ``channel`` (:class:`RuleChannel`), ``authority``
+    (:class:`RuleAuthority`), a structured ``conditions`` object, an ``evidence`` reference (required —
+    a rule cannot exist without citing why), and an EXPLICIT per-rule validity window
+    (``effective_from``/``expires_at``). The pack itself also carries a pack-level window.
+
+    **Malformed or contradictory rules cannot be saved; no rule becomes live just by existing.** The
+    single sanctioned writer (:class:`~app.compliance.policy_rulepacks.CompliancePolicyRulepackStore`)
+    validates the whole pack FIRST — unknown enum values, missing evidence, an incoherent window, a
+    malformed condition, or two rules that contradict each other (same action/channel/authority/
+    conditions, opposite effect, overlapping window) each raise before any row is staged, so a refusal
+    leaves no row. Every stored pack is ``status='draft'`` — recording rules never puts them in force.
+
+    Versioned per jurisdiction: ``(jurisdiction, version)`` is unique and the store is insert-only, so
+    every prior version is preserved for review and a version never overwrites another. The service is
+    India-only, so ``jurisdiction`` is always ``IN`` (the store refuses anything else).
+
+    Like :class:`Source` / :class:`SourceTerms` / :class:`SourceTermsApproval`, this is platform
+    CONTROL-PLANE data — a shared policy registry, deliberately OUTSIDE tenant RLS and never
+    tenant-scoped. It holds only declarative policy metadata: no prospect contact data and no secrets.
+    """
+
+    __tablename__ = "compliance_policy_rulepacks"
+    # One version per jurisdiction; a (jurisdiction, version) pair is never reused — insert-only history.
+    __table_args__ = (
+        UniqueConstraint("jurisdiction", "version", name="uq_policy_rulepack_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # India-only: always "IN". The store refuses any other jurisdiction (a clear, stable code).
+    jurisdiction: Mapped[str] = mapped_column(
+        String(2), default="IN", server_default="IN", index=True
+    )
+    # Monotonic per-jurisdiction version (1-based); explicit, so policy history is reviewable version-by-version.
+    version: Mapped[int] = mapped_column(Integer)
+    # Optional human-readable title for the pack version (not a decision input).
+    title: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # The validated, normalized rules — a list of rule objects (see policy_rulepacks for the shape).
+    rules: Mapped[list] = mapped_column(JSON, default=list)
+    # The pack-level evidence the policy itself rests on: {"reference": str, "kind": str, "uri": str}.
+    evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Pack-level EXPLICIT validity window — a policy lapses rather than living in a never-expiring flag.
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # draft (reviewable, NOT in force) vs active (approved). Promotion is disabled, so every row here
+    # is 'draft'; recording rules never puts them in force on its own.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=PolicyRulepackStatus.DRAFT.value,
+        server_default=PolicyRulepackStatus.DRAFT.value,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

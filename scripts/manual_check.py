@@ -5498,6 +5498,212 @@ def _dca_050(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-052",
+    "versioned India rulepack schemas: a complete fixture (and one with no effective dates) validates "
+    "to a DRAFT row; a contradictory fixture and a malformed (non-India / no evidence) fixture are "
+    "refused with a stable code and stage NO row; nothing is ever live",
+)
+def _dca_052(ctx: CheckContext) -> dict:
+    """Drive the real DCA-052 policy-rulepack validation + store against a disposable DB, following the
+    developer manual-test steps:
+
+      1. VALIDATE a complete India fixture (actions, channels, conditions, evidence, effective dates,
+         law/provider/product authority) — it stages exactly ONE row, ``status='draft'`` (never live);
+      2. VALIDATE a fixture whose rule has NO effective dates — a valid, unbounded rule (version 2);
+      3. a CONTRADICTORY fixture (same action/channel/authority/conditions, allow AND deny, overlapping
+         window) is REFUSED with ``contradictory_rules`` and stages NO row;
+      4. a MALFORMED fixture (non-India jurisdiction; and separately, a rule missing evidence) is
+         REFUSED with a stable code and stages NO row.
+
+    Control-plane data (no tenant scope / no RLS). Local synthetic only; AI disabled; nothing here
+    activates a policy — every stored pack is a reviewable draft and enforces nothing.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.policy_rulepacks import (
+        REASON_CONTRADICTORY_RULES,
+        REASON_INVALID_JURISDICTION,
+        REASON_MISSING_RULE_EVIDENCE,
+        CompliancePolicyRulepackStore,
+        PolicyRuleInput,
+        PolicyRulepackValidationError,
+        RulepackInput,
+    )
+    from app.db.models import CompliancePolicyRulepack, PolicyRulepackStatus
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    evidence = {"reference": "DPDP-2023-s7", "kind": "statute", "uri": "https://example.test/law"}
+
+    def store_pack(pack: RulepackInput):
+        with ctx.session_factory() as session:
+            result = CompliancePolicyRulepackStore(session).add_version(pack)
+            session.commit()
+            return result.id, result.version
+
+    def refuse(pack: RulepackInput) -> str | None:
+        with ctx.session_factory() as session:
+            try:
+                CompliancePolicyRulepackStore(session).add_version(pack)
+                session.commit()
+                return None  # unexpectedly accepted
+            except PolicyRulepackValidationError as exc:
+                session.rollback()
+                return exc.code
+
+    def count() -> int:
+        with ctx.session_factory() as session:
+            return len(CompliancePolicyRulepackStore(session).versions("IN"))
+
+    out: dict = {}
+
+    # 1) a complete, valid India fixture — one allow (law) and one deny (product) rule.
+    complete = RulepackInput(
+        jurisdiction="IN",
+        title="India baseline policy",
+        evidence={"reference": "POLICY-REVIEW-2026-11", "kind": "legal_review"},
+        rules=[
+            PolicyRuleInput(
+                effect="allow",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required", "trust_tier": ["official_registry"]},
+                evidence=evidence,
+                effective_from=now,
+                expires_at=now + timedelta(days=365),
+            ),
+            PolicyRuleInput(
+                effect="deny",
+                action="contact",
+                channel="sms",
+                authority="product",
+                conditions={"registration_required": True},
+                evidence={"reference": "PRODUCT-POLICY-1", "kind": "product_default"},
+            ),
+        ],
+    )
+    pack_id, version = store_pack(complete)
+    with ctx.session_factory() as session:
+        row = session.get(CompliancePolicyRulepack, pack_id)
+        out["complete"] = {
+            "version": row.version,
+            "status": row.status,
+            "is_live": CompliancePolicyRulepackStore.is_active(row),
+            "rule_count": len(row.rules),
+            "authorities": sorted({r["authority"] for r in row.rules}),
+            "channels": sorted({r["channel"] for r in row.rules}),
+        }
+
+    # 2) a fixture whose rule has NO effective dates — valid, unbounded (version 2).
+    no_dates = RulepackInput(
+        jurisdiction="IN",
+        title="unbounded product default",
+        rules=[
+            PolicyRuleInput(
+                effect="deny",
+                action="acquire",
+                authority="product",
+                evidence={"reference": "PRODUCT-DEFAULT", "kind": "product_default"},
+            )
+        ],
+    )
+    _, v2 = store_pack(no_dates)
+    with ctx.session_factory() as session:
+        row2 = CompliancePolicyRulepackStore(session).get_version(v2)
+        out["no_effective_dates"] = {
+            "version": row2.version,
+            "status": row2.status,
+            "effective_from": row2.rules[0]["effective_from"],
+            "expires_at": row2.rules[0]["expires_at"],
+        }
+
+    rows_before_rejections = count()
+
+    # 3) a CONTRADICTORY fixture: same scope, allow AND deny, overlapping (unbounded) window.
+    contradictory = RulepackInput(
+        jurisdiction="IN",
+        rules=[
+            PolicyRuleInput(
+                effect="allow",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required"},
+                evidence=evidence,
+            ),
+            PolicyRuleInput(
+                effect="deny",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required"},
+                evidence=evidence,
+            ),
+        ],
+    )
+    out["contradictory_code"] = refuse(contradictory)
+
+    # 4a) MALFORMED: non-India jurisdiction.
+    foreign = RulepackInput(
+        jurisdiction="US",
+        rules=[
+            PolicyRuleInput(effect="allow", action="acquire", authority="law", evidence=evidence)
+        ],
+    )
+    out["non_india_code"] = refuse(foreign)
+
+    # 4b) MALFORMED: a rule missing evidence (a rule cannot exist without citing why).
+    no_evidence = RulepackInput(
+        jurisdiction="IN",
+        rules=[PolicyRuleInput(effect="allow", action="acquire", authority="law", evidence={})],
+    )
+    out["missing_evidence_code"] = refuse(no_evidence)
+
+    rows_after_rejections = count()
+    out["rows_unchanged_by_rejections"] = rows_before_rejections == rows_after_rejections
+
+    print("\n1) complete India fixture validated -> stored as a DRAFT (never live):")
+    print(
+        f"   version={out['complete']['version']}  status={out['complete']['status']!r}  "
+        f"live={out['complete']['is_live']}  rules={out['complete']['rule_count']}  "
+        f"authorities={out['complete']['authorities']}  channels={out['complete']['channels']}"
+    )
+    print("\n2) fixture with NO effective dates validated (valid, unbounded rule):")
+    print(
+        f"   version={out['no_effective_dates']['version']}  "
+        f"status={out['no_effective_dates']['status']!r}  "
+        f"effective_from={out['no_effective_dates']['effective_from']}  "
+        f"expires_at={out['no_effective_dates']['expires_at']}"
+    )
+    print("\n3) contradictory fixture (allow AND deny, same scope, overlapping window):")
+    print(f"   add_version -> REFUSED  code={out['contradictory_code']!r}")
+    print("\n4) malformed fixtures:")
+    print(f"   non-India jurisdiction   -> REFUSED  code={out['non_india_code']!r}")
+    print(f"   rule missing evidence    -> REFUSED  code={out['missing_evidence_code']!r}")
+    print(
+        f"\nrows before rejections = {rows_before_rejections}, after = {rows_after_rejections} "
+        f"(rejections staged nothing: {out['rows_unchanged_by_rejections']})"
+    )
+    checks = {
+        "complete_stored_as_draft": out["complete"]["status"] == PolicyRulepackStatus.DRAFT.value
+        and out["complete"]["is_live"] is False,
+        "no_effective_dates_valid": out["no_effective_dates"]["effective_from"] is None,
+        "contradictory_refused": out["contradictory_code"] == REASON_CONTRADICTORY_RULES,
+        "non_india_refused": out["non_india_code"] == REASON_INVALID_JURISDICTION,
+        "missing_evidence_refused": out["missing_evidence_code"] == REASON_MISSING_RULE_EVIDENCE,
+        "rejections_staged_nothing": out["rows_unchanged_by_rejections"] is True,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Defining rules validates a schema and stores a "
+        "reviewable DRAFT — it activates nothing: no rule becomes live just by existing. Malformed or "
+        "contradictory rules are refused before anything is staged.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
