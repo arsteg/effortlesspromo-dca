@@ -44,6 +44,7 @@ DCA_TABLES = {
     "budget_limits",
     "sources",
     "source_terms",
+    "source_term_approvals",
 }
 
 
@@ -739,6 +740,53 @@ def test_0017_creates_source_terms_on_a_preexisting_database(clean_schema):
     assert (
         "uq_source_terms_version" in uniques
     )  # one version per source; a version never overwrites
+    assert (
+        policy is None
+    )  # control-plane catalog: no tenant RLS policy (unlike tenant-owned tables)
+
+
+@requires_pg
+def test_0018_creates_source_term_approvals_on_a_preexisting_database(clean_schema):
+    """DCA-046 — the 0018 create branch (for a DB migrated before ``source_term_approvals`` existed).
+
+    ``source_term_approvals`` is platform control-plane data (NOT tenant-owned), like ``sources`` (0016)
+    and ``source_terms`` (0017), so it has NO RLS policy. A fresh DB gets the table from the metadata
+    baseline (0001), so 0018 is a no-op there. To exercise 0018's real job, upgrade to head, drop the
+    table, stamp history back to 0017, then upgrade to head again — 0018 must recreate the table (with
+    its unique (source_key, terms_version) constraint) and add NO tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "source_term_approvals" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0017_source_terms")  # pretend we predate the source-approval table
+    command.upgrade(cfg, "head")  # 0018 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "source_term_approvals" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("source_term_approvals", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'source_term_approvals' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_source_term_approval_version" in uniques
+    )  # one approval per terms version; never reused
     assert (
         policy is None
     )  # control-plane catalog: no tenant RLS policy (unlike tenant-owned tables)

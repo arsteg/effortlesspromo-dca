@@ -222,6 +222,21 @@ class SourceTermsStatus(str, Enum):
     ACTIVE = "active"
 
 
+class SourceApprovalStatus(str, Enum):
+    """Lifecycle state of a source-configuration approval (DCA-046).
+
+    ``ACTIVE`` — the approval a platform operator recorded is in force: it endorses one reviewed
+    :class:`SourceTerms` version and carries the evidence, reviewer, review date and expiry of the
+    review. ``REVOKED`` is the state a future, disabled revoke capability would move it to; no path
+    in this service writes a ``REVOKED`` approval, so an approval can only be created, never silently
+    withdrawn here. An approval is platform control-plane data and, on its own, enables no acquisition
+    (the source catalog entry staying ENABLED is a separate, disabled capability — DCA-044).
+    """
+
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
 class BusinessProfileDraft(TenantOwned, Base):
     """DCA-036 — a scoped, versioned draft of a business's profile (tenant-owned, RLS-protected).
 
@@ -709,6 +724,73 @@ class SourceTerms(Base):
         String(16),
         default=SourceTermsStatus.DRAFT.value,
         server_default=SourceTermsStatus.DRAFT.value,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class SourceTermsApproval(Base):
+    """DCA-046 — a platform operator's review/approval of one source-terms configuration version.
+
+    Approving a source *configuration* is the capability that lets a reviewed :class:`SourceTerms`
+    version (DCA-045) be accepted independently. One row is one approval: it endorses exactly one
+    ``(source_key, terms_version)`` and records the four review essentials the story requires —
+
+    - ``review_evidence`` — the evidence the operator relied on to approve (``{reference, kind, uri}``);
+      an approval cannot be staged without a non-empty ``reference`` (a bare approval is refused).
+    - ``reviewer_id`` / ``reviewer_type`` — WHO approved: an opaque subject id of a *platform
+      operator* (never a name/email). Approval is a platform-plane action
+      (:attr:`~app.identity.permissions.Scope.SOURCE_TERMS_APPROVE`); a tenant administrator can never
+      perform it — the catalog is shared control-plane data, not a tenant resource.
+    - ``reviewed_at`` — the review DATE (when the operator reviewed), required.
+    - ``expires_at`` — the approval's EXPLICIT expiry, required: an approval lapses rather than living
+      forever, so a stale endorsement must be re-reviewed. ``effective_from`` optionally delays it.
+
+    ``approved_operation_rights`` / ``approved_field_rights`` are a SNAPSHOT of the rights the version
+    documented at approval time — the approval endorses exactly the documented field/use rights and
+    can never exceed them (:class:`~app.services.source_approval.SourceApprovalStore` refuses a request
+    to approve a right the version does not document). The snapshot makes the approval self-describing:
+    a reader sees precisely which field/use rights were accepted, independent of later versions.
+
+    Like :class:`Source` / :class:`SourceTerms`, this is platform CONTROL-PLANE data — a shared
+    registry, deliberately OUTSIDE tenant RLS and never tenant-scoped. It holds only the review record
+    (opaque reviewer id + declarative rights snapshot): no prospect contact data and no secrets.
+    Approving a version promotes that :class:`SourceTerms` row to ``active``, but grants NO acquisition
+    right on its own — the source catalog entry must additionally be ENABLED (DCA-044), which stays a
+    disabled future capability, so an approval never, by itself, authorizes acquisition.
+    """
+
+    __tablename__ = "source_term_approvals"
+    # One approval per terms version: a (source_key, terms_version) pair is approved at most once, so
+    # a double approval is a constraint violation, never a silent second endorsement.
+    __table_args__ = (
+        UniqueConstraint("source_key", "terms_version", name="uq_source_term_approval_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The catalog key + version of the SourceTerms this approval endorses (validated to exist).
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    terms_version: Mapped[int] = mapped_column(Integer)
+    # WHO approved — an opaque platform-operator subject id (never a name/email) plus its kind.
+    reviewer_id: Mapped[str] = mapped_column(String(128))
+    reviewer_type: Mapped[str] = mapped_column(
+        String(32), default="platform_operator", server_default="platform_operator"
+    )
+    # The evidence the operator relied on: {"reference": str, "kind": str, "uri": str}. Required.
+    review_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    # WHEN the operator reviewed (the review date) — required.
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The approval's EXPLICIT validity window — it lapses rather than living in a never-expiring flag.
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Snapshot of the field/use rights the version documented and this approval endorsed — never more
+    # than the version documents (the store refuses an over-reaching approval before staging).
+    approved_operation_rights: Mapped[dict] = mapped_column(JSON, default=dict)
+    approved_field_rights: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=SourceApprovalStatus.ACTIVE.value,
+        server_default=SourceApprovalStatus.ACTIVE.value,
         index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

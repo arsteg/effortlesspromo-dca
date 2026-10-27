@@ -210,6 +210,34 @@ def test_dca045_scenario_proves_per_field_rights_and_reproduces_denials(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca046_scenario_proves_operator_approval_and_tenant_denial(capsys):
+    # The DCA-046 source-approval scenario runs on local synthetic SQLite: it proves a platform
+    # operator's complete review approves a terms version and promotes it to active, a tenant
+    # administrator cannot approve (no state change), and an incomplete / over-reaching review is
+    # refused with no approval created and the source catalog entry still a disabled draft.
+    result = execute(_args(story_id="DCA-046"))
+    assert result.exit_code == 0
+    assert result.summary["tenant_admin_refused"] == "not_platform_operator"
+    assert (
+        result.summary["status_after_tenant_attempt"] == "draft"
+    )  # tenant attempt changed nothing
+    assert result.summary["approvals_after_tenant_attempt"] == 0
+    assert result.summary["denials"]["no evidence"] == "missing_review_evidence"
+    assert (
+        result.summary["denials"]["exceeds documented rights ('share')"]
+        == "approval_exceeds_rights"
+    )
+    assert result.summary["approvals_after_denials"] == 0  # refusals staged nothing
+    assert result.summary["approved"]["reviewer_type"] == "platform_operator"
+    assert result.summary["approved"]["evidence_reference"] == "RIGHTS-REVIEW-2026-11"
+    assert result.summary["approved"]["reviewed_at"] is not None  # review date recorded
+    assert result.summary["approved"]["expires_at"] is not None  # expiry recorded
+    assert result.summary["approved"]["in_force_now"] is True
+    assert result.summary["terms_status_after_approval"] == "active"  # version promoted
+    assert result.summary["source_still_disabled_draft"] is True  # acquisition not enabled
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

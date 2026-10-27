@@ -4254,6 +4254,195 @@ def _dca_045(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-046",
+    "approve a source configuration: a platform operator's complete review (evidence + reviewer + "
+    "review date + expiry) approves a recorded terms version and promotes it to active; a tenant "
+    "administrator cannot approve (no state change); an incomplete review and an approval exceeding "
+    "the documented rights are each refused with no approval created",
+)
+def _dca_046(ctx: CheckContext) -> dict:
+    """Drive the real DCA-046 source-approval store against a disposable DB, following the developer
+    manual-test steps and showing actual rows (``source_term_approvals`` is a platform registry, so
+    there is no tenant HTTP surface — the inspectable artifact is the approval row and the promoted
+    terms status):
+
+      1. catalogue a source (DCA-044) and record a terms VERSION (DCA-045) to review;
+      2. a TENANT ADMINISTRATOR attempts the approval -> refused (not a platform operator); the
+         version stays a draft and NO approval row is created;
+      3. an INCOMPLETE operator review (no evidence) -> refused, nothing staged; an approval that
+         tries to EXCEED the documented rights ('share', which the version denies) -> refused;
+      4. a PLATFORM OPERATOR's COMPLETE review -> approved: all four essentials (evidence, reviewer,
+         review date, expiry) are recorded and the version is promoted draft -> active.
+
+    Local synthetic only (AI disabled, ephemeral DB). The source catalog entry stays a DISABLED draft
+    throughout — approving the terms configuration grants no acquisition right on its own (enabling the
+    source is a separate, disabled capability).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import SourceTermsApproval, SourceTermsStatus
+    from app.services.source_approval import (
+        REASON_APPROVAL_EXCEEDS_RIGHTS,
+        REASON_MISSING_EVIDENCE,
+        REASON_NOT_PLATFORM_OPERATOR,
+        ReviewerPrincipal,
+        SourceApprovalAuthorizationError,
+        SourceApprovalError,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    source_key = "mca_master_data"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    tenant_admin = ReviewerPrincipal(subject="user-owner-A", roles=("owner", "admin"))
+
+    def review(**overrides) -> SourceApprovalReview:
+        data = {
+            "reviewer_id": "op-001",
+            "evidence": {"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+            "reviewed_at": now,
+            "expires_at": now + timedelta(days=365),
+        }
+        data.update(overrides)
+        return SourceApprovalReview(**data)
+
+    out: dict = {}
+
+    # 1) catalogue the source + record a terms version to review
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                name="MCA Company Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "store": True, "display": True, "export": True},
+                field_rights={"email": {"display": True, "export": False}},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        session.commit()
+
+    # 2) a tenant administrator cannot approve — refused, nothing changes
+    with ctx.session_factory() as session:
+        store = SourceApprovalStore(session)
+        try:
+            store.approve(source_key, 1, review(reviewer_id="user-owner-A"), tenant_admin)
+            out["tenant_admin_refused"] = "UNEXPECTEDLY APPROVED"
+        except SourceApprovalAuthorizationError as exc:
+            out["tenant_admin_refused"] = exc.code
+        session.commit()
+    with ctx.session_factory() as session:
+        terms = SourceTermsStore(session).get_version(source_key, 1)
+        out["status_after_tenant_attempt"] = terms.status if terms else None
+        out["approvals_after_tenant_attempt"] = session.query(SourceTermsApproval).count()
+
+    # 3) incomplete review + an over-reaching approval are each refused (nothing staged)
+    with ctx.session_factory() as session:
+        store = SourceApprovalStore(session)
+        denials: dict = {}
+        try:
+            store.approve(source_key, 1, review(evidence={}), operator)
+            denials["no evidence"] = "UNEXPECTEDLY APPROVED"
+        except SourceApprovalError as exc:
+            denials["no evidence"] = exc.code
+        try:
+            store.approve(
+                source_key, 1, review(requested_operation_rights={"share": True}), operator
+            )
+            denials["exceeds documented rights ('share')"] = "UNEXPECTEDLY APPROVED"
+        except SourceApprovalError as exc:
+            denials["exceeds documented rights ('share')"] = exc.code
+        session.commit()
+        out["denials"] = denials
+    with ctx.session_factory() as session:
+        out["approvals_after_denials"] = session.query(SourceTermsApproval).count()
+
+    # 4) a platform operator's complete review approves and promotes the version
+    with ctx.session_factory() as session:
+        SourceApprovalStore(session).approve(source_key, 1, review(), operator)
+        session.commit()
+    with ctx.session_factory() as session:
+        store = SourceApprovalStore(session)
+        approval = store.approval_for(source_key, 1)
+        assert approval is not None
+        terms = SourceTermsStore(session).get_version(source_key, 1)
+        assert terms is not None
+        catalog = SourceCatalogStore(session)
+        source = catalog.get(source_key)
+        out["approved"] = {
+            "source_key": approval.source_key,
+            "terms_version": approval.terms_version,
+            "reviewer_id": approval.reviewer_id,
+            "reviewer_type": approval.reviewer_type,
+            "evidence_reference": approval.review_evidence.get("reference"),
+            "reviewed_at": approval.reviewed_at.isoformat() if approval.reviewed_at else None,
+            "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+            "in_force_now": store.is_in_force(approval, now=now),
+        }
+        out["terms_status_after_approval"] = terms.status
+        out["source_still_disabled_draft"] = source is not None and not catalog.is_usable(source)
+
+        print("\n1) catalogued source + recorded terms version 1 (DCA-044/045).")
+        print("\n2) tenant administrator attempts the approval:")
+        print(
+            f"   owner/admin@A -> REFUSED ({out['tenant_admin_refused']})  "
+            f"terms status still '{out['status_after_tenant_attempt']}'  "
+            f"approvals={out['approvals_after_tenant_attempt']}"
+        )
+        print("\n3) incomplete / over-reaching reviews (each refused, nothing staged):")
+        for label, code in out["denials"].items():
+            print(f"   {label:38} -> refused ({code})")
+        print(f"   approvals after refusals: {out['approvals_after_denials']}")
+        print("\n4) platform operator's COMPLETE review -> approved (actual approval row):")
+        for k, v in out["approved"].items():
+            print(f"     {k:20} = {v}")
+        print(
+            f"   endorsed terms version promoted: status now "
+            f"'{out['terms_status_after_approval']}' (was 'draft')"
+        )
+        print(
+            f"   source catalog entry still a disabled draft "
+            f"(acquisition NOT enabled): {out['source_still_disabled_draft']}"
+        )
+
+    exceeds_key = "exceeds documented rights ('share')"
+    no_state_change = (
+        out["status_after_tenant_attempt"] == SourceTermsStatus.DRAFT.value
+        and out["approvals_after_tenant_attempt"] == 0
+    )
+    print(
+        "\nchecks: "
+        f"tenant_admin_refused={out['tenant_admin_refused'] == REASON_NOT_PLATFORM_OPERATOR}  "
+        f"no_state_change_on_tenant_attempt={no_state_change}  "
+        f"incomplete_refused={out['denials']['no evidence'] == REASON_MISSING_EVIDENCE}  "
+        f"exceeds_rights_refused={out['denials'][exceeds_key] == REASON_APPROVAL_EXCEEDS_RIGHTS}  "
+        f"refusals_staged_nothing={out['approvals_after_denials'] == 0}  "
+        f"operator_approved={out['approved']['reviewer_type'] == 'platform_operator'}  "
+        f"version_promoted={out['terms_status_after_approval'] == SourceTermsStatus.ACTIVE.value}  "
+        f"source_still_disabled={out['source_still_disabled_draft']}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action. Approval is a PLATFORM-operator action — a tenant "
+        "administrator cannot perform it; the approval records evidence/reviewer/review-date/expiry and "
+        "cannot exceed the documented rights. Promoting the terms version does NOT enable acquisition: "
+        f"the source catalog entry stays a disabled draft. Table used: {SourceTermsApproval.__tablename__} "
+        "— a platform control-plane registry, not tenant-scoped.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",

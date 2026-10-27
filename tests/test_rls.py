@@ -66,6 +66,8 @@ def test_platform_catalog_tables_are_excluded():
     assert "sources" not in tenant_owned_tables()
     # The DCA-045 source terms registry is platform control-plane data, also outside tenant RLS.
     assert "source_terms" not in tenant_owned_tables()
+    # The DCA-046 source-approval registry is platform control-plane data, also outside tenant RLS.
+    assert "source_term_approvals" not in tenant_owned_tables()
 
 
 # --- Postgres-backed RLS behaviour ----------------------------------------------------------------

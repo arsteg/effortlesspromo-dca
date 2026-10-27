@@ -10,7 +10,11 @@ they never overlap:
 - **Platform plane** — scopes a platform operator holds over the *platform itself*. A platform
   operator gets platform scopes only; it gets NO business scope for any tenant, so global operator
   rights never authorize a client-business action. Acting *as* a client (delegated tenant support)
-  requires a separate, scoped, expiring grant — a later story — and stays disabled here.
+  requires a separate, scoped, expiring grant — a later story — and stays disabled here. Approving a
+  shared source *configuration* (its catalog entry + terms, DCA-046) lives HERE on the platform plane
+  (:attr:`Scope.SOURCE_TERMS_APPROVE`): the catalog is platform control-plane data shared across all
+  tenants, so a tenant administrator can never approve it — the business ``source.approve`` scope
+  below is a business-local intent, not authority over the shared catalog.
 
 The two scope sets are disjoint, so :func:`scopes_for_business_roles` can never return a platform
 scope and :func:`scopes_for_platform_roles` can never return a business scope — crossing a plane is
@@ -34,6 +38,11 @@ class Scope(str, Enum):
 
     # --- platform plane (granted to platform operators only) ---
     PLATFORM_OPS_READ = "platform.ops.read"  # operator: read platform-wide operational state
+    # operator: approve a source configuration (DCA-046). A PLATFORM action, NOT a business one:
+    # a source catalog entry and its terms are platform control-plane data shared across all tenants,
+    # so approving them is never a tenant-admin right. Kept on the platform plane precisely so a
+    # business administrator (``source.approve`` below) can never perform the catalog approval.
+    SOURCE_TERMS_APPROVE = "platform.source.terms.approve"
 
 
 # Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
@@ -55,7 +64,7 @@ BUSINESS_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
 # business map on purpose: membership in a business can never yield a platform scope.
 PLATFORM_OPERATOR_ROLE = "platform_operator"
 PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
-    PLATFORM_OPERATOR_ROLE: frozenset({Scope.PLATFORM_OPS_READ}),
+    PLATFORM_OPERATOR_ROLE: frozenset({Scope.PLATFORM_OPS_READ, Scope.SOURCE_TERMS_APPROVE}),
 }
 
 _BUSINESS_SCOPES = frozenset().union(*BUSINESS_ROLE_SCOPES.values())
