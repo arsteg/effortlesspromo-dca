@@ -6330,6 +6330,312 @@ def _dca_056(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-057",
+    "persist policy decision evidence: record an ALLOW traceable to the EXACT reviewed rulepack version "
+    "/ DCA-053 approval / engine version / evidence + immutable snapshot, with the relevant consent/"
+    "suppression/source version tags and an EXPLICIT expiry (a stored ALLOW can never imply permanent "
+    "authorization — the writer refuses an ALLOW with no expiry); reproduce the decision AND a relevant "
+    "denial from the stored row ALONE (no state change, even after the live pack changes); decisions are "
+    "tenant-scoped and each stages an atomic DCA-026 audit entry",
+)
+def _dca_057(ctx: CheckContext) -> dict:
+    """Persist and inspect real policy-decision records against a disposable DB (manual-test step 2):
+
+      1. record a DCA-052 India rulepack (one consented-email allow rule) and promote it in force via a
+         DCA-053 operator approval whose review expires 2027-11-01;
+      2. evaluate_and_record the SAME consented request for Business A -> an ALLOW row whose expiry IS
+         the review expiry (so it lapses with the review it rests on — never a standing grant), pinning
+         the rulepack version / approval / engine version / evidence / immutable snapshot fingerprint and
+         the relevant consent/suppression/source version tags;
+      3. open the stored row and resolve the referenced policy version: reproduce() the decision from the
+         row alone (even after the live pack is superseded by a deny) -> the SAME ALLOW; is_in_force is
+         True before the expiry and False at/after it (not permanent);
+      4. the rejection case: record a fail-closed DENY for a request with no consent -> reproduce() from
+         the row reproduces the DENY, is_in_force is always False, and NO prohibited state changed;
+      5. refusal: recording an ALLOW with NO expiry is refused (allow_requires_expiry) and stages no row;
+      6. tenant scoping: Business B cannot read Business A's decision record (reads as not-found).
+
+    The evaluator/record path is pure Python — no model is consulted. Local synthetic only (AI disabled,
+    ephemeral DB). Wired into no send/acquisition path: recording a decision enforces nothing — future
+    capabilities stay disabled.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.compliance.policy_engine import (
+        REASON_ALLOWED_BY_RULE,
+        REASON_NO_IN_FORCE_PACK,
+        InForcePack,
+        PolicyDecision,
+        PolicyRequest,
+        decide,
+        replay,
+    )
+    from app.compliance.policy_rulepacks import (
+        CompliancePolicyRulepackStore,
+        PolicyRuleInput,
+        RulepackInput,
+    )
+    from app.db.models import AuditEvent, PolicyDecisionRecord
+    from app.services.policy_approval import (
+        PolicyApprovalReview,
+        PolicyApprovalStore,
+        PolicyReviewerPrincipal,
+    )
+    from app.services.policy_decision_record import (
+        REASON_ALLOW_REQUIRES_EXPIRY,
+        PolicyDecisionContext,
+        PolicyDecisionRecordError,
+        PolicyDecisionRecordStore,
+        evaluate_and_record,
+    )
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0057", type=ActorType.USER)
+    operator = PolicyReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    at = datetime(2026, 11, 1, 0, 0, tzinfo=UTC)
+    before = at - timedelta(seconds=1)
+    review_expiry = at + timedelta(days=365)
+    consented = PolicyRequest(action="contact", channel="email", facts={"consent": "present"})
+    # Consent explicitly absent => the allow rule is excluded => default-deny (a clean relevant denial).
+    no_consent = PolicyRequest(action="contact", channel="email", facts={"consent": "absent"})
+
+    pack = RulepackInput(
+        jurisdiction="IN",
+        title="India notice/consent",
+        evidence={"reference": "POLICY-REVIEW-2026-11", "kind": "legal_review"},
+        rules=[
+            PolicyRuleInput(
+                effect="allow",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required"},
+                evidence={"reference": "DPDP-2023-s7", "kind": "statute"},
+            )
+        ],
+    )
+    review = PolicyApprovalReview(
+        reviewer_id="op-001",
+        references={"reference": "LEGAL-REVIEW-2026-11", "kind": "legal_review"},
+        reviewed_at=before,
+        expires_at=review_expiry,
+    )
+
+    out: dict = {}
+
+    # 1) record + promote the in-force pack.
+    with ctx.session_factory() as session:
+        CompliancePolicyRulepackStore(session).add_version(pack)
+        session.commit()
+    with ctx.session_factory() as session:
+        PolicyApprovalStore(session).approve(1, review, operator)
+        session.commit()
+
+    # 2) evaluate_and_record the consented ALLOW for Business A.
+    with ctx.session_factory() as session:
+        evaluation, record = evaluate_and_record(
+            session,
+            biz_a,
+            consented,
+            actor=actor,
+            now=at,
+            context=PolicyDecisionContext(
+                consent_version="consent-basis-v3",
+                suppression_version="suppress-2026-10",
+                source_versions={"mca_master_data": 2},
+            ),
+        )
+        session.commit()
+        allow_id = record.id
+
+    # 3) open the ALLOW row, reproduce it (live pack superseded), check expiry/freshness.
+    superseded = InForcePack(
+        jurisdiction="IN",
+        version=2,
+        approval_id="appr-2",
+        rules=[
+            {
+                "effect": "deny",
+                "action": "contact",
+                "channel": "email",
+                "authority": "law",
+                "conditions": {},
+                "evidence": {"reference": "LATER-OVERRIDE"},
+                "effective_from": None,
+                "expires_at": None,
+            }
+        ],
+    )
+    with ctx.session_factory() as session:
+        store = PolicyDecisionRecordStore(session, biz_a)
+        allow_row = store.get(allow_id)
+        assert allow_row is not None
+        reproduced_allow = PolicyDecisionRecordStore.reproduce(allow_row)
+        live_after_supersede = decide(consented, superseded, now=at)
+        snapshot_replay = replay(consented, evaluation.snapshot) if evaluation.snapshot else None
+        rows_after_read = session.query(PolicyDecisionRecord).count()
+        out["allow_record"] = {
+            "id": allow_row.id,
+            "decision": allow_row.decision,
+            "reason_codes": list(allow_row.reason_codes),
+            "rulepack_version": allow_row.rulepack_version,
+            "approval_id": allow_row.approval_id,
+            "engine_version": allow_row.engine_version,
+            "decisive_authority": allow_row.decisive_authority,
+            "snapshot_fingerprint": allow_row.snapshot_fingerprint[:12] + "…",
+            "references": dict(allow_row.references),
+            "expires_at": allow_row.expires_at.isoformat() if allow_row.expires_at else None,
+            "in_force_before_expiry": PolicyDecisionRecordStore.is_in_force(
+                allow_row, now=review_expiry - timedelta(days=1)
+            ),
+            "in_force_at_expiry": PolicyDecisionRecordStore.is_in_force(
+                allow_row, now=review_expiry
+            ),
+        }
+        out["reproduce_allow"] = {
+            "live_decision_after_supersede": live_after_supersede.decision.value,
+            "reproduced_from_row": reproduced_allow.decision.value,
+            "reproduced_fingerprint_matches": (
+                reproduced_allow.snapshot is not None
+                and reproduced_allow.snapshot.fingerprint == allow_row.snapshot_fingerprint
+            ),
+            "replay_from_snapshot": snapshot_replay.decision.value if snapshot_replay else None,
+            "read_changed_no_state": rows_after_read == 1,
+        }
+
+    # 4) rejection case: a fail-closed DENY (no consent -> indeterminate/deny) persists + reproduces.
+    with ctx.session_factory() as session:
+        evaluation_d, record_d = evaluate_and_record(
+            session, biz_a, no_consent, actor=actor, now=at
+        )
+        session.commit()
+        deny_id = record_d.id
+    with ctx.session_factory() as session:
+        deny_row = PolicyDecisionRecordStore(session, biz_a).get(deny_id)
+        assert deny_row is not None
+        reproduced_deny = PolicyDecisionRecordStore.reproduce(deny_row)
+        out["denial_record"] = {
+            "id": deny_row.id,
+            "decision": deny_row.decision,
+            "reason_codes": list(deny_row.reason_codes),
+            "expires_at": deny_row.expires_at.isoformat() if deny_row.expires_at else None,
+            "is_in_force": PolicyDecisionRecordStore.is_in_force(deny_row, now=at),
+            "reproduced_from_row": reproduced_deny.decision.value,
+        }
+
+    # 5) refusal: an ALLOW with NO expiry is refused and stages no row.
+    allow_pack = InForcePack(
+        jurisdiction="IN",
+        version=1,
+        approval_id="appr-1",
+        rules=[
+            {
+                "effect": "allow",
+                "action": "contact",
+                "channel": "email",
+                "authority": "law",
+                "conditions": {"consent": "required"},
+                "evidence": {"reference": "DPDP-2023-s7"},
+                "effective_from": None,
+                "expires_at": None,
+            }
+        ],
+    )
+    allow_eval = decide(consented, allow_pack, now=at)
+    refusal_code = None
+    with ctx.session_factory() as session:
+        try:
+            PolicyDecisionRecordStore(session, biz_a).record(
+                allow_eval, consented, actor=actor, expires_at=None
+            )
+        except PolicyDecisionRecordError as exc:
+            refusal_code = exc.code
+        session.rollback()
+    out["refusal_allow_without_expiry"] = {
+        "code": refusal_code,
+        "stages_no_row": refusal_code == REASON_ALLOW_REQUIRES_EXPIRY,
+    }
+
+    # 6) tenant scoping + atomic audit.
+    with ctx.session_factory() as session:
+        b_sees = PolicyDecisionRecordStore(session, biz_b).get(allow_id)
+        a_count = len(PolicyDecisionRecordStore(session, biz_a).list())
+        audits = session.query(AuditEvent).count()
+    out["tenant_scoping"] = {
+        "business_b_can_read_a_record": b_sees is not None,
+        "business_a_record_count": a_count,
+        "atomic_audit_entries": audits,
+    }
+
+    print("\n2) recorded a traceable ALLOW for Business A (open its decision record):")
+    for k, v in out["allow_record"].items():
+        print(f"     {k:28} = {v}")
+    print("\n3) reproduce the ALLOW from the stored row ALONE (live pack superseded by a deny):")
+    for k, v in out["reproduce_allow"].items():
+        print(f"     {k:28} = {v}")
+    print("\n4) rejection case — a persisted denial reproduces and is never in force:")
+    for k, v in out["denial_record"].items():
+        print(f"     {k:28} = {v}")
+    print("\n5) refusal — a stored ALLOW cannot imply permanent authorization:")
+    for k, v in out["refusal_allow_without_expiry"].items():
+        print(f"     {k:28} = {v}")
+    print("\n6) tenant scoping + atomic audit:")
+    for k, v in out["tenant_scoping"].items():
+        print(f"     {k:28} = {v}")
+
+    checks = {
+        "allow_traceable_to_reviewed_rule": (
+            out["allow_record"]["decision"] == PolicyDecision.ALLOW.value
+            and out["allow_record"]["reason_codes"] == [REASON_ALLOWED_BY_RULE]
+            and out["allow_record"]["rulepack_version"] == 1
+            and out["allow_record"]["approval_id"] is not None
+        ),
+        "allow_captures_relevant_versions": (
+            out["allow_record"]["references"].get("consent_version") == "consent-basis-v3"
+            and out["allow_record"]["references"].get("suppression_version") == "suppress-2026-10"
+            and out["allow_record"]["references"].get("source_versions") == {"mca_master_data": 2}
+        ),
+        "allow_not_permanent": (
+            out["allow_record"]["expires_at"] is not None
+            and out["allow_record"]["in_force_before_expiry"] is True
+            and out["allow_record"]["in_force_at_expiry"] is False
+        ),
+        "allow_reproduces_from_row_after_supersede": (
+            out["reproduce_allow"]["live_decision_after_supersede"] == PolicyDecision.DENY.value
+            and out["reproduce_allow"]["reproduced_from_row"] == PolicyDecision.ALLOW.value
+            and out["reproduce_allow"]["reproduced_fingerprint_matches"] is True
+            and out["reproduce_allow"]["read_changed_no_state"] is True
+        ),
+        "denial_reproduces_and_never_in_force": (
+            out["denial_record"]["is_in_force"] is False
+            and out["denial_record"]["reproduced_from_row"] == out["denial_record"]["decision"]
+        ),
+        "allow_without_expiry_refused_no_row": out["refusal_allow_without_expiry"]["stages_no_row"]
+        is True,
+        "records_are_tenant_scoped": (
+            out["tenant_scoping"]["business_b_can_read_a_record"] is False
+            and out["tenant_scoping"]["business_a_record_count"] == 2
+        ),
+        "every_record_has_atomic_audit": out["tenant_scoping"]["atomic_audit_entries"] == 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    _ = REASON_NO_IN_FORCE_PACK  # referenced for clarity in the denial narrative above
+    print(
+        "\n(local synthetic only; no AI/paid action. A stored ALLOW pins the EXACT reviewed rulepack "
+        "version / DCA-053 approval / engine version / evidence + immutable snapshot and the relevant "
+        "consent/suppression/source version tags, and carries an explicit expiry so it can NEVER imply "
+        "permanent authorization. Any decision reproduces from its stored row ALONE — the result and the "
+        "relevant denial — even after the live pack changes, with no state change. Records are "
+        "tenant-scoped and each stages an atomic audit entry. Recording a decision is wired into no "
+        "send/acquisition path: future capabilities stay disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",

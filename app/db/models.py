@@ -1067,6 +1067,111 @@ class CompliancePolicyApproval(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class PolicyDecisionOutcome(str, Enum):
+    """The four outcomes a persisted policy decision can record (mirrors
+    :class:`~app.compliance.policy_engine.PolicyDecision`; kept as a column value for query/filter).
+
+    ``ALLOW`` is the ONLY outcome that grants the personal-data permission — and even then only within
+    the recorded decision's explicit expiry (:attr:`PolicyDecisionRecord.expires_at`). ``DENY`` /
+    ``REVIEW`` / ``NOT_APPLICABLE`` grant nothing. The outcome is a safe, stable code — never free text.
+    """
+
+    ALLOW = "allow"
+    DENY = "deny"
+    REVIEW = "review"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class PolicyDecisionRecord(TenantOwned, Base):
+    """DCA-057 — a durable, auditable record of ONE policy decision (tenant-owned, RLS-protected).
+
+    One row is one evaluation of a single :class:`~app.compliance.policy_engine.PolicyRequest` against
+    the in-force India compliance policy (DCA-052/053) by the deterministic DCA-055/056 evaluator,
+    persisted so the result can be *reviewed and reproduced independently*. Expressing a decision
+    enforces nothing — the DCA has no send/acquisition path — but recording one preserves WHY an action
+    was allowed or denied, traceable to the exact reviewed rule/evidence set, bounded by an explicit
+    expiry so a stored ALLOW can never imply *permanent* authorization.
+
+    The load-bearing guarantees (the DCA-057 acceptance criteria):
+
+    - **A stored ALLOW is traceable to the exact reviewed rule/evidence set and is NOT permanent.** The
+      row pins the in-force ``rulepack_version`` + ``approval_id`` (the DCA-053 review that put the pack
+      in force), the ``engine_version``, the ``evidence`` actually consulted, and the immutable,
+      content-fingerprinted evaluation-time ``snapshot`` (DCA-056) — so a reader can resolve the precise
+      obligations/rules that decided it. Every ALLOW additionally carries a non-null ``expires_at`` (the
+      single writer refuses to persist an ALLOW without one): the authorization lapses with the review
+      it rests on, so a stored ALLOW is never read as a standing grant.
+
+    - **The decision reproduces from the row ALONE, with no state change.** ``request_facts`` +
+      ``snapshot`` are a complete, self-contained capture;
+      :meth:`~app.services.policy_decision_record.PolicyDecisionRecordStore.reproduce` rebuilds the
+      request and replays the snapshot (or re-decides a fail-closed denial whose snapshot is ``None``)
+      to yield the identical decision — even after the live pack has changed — reading only this row and
+      writing nothing.
+
+    - **Relevant source / consent / suppression versions are captured.** ``references`` records the
+      opaque version identifiers the decision was taken under (e.g. consent-basis version, suppression-
+      list version, per-source terms versions), so the decision can be tied to the exact inputs that
+      governed it. These are declarative version tags, never recipient contact data.
+
+    ``decision`` is a safe :class:`PolicyDecisionOutcome` code and ``reason_codes`` the stable reason
+    codes the engine returned (never free-form text). ``actor_id`` / ``actor_type`` record WHO persisted
+    the record (an opaque subject id, never a name/email) — the same actor the atomic DCA-026 audit entry
+    carries, staged in the SAME unit of work as the row.
+
+    This is the tenant's OWN decision evidence (declarative policy metadata: rule obligations, version
+    tags, categorical facts such as consent-present) — NOT prospect contact data or secrets — so, like
+    :class:`BusinessProfileDraft` / :class:`IcpDraft`, its JSON fields are not opaque-reference screened
+    (the atomic audit entry it stages IS screened). Tenant-owned: it inherits the DCA-017 ``business_id``
+    column and the DCA-018 RLS policy like every other tenant data table, so one business can never read
+    another's decision records.
+    """
+
+    __tablename__ = "policy_decision_records"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The resolved recipient jurisdiction the decision was taken for (India-only service: "IN", or ""
+    # when it could not be resolved — a fail-closed DENY).
+    jurisdiction: Mapped[str] = mapped_column(String(2), default="", server_default="")
+    # The acquisition/contact scope the request named (controlled vocabularies at evaluation time).
+    action: Mapped[str] = mapped_column(String(32))
+    channel: Mapped[str] = mapped_column(String(32), default="any", server_default="any")
+    # The safe outcome code (allow/deny/review/not_applicable) and the stable reason codes behind it.
+    decision: Mapped[str] = mapped_column(String(16), index=True)
+    reason_codes: Mapped[list] = mapped_column(JSON, default=list)
+    # The EXACT reviewed content the decision rests on: the in-force rulepack version + the DCA-053
+    # approval that put it in force + the evaluator version. NULL version/approval => a fail-closed
+    # denial taken with no in-force pack (a missing pack can never allow).
+    rulepack_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    approval_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    engine_version: Mapped[int] = mapped_column(Integer, default=1)
+    # Which authority's rule decided an allow/deny (law/provider/product), for a quick read.
+    decisive_authority: Mapped[str | None] = mapped_column(String(16), default=None)
+    # The evidence actually consulted (rule(s)/pack/approval) — traceable to the reviewed rule set.
+    evidence: Mapped[list] = mapped_column(JSON, default=list)
+    # Opaque version tags of the relevant inputs the decision was taken under: consent basis version,
+    # suppression-list version, per-source terms versions, etc. Declarative tags, never contact data.
+    references: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The request's asserted facts (categorical context: consent-present, trust tier, hour, …) — needed
+    # to reproduce the decision from the row alone. NOT contact data; retained exactly as supplied.
+    request_facts: Mapped[dict] = mapped_column(JSON, default=dict)
+    involves_personal_data: Mapped[bool] = mapped_column(Boolean, default=True)
+    # The immutable, content-fingerprinted evaluation-time snapshot (DCA-056), serialized. NULL for a
+    # fail-closed denial taken before any pack was consulted (reproduced by re-deciding with no pack).
+    snapshot: Mapped[dict | None] = mapped_column(JSON, default=None)
+    snapshot_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The evaluation moment the decision was taken at (replay re-decides at exactly this instant).
+    evaluated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The decision's EXPLICIT expiry — required for an ALLOW so a stored allow can never imply permanent
+    # authorization; it lapses with the review it rests on. NULL is permitted only for a non-ALLOW.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # WHO persisted the record — an opaque subject id (never a name/email) plus its kind, screened by the
+    # audit sink in the SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class BusinessSourceEntitlement(TenantOwned, Base):
     """DCA-047 — a business's own, versioned entitlement to a platform-approved source (tenant-owned).
 

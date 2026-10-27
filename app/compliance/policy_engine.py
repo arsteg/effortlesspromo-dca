@@ -544,6 +544,93 @@ def replay(request: PolicyRequest, snapshot: EvaluationSnapshot) -> PolicyEvalua
     return decide(request, pack, now=moment)
 
 
+# --------------------------------------------------------------------------------------------------
+# Plain-data (de)serialization — lets a durable store (DCA-057) persist a request + its immutable
+# snapshot as JSON and reproduce the exact decision from the stored row ALONE. These are pure, lossless
+# round-trips over the frozen shapes above; they add no I/O and consult no model.
+# --------------------------------------------------------------------------------------------------
+
+
+def request_to_dict(request: PolicyRequest) -> dict:
+    """Serialize a :class:`PolicyRequest` to a JSON-storable dict (lossless)."""
+    return {
+        "action": request.action,
+        "channel": request.channel,
+        "jurisdiction": request.jurisdiction,
+        "involves_personal_data": request.involves_personal_data,
+        "facts": dict(request.facts or {}),
+    }
+
+
+def request_from_dict(data: dict) -> PolicyRequest:
+    """Rebuild a :class:`PolicyRequest` from :func:`request_to_dict` output."""
+    return PolicyRequest(
+        action=data["action"],
+        channel=data.get("channel", RuleChannel.ANY.value),
+        jurisdiction=data.get("jurisdiction", INDIA_JURISDICTION),
+        involves_personal_data=bool(data.get("involves_personal_data", True)),
+        facts=dict(data.get("facts", {}) or {}),
+    )
+
+
+def snapshot_to_dict(snapshot: EvaluationSnapshot) -> dict:
+    """Serialize an immutable :class:`EvaluationSnapshot` to a JSON-storable dict (lossless)."""
+    return {
+        "evaluated_at": snapshot.evaluated_at,
+        "jurisdiction": snapshot.jurisdiction,
+        "rulepack_version": snapshot.rulepack_version,
+        "approval_id": snapshot.approval_id,
+        "engine_version": snapshot.engine_version,
+        "fingerprint": snapshot.fingerprint,
+        "selected_rules": [
+            {
+                "obligation": r.obligation,
+                "effect": r.effect,
+                "action": r.action,
+                "channel": r.channel,
+                "authority": r.authority,
+                "conditions_json": r.conditions_json,
+                "reference": r.reference,
+                "effective_from": r.effective_from,
+                "expires_at": r.expires_at,
+                "time_eligible": r.time_eligible,
+            }
+            for r in snapshot.selected_rules
+        ],
+    }
+
+
+def snapshot_from_dict(data: dict) -> EvaluationSnapshot:
+    """Rebuild an immutable :class:`EvaluationSnapshot` from :func:`snapshot_to_dict` output.
+
+    The reconstructed snapshot is frozen exactly like the original, so a stored decision stays
+    self-contained and :func:`replay` reproduces the identical result (and the identical fingerprint).
+    """
+    return EvaluationSnapshot(
+        evaluated_at=data["evaluated_at"],
+        jurisdiction=data["jurisdiction"],
+        rulepack_version=data.get("rulepack_version"),
+        approval_id=data.get("approval_id"),
+        engine_version=int(data.get("engine_version", POLICY_ENGINE_VERSION)),
+        selected_rules=tuple(
+            RuleSnapshot(
+                obligation=r["obligation"],
+                effect=r["effect"],
+                action=r["action"],
+                channel=r["channel"],
+                authority=r["authority"],
+                conditions_json=r["conditions_json"],
+                reference=r["reference"],
+                effective_from=r.get("effective_from"),
+                expires_at=r.get("expires_at"),
+                time_eligible=bool(r["time_eligible"]),
+            )
+            for r in data.get("selected_rules", [])
+        ),
+        fingerprint=data["fingerprint"],
+    )
+
+
 def _fail_closed(
     request: PolicyRequest,
     jurisdiction: str,
