@@ -28,6 +28,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false as sa_false,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -138,6 +139,47 @@ class ProfileStatus(str, Enum):
 
     DRAFT = "draft"
     CONFIRMED = "confirmed"
+
+
+class SourceKind(str, Enum):
+    """The provenance class of a catalog source (DCA-044).
+
+    ``OFFICIAL`` — an official/government registry or dataset (e.g. a company registry). ``COMMERCIAL``
+    — a licensed commercial data provider. The kind is descriptive metadata only: neither kind, on
+    creation, grants any usage right — a newly catalogued source of either kind is a DISABLED draft.
+    """
+
+    OFFICIAL = "official"
+    COMMERCIAL = "commercial"
+
+
+class SourceAccessMethod(str, Enum):
+    """How a catalogued source's data is obtained (DCA-044).
+
+    Descriptive metadata; declaring an access method enables nothing on its own. ``API`` — a queryable
+    API/endpoint; ``BULK_DOWNLOAD`` — a downloadable dataset/dump; ``PORTAL_LOOKUP`` — a human/portal
+    lookup; ``MANUAL`` — manually supplied records.
+    """
+
+    API = "api"
+    BULK_DOWNLOAD = "bulk_download"
+    PORTAL_LOOKUP = "portal_lookup"
+    MANUAL = "manual"
+
+
+class SourceStatus(str, Enum):
+    """Lifecycle state of a catalog source (DCA-044).
+
+    ``DRAFT`` — a reviewable, DISABLED draft. Every source is created here as a draft and is NOT usable:
+    it grants no acquisition right and no discovery adapter may consult it. ``ENABLED`` — a future,
+    approved/active source a draft may one day be promoted to. **Promotion/approval (and the source's
+    rights details) is a DISABLED future capability** (its own later story, gated behind a rights
+    review): no path in this service writes an ``ENABLED`` source, so cataloguing a draft can never
+    silently make a source usable.
+    """
+
+    DRAFT = "draft"
+    ENABLED = "enabled"
 
 
 class BusinessProfileDraft(TenantOwned, Base):
@@ -499,6 +541,69 @@ class EntitlementProjection(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))  # the snapshot's as_of
     version: Mapped[str] = mapped_column(String(64))
     refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class Source(Base):
+    """DCA-044 — a platform-owned catalog entry describing a prospect data source.
+
+    One row is one *source* the Data Concierge could, once approved, acquire prospects from — an
+    official registry or a licensed commercial dataset. It records the source's declared shape: its
+    ``kind`` (official/commercial), the ``capabilities`` it offers, the ``fields`` it can return, the
+    ``access_method`` by which its data is obtained, its declared ``trust_tier`` (what the acquisition
+    rulepack screens on), and its ``india_coverage`` — the service is India-only, so coverage is
+    expressed as recognized Indian state/UT codes and/or a nationwide flag.
+
+    **Disabled draft by default, no implicit permissions.** A newly catalogued source is ALWAYS a
+    ``DRAFT`` with ``enabled=False`` and an EMPTY ``permissions`` set: its mere existence grants nothing
+    and no discovery path may consult it (:class:`~app.services.source_catalog.SourceCatalogStore`
+    treats a draft as not usable). Approving/enabling a source — and defining its rights — is a separate,
+    later capability that stays DISABLED here (the store only ever writes drafts and never flips
+    ``enabled`` or promotes to ``ENABLED``). So cataloguing a source can never, on its own, authorize
+    any acquisition.
+
+    This is platform-sourced CONTROL-PLANE data — a shared catalog across all tenants, like
+    :class:`TenantAgent` / :class:`EntitlementProjection` — deliberately OUTSIDE tenant RLS and never
+    tenant-scoped. It holds only the source's own descriptive metadata: no prospect contact data and no
+    secrets.
+    """
+
+    __tablename__ = "sources"
+    # The catalog key is globally unique — two catalog entries can never share one key.
+    __table_args__ = (UniqueConstraint("key", name="uq_source_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # Stable catalog key / slug (e.g. "mca_master_data"); unique across the catalog. Opaque, not free text.
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # official | commercial — descriptive provenance class; neither grants a usage right on creation.
+    kind: Mapped[str] = mapped_column(String(16), index=True)
+    # The source's declared trust tier (e.g. "official_registry"); the acquisition rulepack screens on it.
+    trust_tier: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    # What the source offers / which fields it can return — declarative string lists (NOT contact data).
+    capabilities: Mapped[list] = mapped_column(JSON, default=list)
+    fields: Mapped[list] = mapped_column(JSON, default=list)
+    # api | bulk_download | portal_lookup | manual — how the data is obtained.
+    access_method: Mapped[str] = mapped_column(String(32))
+    # India coverage (India-only service): {"nationwide": bool, "states": [ISO 3166-2:IN codes]}.
+    india_coverage: Mapped[dict] = mapped_column(JSON, default=dict)
+    # draft (reviewable, DISABLED) vs enabled (approved/active). Approval is disabled, so every row
+    # written here is 'draft'; nothing promotes a draft to 'enabled' yet.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=SourceStatus.DRAFT.value,
+        server_default=SourceStatus.DRAFT.value,
+        index=True,
+    )
+    # Disabled by default — a draft source is never usable. Flipped on only by a future approval
+    # capability (which stays disabled here), so its mere creation enables nothing.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    # No implicit permissions: a draft carries an EMPTY permission set. A later rights/approval story
+    # populates this; cataloguing a source grants none of them.
+    permissions: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
 

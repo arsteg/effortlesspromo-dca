@@ -166,6 +166,26 @@ def test_dca043_scenario_runs_and_proves_invalidation_isolation_and_denial(capsy
     assert result.cleaned_up is True
 
 
+def test_dca044_scenario_catalogues_disabled_drafts_and_reproduces_denials(capsys):
+    # The DCA-044 source-catalog scenario runs on local synthetic SQLite: it proves a newly catalogued
+    # official or commercial source is a disabled draft with no implicit permissions and cannot be used
+    # while a draft, and that invalid/duplicate drafts are refused with no row created.
+    result = execute(_args(story_id="DCA-044"))
+    assert result.exit_code == 0
+    rows = {r["key"]: r for r in result.summary["rows"]}
+    assert rows["mca_master_data"]["status"] == "draft"
+    assert rows["mca_master_data"]["enabled"] is False
+    assert rows["mca_master_data"]["permissions"] == []
+    assert rows["mca_master_data"]["usable"] is False
+    assert rows["acme_leads"]["status"] == "draft"
+    assert result.summary["usable_keys"] == []
+    assert result.summary["denials"]["unknown kind"] == "unknown_source_kind"
+    assert result.summary["denials"]["non-India coverage"] == "invalid_india_coverage"
+    assert result.summary["denials"]["duplicate key"] == "duplicate_source_key"
+    assert result.summary["row_count_after_denials"] == 2
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

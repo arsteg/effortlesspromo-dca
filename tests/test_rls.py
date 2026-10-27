@@ -62,6 +62,8 @@ def test_platform_catalog_tables_are_excluded():
     # The platform-owned registration catalog is deliberately outside tenant RLS.
     assert "tenant_agents" not in tenant_owned_tables()
     assert "icp_profiles" not in tenant_owned_tables()
+    # The DCA-044 source catalog is platform control-plane data, also outside tenant RLS.
+    assert "sources" not in tenant_owned_tables()
 
 
 # --- Postgres-backed RLS behaviour ----------------------------------------------------------------

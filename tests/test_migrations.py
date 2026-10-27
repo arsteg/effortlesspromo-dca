@@ -42,6 +42,7 @@ DCA_TABLES = {
     "icp_drafts",
     "icp_confirmations",
     "budget_limits",
+    "sources",
 }
 
 
@@ -652,6 +653,49 @@ def test_0015_adds_score_staleness_columns_on_a_preexisting_database(clean_schem
         "current",
         None,
     )  # pre-existing row backfilled to a current, unversioned score
+
+
+@requires_pg
+def test_0016_creates_sources_on_a_preexisting_database(clean_schema):
+    """DCA-044 — the 0016 create branch (for a DB migrated before ``sources`` existed).
+
+    ``sources`` is platform control-plane data (NOT tenant-owned), so — unlike 0005..0014 — it has NO
+    RLS policy; it is created like the 0003 entitlement projection. A fresh DB gets the table from the
+    metadata baseline (0001), so 0016 is a no-op there. To exercise 0016's real job, upgrade to head,
+    drop the table, stamp history back to 0015, then upgrade to head again — 0016 must recreate the
+    table (with its unique catalog-key constraint) and add NO tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "sources" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0015_prospect_score_staleness")  # pretend we predate the source catalog
+    command.upgrade(cfg, "head")  # 0016 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "sources" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {u["name"] for u in insp.get_unique_constraints("sources", schema=clean_schema)}
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'sources' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_source_key" in uniques  # the globally-unique catalog-key constraint travelled
+    assert (
+        policy is None
+    )  # control-plane catalog: no tenant RLS policy (unlike tenant-owned tables)
 
 
 @requires_pg

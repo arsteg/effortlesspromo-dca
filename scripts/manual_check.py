@@ -3905,6 +3905,162 @@ def _dca_043(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-044",
+    "store source catalog drafts: catalogue an official dataset and a commercial source -> each is a "
+    "DISABLED draft with no implicit permissions and cannot be used while a draft; an unknown kind / "
+    "non-India coverage / duplicate key is refused with no row created",
+)
+def _dca_044(ctx: CheckContext) -> dict:
+    """Drive the real DCA-044 source-catalog store against a disposable DB, following the developer
+    manual-test steps and showing actual rows (``sources`` is a platform catalog, so there is no
+    tenant HTTP surface yet — the inspectable artifact is the catalogued rows):
+
+      1. catalogue an official dataset entry and a commercial source;
+      2. show each stored row: status=draft, enabled=False, permissions=[] (disabled, no implicit
+         permissions) — and confirm it CANNOT be used while a draft (``is_usable`` False, a stable
+         denial code, and the usable set empty);
+      3. reproduce the denials, each leaving the catalog unchanged: an unknown kind, a non-India
+         coverage, and a duplicate key are each refused with no row created.
+
+    Local synthetic only (AI disabled, ephemeral DB). Nothing is approved/enabled — approval and a
+    source's rights are later, disabled stories.
+    """
+    from app.db.models import Source
+    from app.services.source_catalog import (
+        REASON_DUPLICATE_KEY,
+        REASON_INVALID_COVERAGE,
+        REASON_SOURCE_NOT_ENABLED,
+        REASON_UNKNOWN_KIND,
+        SourceCatalogStore,
+        SourceDraftInput,
+        SourceValidationError,
+    )
+
+    official = SourceDraftInput(
+        key="mca_master_data",
+        kind="official",
+        access_method="bulk_download",
+        name="MCA Company Master Data",
+        trust_tier="official_registry",
+        capabilities=["org_identifier", "org_name"],
+        fields=["cin", "company_name", "state"],
+        india_coverage={"nationwide": True},
+    )
+    commercial = SourceDraftInput(
+        key="acme_leads",
+        kind="commercial",
+        access_method="api",
+        name="Acme Leads API",
+        trust_tier="licensed_commercial",
+        capabilities=["org_name", "role_email"],
+        fields=["company", "email"],
+        india_coverage={"states": ["MH", "Karnataka"]},
+    )
+
+    out: dict = {}
+
+    # 1) + 2) catalogue both; show the stored rows are disabled drafts with no permissions, unusable
+    with ctx.session_factory() as session:
+        store = SourceCatalogStore(session)
+        store.create_draft(official)
+        store.create_draft(commercial)
+        session.commit()
+
+    with ctx.session_factory() as session:
+        store = SourceCatalogStore(session)
+        rows = store.all()
+        print("\n1-2) catalogued sources (actual rows):")
+        row_view = []
+        for s in rows:
+            usable = store.is_usable(s)
+            reason = store.usability_reason(s)
+            print(
+                f"  key={s.key:16} kind={s.kind:10} access={s.access_method:13} "
+                f"status={s.status:6} enabled={s.enabled} permissions={s.permissions} "
+                f"coverage={s.india_coverage}"
+            )
+            print(f"      -> usable={usable}  usability_reason={reason}")
+            row_view.append(
+                {
+                    "key": s.key,
+                    "kind": s.kind,
+                    "status": s.status,
+                    "enabled": s.enabled,
+                    "permissions": s.permissions,
+                    "usable": usable,
+                    "reason": reason,
+                }
+            )
+        usable_keys = [s.key for s in store.usable()]
+        print(f"   usable (approved+enabled) sources: {usable_keys} (empty — all are drafts)")
+        out["rows"] = row_view
+        out["usable_keys"] = usable_keys
+
+    # 3) denials — each leaves the catalog unchanged (2 rows)
+    with ctx.session_factory() as session:
+        store = SourceCatalogStore(session)
+        denials: dict = {}
+        for label, bad in [
+            (
+                "unknown kind",
+                SourceDraftInput(
+                    key="x1",
+                    kind="government",
+                    access_method="api",
+                    india_coverage={"nationwide": True},
+                ),
+            ),
+            (
+                "non-India coverage",
+                SourceDraftInput(
+                    key="x2",
+                    kind="official",
+                    access_method="api",
+                    india_coverage={"states": ["XX"]},
+                ),
+            ),
+            ("duplicate key", official),  # already catalogued above
+        ]:
+            try:
+                store.create_draft(bad)
+                denials[label] = "UNEXPECTEDLY ACCEPTED"
+            except SourceValidationError as exc:
+                denials[label] = exc.code
+        session.commit()
+
+    with ctx.session_factory() as session:
+        remaining = len(SourceCatalogStore(session).all())
+    print("\n3) denials (catalog must stay at 2 rows):")
+    for label, code in denials.items():
+        print(f"   {label:20} -> refused ({code})")
+    print(f"   catalog row count after denials: {remaining} (unchanged)")
+    out["denials"] = denials
+    out["row_count_after_denials"] = remaining
+
+    official_row = next(r for r in out["rows"] if r["key"] == "mca_master_data")
+    commercial_row = next(r for r in out["rows"] if r["key"] == "acme_leads")
+    print(
+        "\nchecks: "
+        f"official_disabled_draft={official_row['status'] == 'draft' and official_row['enabled'] is False}  "
+        f"commercial_disabled_draft={commercial_row['status'] == 'draft' and commercial_row['enabled'] is False}  "
+        f"no_implicit_permissions={official_row['permissions'] == [] and commercial_row['permissions'] == []}  "
+        f"draft_not_usable={official_row['usable'] is False and official_row['reason'] == REASON_SOURCE_NOT_ENABLED}  "
+        f"usable_set_empty={out['usable_keys'] == []}  "
+        f"unknown_kind_refused={out['denials']['unknown kind'] == REASON_UNKNOWN_KIND}  "
+        f"non_india_coverage_refused={out['denials']['non-India coverage'] == REASON_INVALID_COVERAGE}  "
+        f"duplicate_refused={out['denials']['duplicate key'] == REASON_DUPLICATE_KEY}  "
+        f"catalog_unchanged={out['row_count_after_denials'] == 2}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action. A newly catalogued official or commercial source "
+        "is a DISABLED draft with no implicit permissions and cannot be used while a draft; approving/"
+        "enabling a source and its rights are later, disabled capabilities. Table used: "
+        f"{Source.__tablename__} — a platform control-plane catalog, not tenant-scoped.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
