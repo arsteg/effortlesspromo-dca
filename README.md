@@ -61,6 +61,16 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
   with the business change, so a concurrent duplicate loses the unique-constraint race and replays
   the winner's result. Opt-in: no key ⇒ served normally. See `docs/DCA-035-*.md`.
 
+- Structured geography & Indian-targeting validation (DCA-038, `app/geography/`): structured geography
+  (country, state/UT, city, district, PIN / service area) + atomic `LocationEvidence`, keeping the three
+  contexts — **legal address**, **operational area**, **recipient location** — strictly separate. A
+  **deterministic** resolver (`resolve_jurisdiction`) + India-only gate (`validate_targeting`) decide
+  `in` / `foreign` / `unresolved`: a `+91` phone code or a `.in` domain (or language / IP-geo /
+  employer HQ) is a **weak signal** that never proves the recipient's jurisdiction on its own, so an
+  unknown or non-Indian recipient is **blocked** — and an Indian legal address / operational area never
+  rescues a weak recipient. Exposed as a **stateless** `POST /v1/targeting/validate` (+ `GET
+  /v1/targeting/reference`) for later Web/Admin consumers; no AI, no persistence. See `docs/DCA-038-*.md`.
+
 - Database sessions: a **sync** engine backs the SQLite-friendly dev/test surface; an **async**
   engine (`app/db/base.py` `make_async_engine` / `transactional_session`, dependency
   `app/api/deps.py:get_async_session`) provides one session per request/task with an explicit

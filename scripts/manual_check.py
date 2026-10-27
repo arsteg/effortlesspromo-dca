@@ -3071,6 +3071,125 @@ def _dca_037(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-038",
+    "validate Indian targeting evidence: India allowed, foreign/unknown blocked, +91/.in alone never "
+    "proves recipient jurisdiction; legal address/operational area kept separate; stateless",
+)
+def _dca_038(ctx: CheckContext) -> dict:
+    """Drive the real DCA-038 targeting-validation API over synthetic India / foreign / ambiguous
+    fixtures, following the developer manual-test steps, and show each actual response body so a human
+    can compare against the acceptance criteria rather than a bare PASS.
+
+    Cases:
+      1. Indian recipient (valid PIN) -> ALLOWED (resolved_in).
+      2. +91 contact with NO location evidence -> BLOCKED (the headline denial: +91 alone proves nothing).
+      3. .in domain alone -> BLOCKED (weak signal only).
+      4. empty evidence -> BLOCKED (no evidence).
+      5. foreign recipient (declared US) -> BLOCKED (foreign jurisdiction).
+      6. ambiguous: valid Indian PIN AND a declared US country -> BLOCKED (conflicting evidence).
+      7. +91 recipient but an Indian legal address + operational area -> still BLOCKED (the three
+         contexts are kept separate; a business's location is not the recipient's).
+
+    The route is stateless and read-only: it is invoked against a synthetic, AI-disabled app and
+    touches no rows. The scenario asserts the tenant/row tables are untouched before and after, so
+    every allow/deny above is reproduced with no state change.
+    """
+    from sqlalchemy import func, select
+    from fastapi.testclient import TestClient
+
+    from app.db.models import BusinessProfileDraft, DiscoveryRun, ProspectCandidate, TenantAgent
+    from app.main import create_app
+
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    def row_counts() -> dict:
+        with ctx.session_factory() as session:
+            return {
+                "tenant_agents": session.scalar(select(func.count()).select_from(TenantAgent)),
+                "discovery_runs": session.scalar(select(func.count()).select_from(DiscoveryRun)),
+                "prospect_candidates": session.scalar(
+                    select(func.count()).select_from(ProspectCandidate)
+                ),
+                "business_profile_drafts": session.scalar(
+                    select(func.count()).select_from(BusinessProfileDraft)
+                ),
+            }
+
+    cases = {
+        "1 Indian recipient (PIN 560001)": {"recipientLocation": {"pinCode": "560001"}},
+        "2 +91 contact, NO location evidence": {
+            "recipientLocation": {"evidence": [{"kind": "phone_country_code", "value": "+91"}]}
+        },
+        "3 .in domain alone": {
+            "recipientLocation": {"evidence": [{"kind": "domain_tld", "value": ".in"}]}
+        },
+        "4 empty (no evidence)": {},
+        "5 foreign recipient (declared US)": {"recipientLocation": {"country": "US"}},
+        "6 ambiguous: Indian PIN + declared US": {
+            "recipientLocation": {
+                "pinCode": "560001",
+                "evidence": [{"kind": "declared_country", "value": "US"}],
+            }
+        },
+        "7 +91 recipient, Indian legal/operational": {
+            "recipientLocation": {"evidence": [{"kind": "phone_country_code", "value": "+91"}]},
+            "legalAddress": {"country": "IN", "stateUt": "KA", "pinCode": "560001"},
+            "operationalArea": {"stateUt": "KA"},
+        },
+    }
+
+    out: dict = {}
+    before = row_counts()
+    try:
+        print("\ntargeting validation (POST /v1/targeting/validate) — recipient governs the gate:")
+        for label, body in cases.items():
+            resp = client.post("/v1/targeting/validate", json=body, headers=auth)
+            data = resp.json()
+            verdict = "ALLOW" if data["allowed"] else "BLOCK"
+            print(
+                f"  {label:44} -> {verdict:5} recipient={data['recipient']['status']:10} "
+                f"({data['recipient']['reasonCode']})"
+            )
+            if data.get("notes"):
+                print(f"      note: {data['notes'][0]}")
+            out[label] = {
+                "allowed": data["allowed"],
+                "reasonCode": data["reasonCode"],
+                "recipient": data["recipient"]["reasonCode"],
+                "legalAddress": data["legalAddress"]["status"],
+                "operationalArea": data["operationalArea"]["status"],
+            }
+    finally:
+        app.state.engine.dispose()
+
+    after = row_counts()
+    print(f"\nrow counts before: {before}")
+    print(f"row counts after : {after}")
+    print(f"state unchanged  : {before == after} (the validator is stateless — no rows touched)")
+
+    print(
+        "\nchecks: "
+        f"india_allowed={out['1 Indian recipient (PIN 560001)']['allowed'] is True}  "
+        f"plus91_blocked={out['2 +91 contact, NO location evidence']['allowed'] is False}  "
+        f"dotin_blocked={out['3 .in domain alone']['allowed'] is False}  "
+        f"empty_blocked={out['4 empty (no evidence)']['allowed'] is False}  "
+        f"foreign_blocked={out['5 foreign recipient (declared US)']['reasonCode'] == 'blocked_foreign_jurisdiction'}  "
+        f"ambiguous_blocked={out['6 ambiguous: Indian PIN + declared US']['recipient'] == 'unresolved_conflicting_evidence'}  "
+        "separation_holds="
+        f"{out['7 +91 recipient, Indian legal/operational']['allowed'] is False and out['7 +91 recipient, Indian legal/operational']['legalAddress'] == 'in'}  "
+        f"stateless={before == after}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; +91 or .in alone never proves recipient "
+        "jurisdiction; an Indian legal address/operational area never rescues a weak recipient)"
+    )
+    out["_state_unchanged"] = before == after
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

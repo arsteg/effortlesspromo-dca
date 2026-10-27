@@ -84,6 +84,17 @@ def test_production_allowed_with_explicit_flag(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca038_scenario_runs_and_leaves_state_unchanged(capsys):
+    # The DCA-038 targeting validator is stateless; the scenario runs on local synthetic SQLite and
+    # proves the headline denials while touching no rows.
+    result = execute(_args(story_id="DCA-038"))
+    assert result.exit_code == 0
+    assert result.summary["_state_unchanged"] is True
+    assert result.summary["1 Indian recipient (PIN 560001)"]["allowed"] is True
+    assert result.summary["2 +91 contact, NO location evidence"]["allowed"] is False
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out
