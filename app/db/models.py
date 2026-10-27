@@ -796,6 +796,73 @@ class SourceTermsApproval(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class BusinessSourceEntitlement(TenantOwned, Base):
+    """DCA-047 — a business's own, versioned entitlement to a platform-approved source (tenant-owned).
+
+    One row is one *version* of a single business's decision to use one catalog :class:`Source` and
+    the field/operation/purpose rights it grants ITSELF for that source. It exists to NARROW the
+    platform-approved rights down to what the business wants to exercise — never to widen them. The
+    platform ceiling is the in-force :class:`SourceTermsApproval` (DCA-046): a business can only
+    entitle a source that is approved at the platform level, and every operation / field right /
+    purpose it grants must be a subset of what that approval documents. The single sanctioned writer
+    (:class:`~app.services.source_entitlement.BusinessSourceEntitlementStore`) refuses, before staging
+    anything, an attempt to enable an unapproved source or to grant a right the platform denies — so a
+    business can never, through its own configuration, reach a capability the platform withheld.
+
+    - ``enabled`` — the business's own enable/disable intent for the source. An entitlement can only be
+      saved (enabled OR disabled) against a source with an in-force platform approval; enabling grants
+      NO acquisition right on its own (no discovery path consults this table — that stays a disabled
+      future capability), it merely records the narrowed rights the business has opted into.
+    - ``operation_rights`` — the business's narrowed source-wide grant per operation ({operation: bool},
+      deny-by-default), always a subset of the approval's ``approved_operation_rights``.
+    - ``field_rights`` — the business's narrowed per-field overrides ({field: {operation: bool}}),
+      each a subset of the approval's effective (field-override-or-default) grant for that field.
+    - ``purposes`` — the purposes the business limits its use to; a subset of the approved terms'
+      purposes (rights stay purpose-bound, never widened).
+    - ``approved_terms_version`` — the platform terms version (DCA-045/046) this entitlement was
+      narrowed against, so a reader can tell exactly which platform ceiling it was checked under.
+
+    Versioned per source: ``(business_id, source_key, version)`` is unique and the store is
+    insert-only, so every prior version is preserved as an immutable, auditable history and a new
+    version never overwrites another; the highest version for a ``(business, source)`` is the one in
+    force. Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like
+    every other tenant data table, so one business can never read or change another's entitlements. It
+    holds only declarative rights metadata (opaque source key + boolean grants): no prospect contact
+    data and no secrets.
+    """
+
+    __tablename__ = "business_source_entitlements"
+    # A (source, version) pair is unique PER business: the same source/version recurs across tenants
+    # but never within one, so a new version can never collide with or overwrite an existing version.
+    __table_args__ = (
+        tenant_unique("source_key", "version", name="uq_business_source_entitlement_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The catalog key of the Source this entitlement narrows (DCA-044); validated to be platform-approved.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # 1-based version ordinal within (business, source); a new entitlement is always max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # The business's own enable intent for the source. Enabling grants no acquisition right on its own
+    # (no discovery path consults this) — acquisition stays a disabled future capability.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    # Narrowed source-wide grant per operation: {operation: bool}. Always a subset of the platform
+    # approval's documented operation rights (deny-by-default; a right the platform denies is refused).
+    operation_rights: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Narrowed per-field overrides: {field: {operation: bool}} — each a subset of the approved rights.
+    field_rights: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The purposes the business limits use to — a subset of the approved terms' purposes.
+    purposes: Mapped[list] = mapped_column(JSON, default=list)
+    # The platform terms version (DCA-045/046) this entitlement was narrowed against (the ceiling it
+    # was checked under), so a reader knows exactly which approved rights snapshot it is a subset of.
+    approved_terms_version: Mapped[int] = mapped_column(Integer)
+    # WHO set this version — an opaque subject id (never a name/email) plus its kind, screened by the
+    # audit sink in the SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AuditEvent(TenantOwned, Base):
     """DCA-026 — a durable, transactional audit event for a tenant-scoped mutation.
 

@@ -4443,6 +4443,261 @@ def _dca_046(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-047",
+    "restrict source access per business: business A narrows a platform-approved source to a SUBSET "
+    "of its rights (allowed), but cannot enable an unapproved source, cannot grant an operation / "
+    "field right / purpose the platform denies, and an ordinary user cannot configure it; business B "
+    "is untouched and each refusal stages nothing",
+)
+def _dca_047(ctx: CheckContext) -> dict:
+    """Drive the real DCA-047 business-source-entitlement store against a disposable DB with isolated
+    synthetic Businesses A/B, following the developer manual-test steps and showing actual rows:
+
+      1. catalogue a source (DCA-044), record a terms version (DCA-045), and APPROVE it (DCA-046) so
+         it is the in-force platform ceiling (collect/store/display/export source-wide — 'share'
+         DENIED; email display-only; purpose 'prospecting');
+      2. a business ADMINISTRATOR of A narrows the source to a SUBSET (display only) -> allowed; the
+         entitlement row records exactly the narrowed rights and is audited;
+      3. A attempts to BROADEN through its own configuration — enable an operation the platform denies
+         ('share'), a per-field right it denies (email 'export'), a purpose it does not document
+         ('resale'), and enable a source with NO platform approval — each refused, staging nothing;
+      4. an ORDINARY USER of A cannot configure an entitlement at all (not an administrator);
+      5. business B is never touched by A's configuration.
+
+    Local synthetic only (AI disabled, ephemeral DB). An entitlement grants NO acquisition right on
+    its own (no discovery path consults it) — it only records the narrowed rights the business opted
+    into. ``business_source_entitlements`` is tenant-owned, so A's and B's rows never cross.
+    """
+    from app.db.models import AuditEvent, BusinessSourceEntitlement, SourceTermsApproval
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        REASON_FIELD_RIGHT_DENIED_AT_PLATFORM,
+        REASON_NOT_BUSINESS_ADMINISTRATOR,
+        REASON_OPERATION_DENIED_AT_PLATFORM,
+        REASON_PURPOSE_DENIED_AT_PLATFORM,
+        REASON_SOURCE_NOT_PLATFORM_APPROVED,
+        BusinessEntitler,
+        BusinessSourceEntitlementAuthorizationError,
+        BusinessSourceEntitlementError,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    from datetime import UTC, datetime, timedelta
+
+    source_key = "mca_master_data"
+    unapproved_key = "commercial_leads"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0047", roles=("owner", "admin")
+    )
+    ordinary = BusinessEntitler(subject="00000000-0000-4000-9000-0000000a0048", roles=("viewer",))
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+
+    out: dict = {}
+
+    # 1) catalogue + approve a source (the platform ceiling), plus an UNAPPROVED source for step 3
+    with ctx.session_factory() as session:
+        catalog = SourceCatalogStore(session)
+        catalog.create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                name="MCA Company Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        catalog.create_draft(
+            SourceDraftInput(
+                key=unapproved_key,
+                kind="commercial",
+                access_method="api",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "store": True, "display": True, "export": True},
+                field_rights={"email": {"display": True, "export": False}},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        session.commit()
+
+    # 2) business A administrator narrows to a SUBSET -> allowed
+    with ctx.session_factory() as session:
+        store = BusinessSourceEntitlementStore(session, BUSINESS_A)
+        entitlement = store.set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=source_key,
+                enabled=True,
+                operations={"display": True, "export": False},
+                field_rights={"email": {"display": True}},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        session.commit()
+        out["A_entitlement"] = {
+            "source_key": entitlement.source_key,
+            "version": entitlement.version,
+            "enabled": entitlement.enabled,
+            "operation_rights": entitlement.operation_rights,
+            "field_rights": entitlement.field_rights,
+            "purposes": entitlement.purposes,
+            "approved_terms_version": entitlement.approved_terms_version,
+        }
+
+    # 3) attempts to BROADEN through A's own configuration — each refused
+    attempts = {
+        "enable op 'share' (platform denies)": (
+            BusinessSourceEntitlementInput(
+                source_key=source_key, enabled=True, operations={"share": True}
+            ),
+            REASON_OPERATION_DENIED_AT_PLATFORM,
+        ),
+        "grant email 'export' (platform denies)": (
+            BusinessSourceEntitlementInput(
+                source_key=source_key, enabled=True, field_rights={"email": {"export": True}}
+            ),
+            REASON_FIELD_RIGHT_DENIED_AT_PLATFORM,
+        ),
+        "purpose 'resale' (not documented)": (
+            BusinessSourceEntitlementInput(
+                source_key=source_key, enabled=True, purposes=["resale"]
+            ),
+            REASON_PURPOSE_DENIED_AT_PLATFORM,
+        ),
+        "enable UNAPPROVED source": (
+            BusinessSourceEntitlementInput(source_key=unapproved_key, enabled=True),
+            REASON_SOURCE_NOT_PLATFORM_APPROVED,
+        ),
+    }
+    denials: dict = {}
+    with ctx.session_factory() as session:
+        store = BusinessSourceEntitlementStore(session, BUSINESS_A)
+        for label, (data, expected) in attempts.items():
+            try:
+                store.set_entitlement(data, admin, now=now)
+                denials[label] = "UNEXPECTEDLY ALLOWED"
+            except BusinessSourceEntitlementError as exc:
+                denials[label] = exc.code
+        session.commit()
+    out["broaden_denials"] = denials
+
+    # 4) an ordinary (non-admin) user cannot configure an entitlement
+    with ctx.session_factory() as session:
+        store = BusinessSourceEntitlementStore(session, BUSINESS_A)
+        try:
+            store.set_entitlement(
+                BusinessSourceEntitlementInput(source_key=source_key, enabled=True),
+                ordinary,
+                now=now,
+            )
+            out["ordinary_user"] = "UNEXPECTEDLY ALLOWED"
+        except BusinessSourceEntitlementAuthorizationError as exc:
+            out["ordinary_user"] = exc.code
+        session.commit()
+
+    # 5) business B is untouched; only A's single narrowed version exists; each refusal staged nothing
+    with ctx.session_factory() as session:
+        store_a = BusinessSourceEntitlementStore(session, BUSINESS_A)
+        store_b = BusinessSourceEntitlementStore(session, BUSINESS_B)
+        out["A_versions"] = [e.version for e in store_a.versions(source_key)]
+        out["B_has_entitlement"] = store_b.latest(source_key) is not None
+        out["entitlement_rows_total"] = session.query(BusinessSourceEntitlement).count()
+        out["approval_rows_total"] = session.query(SourceTermsApproval).count()
+        # A's narrowed read is the intersection: display allowed, export (approved but not entitled) denied.
+        out["A_permits_email_display"] = store_a.permits(source_key, "email", "display", now=now)
+        out["A_permits_name_export"] = store_a.permits(source_key, "name", "export", now=now)
+        out["B_permits_email_display"] = store_b.permits(source_key, "email", "display", now=now)
+        audits = session.query(AuditEvent).filter(AuditEvent.business_id == BUSINESS_A).all()
+        out["A_audit_actions"] = [a.action for a in audits]
+
+    print(
+        "\n1) catalogued + APPROVED source (platform ceiling): "
+        "collect/store/display/export, 'share' DENIED, email display-only, purpose 'prospecting'."
+    )
+    print("\n2) business A administrator narrows to a SUBSET -> ALLOWED:")
+    for k, v in out["A_entitlement"].items():
+        print(f"     {k:22} = {v}")
+    print(
+        "\n3) A attempts to BROADEN through its own configuration (each refused, nothing staged):"
+    )
+    for label, code in out["broaden_denials"].items():
+        print(f"   {label:40} -> refused ({code})")
+    print(
+        f"\n4) ordinary (non-admin) user configures entitlement -> refused ({out['ordinary_user']})"
+    )
+    print("\n5) isolation + no stray state:")
+    print(
+        f"   A entitlement versions           : {out['A_versions']} (only the one narrowed version)"
+    )
+    print(
+        f"   B has an entitlement             : {out['B_has_entitlement']} (A's config never touched B)"
+    )
+    print(f"   total entitlement rows           : {out['entitlement_rows_total']}")
+    print(f"   A permits (email, display)       : {out['A_permits_email_display']}")
+    print(
+        f"   A permits (name, export)         : {out['A_permits_name_export']} "
+        "(approved at platform but NOT entitled by A -> narrowed out)"
+    )
+    print(
+        f"   B permits (email, display)       : {out['B_permits_email_display']} (B not entitled)"
+    )
+    print(f"   A audit actions                  : {out['A_audit_actions']}")
+
+    all_denied = (
+        out["broaden_denials"]["enable op 'share' (platform denies)"]
+        == REASON_OPERATION_DENIED_AT_PLATFORM
+        and out["broaden_denials"]["grant email 'export' (platform denies)"]
+        == REASON_FIELD_RIGHT_DENIED_AT_PLATFORM
+        and out["broaden_denials"]["purpose 'resale' (not documented)"]
+        == REASON_PURPOSE_DENIED_AT_PLATFORM
+        and out["broaden_denials"]["enable UNAPPROVED source"]
+        == REASON_SOURCE_NOT_PLATFORM_APPROVED
+    )
+    print(
+        "\nchecks: "
+        f"narrowing_allowed={out['A_entitlement']['version'] == 1}  "
+        f"all_broadening_refused={all_denied}  "
+        f"ordinary_user_refused={out['ordinary_user'] == REASON_NOT_BUSINESS_ADMINISTRATOR}  "
+        f"only_one_row_staged={out['entitlement_rows_total'] == 1}  "
+        f"B_untouched={out['B_has_entitlement'] is False}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action. A business can only NARROW the platform-approved "
+        "rights, never widen them: it cannot enable an unapproved source or grant an operation/field/"
+        "purpose the platform denied. Entitling grants no acquisition right on its own — no discovery "
+        f"path consults {BusinessSourceEntitlement.__tablename__}. The table is tenant-owned, so A and "
+        "B never cross.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",

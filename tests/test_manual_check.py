@@ -238,6 +238,31 @@ def test_dca046_scenario_proves_operator_approval_and_tenant_denial(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca047_scenario_proves_per_business_narrowing_and_reproduces_denials(capsys):
+    # The DCA-047 business-source-entitlement scenario runs on local synthetic SQLite with isolated
+    # Businesses A/B: it proves a business administrator can NARROW a platform-approved source to a
+    # subset of its rights, but cannot enable an unapproved source or grant any operation / field right
+    # / purpose the platform denies, an ordinary user cannot configure it, and business B is untouched —
+    # each refusal staging nothing.
+    result = execute(_args(story_id="DCA-047"))
+    assert result.exit_code == 0
+    assert result.summary["A_entitlement"]["version"] == 1
+    assert result.summary["A_entitlement"]["operation_rights"] == {"display": True, "export": False}
+    assert result.summary["A_entitlement"]["approved_terms_version"] == 1
+    denials = result.summary["broaden_denials"]
+    assert denials["enable op 'share' (platform denies)"] == "operation_denied_at_platform"
+    assert denials["grant email 'export' (platform denies)"] == "field_right_denied_at_platform"
+    assert denials["purpose 'resale' (not documented)"] == "purpose_denied_at_platform"
+    assert denials["enable UNAPPROVED source"] == "source_not_platform_approved"
+    assert result.summary["ordinary_user"] == "not_business_administrator"
+    assert result.summary["entitlement_rows_total"] == 1  # refusals staged nothing
+    assert result.summary["B_has_entitlement"] is False  # A's config never touched B
+    assert tuple(result.summary["A_permits_email_display"]) == (True, None)
+    assert tuple(result.summary["A_permits_name_export"]) == (False, "operation_not_entitled")
+    assert result.summary["A_audit_actions"] == ["source.entitlement.set"]
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

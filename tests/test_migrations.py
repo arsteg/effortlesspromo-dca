@@ -45,6 +45,7 @@ DCA_TABLES = {
     "sources",
     "source_terms",
     "source_term_approvals",
+    "business_source_entitlements",
 }
 
 
@@ -790,6 +791,55 @@ def test_0018_creates_source_term_approvals_on_a_preexisting_database(clean_sche
     assert (
         policy is None
     )  # control-plane catalog: no tenant RLS policy (unlike tenant-owned tables)
+
+
+@requires_pg
+def test_0019_creates_business_source_entitlements_on_a_preexisting_database(clean_schema):
+    """DCA-047 — the 0019 create branch (for a DB migrated before ``business_source_entitlements``).
+
+    ``business_source_entitlements`` is tenant-owned (RLS-protected), like ``budget_limits`` (0014) —
+    unlike the control-plane source tables (0016..0018). A fresh DB gets the table from the metadata
+    baseline (0001) and its RLS policy from 0002, so 0019 is a no-op there. To exercise 0019's real
+    job, upgrade to head, drop the table + policy, stamp history back to 0018, then upgrade to head
+    again — 0019 must recreate the table (with its per-tenant (source_key, version) constraint) AND its
+    tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text('DROP TABLE IF EXISTS "business_source_entitlements" CASCADE')
+        )  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0018_source_term_approvals")  # pretend we predate the entitlement table
+    command.upgrade(cfg, "head")  # 0019 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "business_source_entitlements" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("business_source_entitlements", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'business_source_entitlements' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_business_source_entitlement_version" in uniques
+    )  # one version per (tenant, source); a version never overwrites
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg
