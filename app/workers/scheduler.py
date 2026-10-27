@@ -18,6 +18,7 @@ from app.core.config import Settings
 from app.db.models import TenantAgent
 from app.services.discovery import DiscoveryError, run_discovery
 from app.services.source_expiry import ExpirySweepResult, run_expiry_sweep
+from app.services.source_revocation import run_revocation_invalidation
 
 log = logging.getLogger("dca.worker")
 
@@ -31,6 +32,11 @@ def tick_maintenance(
     ever makes a lapsed right MORE restrictive, so it is not gated behind any feature/source flag. The
     effective-date checks already deny a lapsed right immediately; this pass just stamps the durable
     EXPIRED state. A failure here must not stop the loop or block the tenant ticks that follow.
+
+    It also runs the DCA-050 revocation-invalidation sweep (queued invalidation of observations acquired
+    from a now-revoked source). The operator revocation itself is immediate (``is_in_force`` keys on the
+    status); this pass is only the durable housekeeping that flips affected observations' scores stale.
+    The expiry sweep's result is returned for the existing wiring; the invalidation result is logged.
     """
     result = run_expiry_sweep(session_factory, settings)
     if result.transitioned:
@@ -38,6 +44,13 @@ def tick_maintenance(
             "source-expiry sweep: expired %d approval(s), %d terms version(s)",
             len(result.expired_approvals),
             len(result.expired_terms),
+        )
+    invalidation = run_revocation_invalidation(session_factory, settings)
+    if invalidation.invalidated:
+        log.info(
+            "source-revocation invalidation: marked %d observation(s) stale from %d revoked source(s)",
+            invalidation.invalidated,
+            len(invalidation.revoked_source_keys),
         )
     return result
 

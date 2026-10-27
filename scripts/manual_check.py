@@ -5223,6 +5223,281 @@ def _dca_049(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-050",
+    "revoke a source version: a running task authorizes against the old version (ALLOW) and is paused "
+    "mid-fetch; an operator revokes that version; the task resumes and its re-check before commit/use "
+    "is DENIED (same clock, no sweep) while a tenant admin is refused the revoke; the scheduled "
+    "invalidation sweep then flips the observations acquired from the revoked source stale (idempotent)",
+)
+def _dca_050(ctx: CheckContext) -> dict:
+    """Drive the real DCA-050 operator revocation + queued invalidation against a disposable DB with
+    isolated synthetic Businesses A/B, following the developer manual-test steps:
+
+      1. catalogue a source (DCA-044), record terms (DCA-045), APPROVE it (DCA-046), (test-only) ENABLE
+         the catalog entry and entitle A (DCA-047); seed one observation A acquired from that source;
+      2. a running task authorizes against the in-force source version (ALLOW) and captures it, then is
+         PAUSED mid-fetch (it holds candidates it has not yet committed);
+      3. a platform operator REVOKES that version (a tenant admin is refused first — Admin role alone is
+         insufficient); the task RESUMES and re-checks before committing — at the SAME clock — and is
+         DENIED (the preflight and the version-specific in-force check both refuse), so it commits
+         nothing: revoked rights cannot be used by an already-running task with an old source version;
+      4. the scheduled invalidation sweep flips A's observation from the revoked source current -> stale
+         (queued for a future, disabled re-review), idempotent on a second run; B (never entitled) is
+         unaffected.
+
+    Local synthetic only (AI disabled, ephemeral DB). Nothing here enables acquisition — revocation only
+    ever makes a right MORE restrictive (every production fetch still denies at the source-status gate).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        DiscoveryRun,
+        ProspectCandidate,
+        ScoreStatus,
+        Source,
+        SourceApprovalStatus,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsStatus,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_preflight import PreflightRequest, SourcePreflight
+    from app.services.source_revocation import (
+        RevocationInvalidationSweep,
+        RevokerPrincipal,
+        SourceRevocationAuthorizationError,
+        SourceRevocationStore,
+    )
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    source_key = "mca_master_data"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0050", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    revoker = RevokerPrincipal(subject="op-001", roles=("platform_operator",))
+    tenant_admin = RevokerPrincipal(subject="tenant-admin-1", roles=("owner", "admin"))
+    req = PreflightRequest(source_key=source_key, operation="collect", purpose="prospecting")
+
+    class PausableAdapter:
+        """A fake source adapter whose fetch is 'paused' (returns candidates not yet committed)."""
+
+        key = source_key
+
+        def fetch(self, icp: dict) -> list:
+            return [{"org_name": "Synthetic Textiles Pvt Ltd", "source_key": self.key}]
+
+    out: dict = {}
+
+    # 1) seed: approved + (test-only) enabled source, A entitled, one observation A acquired from it.
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "display": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        source = session.query(Source).filter(Source.key == source_key).one()
+        source.status = SourceStatus.ENABLED.value
+        source.enabled = True
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=source_key,
+                enabled=True,
+                operations={"collect": True, "display": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        run = DiscoveryRun(business_id=BUSINESS_A, source_keys=[source_key], status="completed")
+        session.add(run)
+        session.flush()
+        candidate = ProspectCandidate(
+            business_id=BUSINESS_A,
+            run_id=run.id,
+            org_name="Synthetic Textiles Pvt Ltd",
+            org_identifier="CIN-SYNTH-1",
+            contact={},
+            source_key=source_key,
+            source_ref="synthetic://record/1",
+            trust_tier="official_registry",
+            match_score=1.0,
+            rationale="matches ICP",
+        )
+        session.add(candidate)
+        session.flush()
+        candidate_id = candidate.id
+        session.commit()
+
+    # 2) the running task authorizes against the in-force version (ALLOW) and is PAUSED mid-fetch.
+    with ctx.session_factory() as session:
+        gate = SourcePreflight(session, BUSINESS_A)
+        start = gate.authorize(req, now=now)
+        captured_version = SourceApprovalStore(session).approvals(source_key)[0].terms_version
+        paused_candidates = PausableAdapter().fetch({"industries": ["textiles"]})
+    out["task_start"] = {"allowed": start.allowed, "captured_version": captured_version}
+
+    # 3a) a tenant admin is refused the revoke (Admin role alone is insufficient — platform scope).
+    tenant_refused = False
+    with ctx.session_factory() as session:
+        try:
+            SourceRevocationStore(session).revoke(
+                source_key, captured_version, tenant_admin, reason="tenant_tried", now=now
+            )
+        except SourceRevocationAuthorizationError as exc:
+            tenant_refused = True
+            out["tenant_admin_revoke"] = {"refused": True, "code": exc.code}
+        session.rollback()
+
+    # 3b) the platform operator revokes the version the task is holding.
+    with ctx.session_factory() as session:
+        result = SourceRevocationStore(session).revoke(
+            source_key, captured_version, revoker, reason="rights_withdrawn_by_licensor", now=now
+        )
+        session.commit()
+    out["revocation"] = {
+        "terms_version": result.terms_version,
+        "revoked_by": result.revoked_by,
+        "demoted_terms": result.demoted_terms,
+    }
+
+    # 3c) the task RESUMES and re-checks before commit/use — SAME clock, no sweep — and is DENIED.
+    with ctx.session_factory() as session:
+        gate = SourcePreflight(session, BUSINESS_A)
+        resume = gate.authorize(req, now=now)
+        approval = SourceApprovalStore(session).approval_for(source_key, captured_version)
+        version_in_force = SourceApprovalStore.is_in_force(approval, now=now)
+        stored_status = approval.status
+        terms_status = (
+            session.query(SourceTerms).filter(SourceTerms.source_key == source_key).one().status
+        )
+    out["task_resume"] = {
+        "allowed": resume.allowed,
+        "reason": resume.reason,
+        "version_in_force": version_in_force,
+        "approval_status": stored_status,
+        "terms_status": terms_status,
+        "paused_candidates_discarded": len(paused_candidates),  # fetched, never committed
+    }
+
+    # 4) the scheduled invalidation sweep flips A's observation from the revoked source stale; B's data
+    #    (never entitled / none) is unaffected. Idempotent on a second run.
+    with ctx.session_factory() as session:
+        first = RevocationInvalidationSweep(session).sweep(now=now)
+        session.commit()
+    with ctx.session_factory() as session:
+        second = RevocationInvalidationSweep(session).sweep(now=now)
+        session.commit()
+    with ctx.session_factory() as session:
+        candidate = session.get(ProspectCandidate, candidate_id)
+        out["invalidation"] = {
+            "revoked_source_keys": first.revoked_source_keys,
+            "invalidated_candidate_ids": first.invalidated_candidate_ids,
+            "second_run_invalidated": second.invalidated,
+            "candidate_score_status": candidate.score_status,
+            "candidate_status": candidate.status,  # approval/acceptance untouched (score-only)
+        }
+        # Tenant isolation: B was never entitled this source and holds no observations from it.
+        b_rows = (
+            session.query(ProspectCandidate)
+            .filter(ProspectCandidate.business_id == BUSINESS_B)
+            .count()
+        )
+        out["B_candidate_rows"] = b_rows
+
+    print("\n1) seeded 'mca_master_data' approved+ (test-only) ENABLED; A entitled; 1 observation.")
+    print("\n2) running task authorizes against the in-force version (paused mid-fetch):")
+    print(
+        f"   authorize -> {'ALLOW' if start.allowed else 'DENY'}  "
+        f"captured source version = {captured_version}  "
+        f"(fetched {len(paused_candidates)} candidate(s), NOT yet committed)"
+    )
+    print("\n3) revoke the version while the task is paused:")
+    print(
+        f"   tenant admin revoke       -> {'REFUSED' if tenant_refused else 'ALLOWED?!'} "
+        f"({out.get('tenant_admin_revoke', {}).get('code')})  (Admin role alone is insufficient)"
+    )
+    print(
+        f"   operator revoke v{captured_version}         -> demoted_terms={result.demoted_terms} "
+        f"revoked_by={result.revoked_by!r}"
+    )
+    print("   task RESUMES and re-checks before commit/use (SAME clock, no sweep):")
+    print(
+        f"     preflight re-check      -> {'ALLOW' if resume.allowed else 'DENY'}  "
+        f"reason={resume.reason}"
+    )
+    print(
+        f"     old version in force?   -> {version_in_force}  "
+        f"(approval={stored_status!r}, terms={terms_status!r})"
+    )
+    print("\n4) scheduled invalidation sweep (queued invalidation of affected observations):")
+    print(
+        f"   revoked source keys        -> {first.revoked_source_keys}  "
+        f"invalidated candidates -> {first.invalidated_candidate_ids}"
+    )
+    print(
+        f"   sweep #2 invalidated       -> {second.invalidated} (idempotent)  "
+        f"candidate score_status={out['invalidation']['candidate_score_status']!r} "
+        f"status={out['invalidation']['candidate_status']!r} (approval untouched)"
+    )
+    print(f"   B observations from source -> {out['B_candidate_rows']} (tenant isolation)")
+    checks = {
+        "task_started_allowed": start.allowed is True,
+        "tenant_admin_refused": tenant_refused is True,
+        "running_task_denied_after_revoke": resume.allowed is False and version_in_force is False,
+        "approval_and_terms_revoked": stored_status == SourceApprovalStatus.REVOKED.value
+        and terms_status == SourceTermsStatus.REVOKED.value,
+        "observation_invalidated": out["invalidation"]["candidate_score_status"]
+        == ScoreStatus.STALE.value,
+        "invalidation_idempotent": second.invalidated == 0,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Revoked rights cannot be used by an already-"
+        "running task holding the old source version — the re-check denies the instant the approval is "
+        "revoked, with no sweep required. The invalidation sweep only marks affected observations stale; "
+        "it enables nothing.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",

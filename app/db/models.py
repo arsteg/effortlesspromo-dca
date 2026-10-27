@@ -220,11 +220,16 @@ class SourceTermsStatus(str, Enum):
     are no longer in force. The expiry decision is governed by the explicit validity window
     (:attr:`SourceTerms.effective_from`/:attr:`SourceTerms.expires_at`), never by the status flag alone,
     so a right is treated as lapsed the moment its window closes even before the sweep stamps it EXPIRED.
+    ``REVOKED`` is the terminal state the DCA-050 operator-revocation moves an ACTIVE version to when a
+    platform operator withdraws the approval that promoted it — a durable record that the rights were
+    deliberately pulled (distinct from a lapse). Like EXPIRED it only ever makes a right MORE
+    restrictive; it is never consulted to authorize a fetch.
     """
 
     DRAFT = "draft"
     ACTIVE = "active"
     EXPIRED = "expired"
+    REVOKED = "revoked"
 
 
 class SourceApprovalStatus(str, Enum):
@@ -238,10 +243,14 @@ class SourceApprovalStatus(str, Enum):
     validity window (:meth:`~app.services.source_approval.SourceApprovalStore.is_in_force` honours
     ``effective_from``/``expires_at`` at ``now``), never by the status flag alone, so a lapsed approval
     endorses nothing the moment its window closes — even before the sweep stamps it EXPIRED. ``REVOKED``
-    is the state a future, disabled revoke capability would move it to; no path in this service writes a
-    ``REVOKED`` approval, so an approval can only be created or expire, never silently withdrawn here. An
-    approval is platform control-plane data and, on its own, enables no acquisition (the source catalog
-    entry staying ENABLED is a separate, disabled capability — DCA-044).
+    is the terminal state the DCA-050 operator-revocation moves an ACTIVE approval to when a platform
+    operator deliberately withdraws it (recording who/when/why on the approval row). The moment the
+    approval is ``REVOKED`` it is no longer ACTIVE, so
+    :meth:`~app.services.source_approval.SourceApprovalStore.is_in_force` returns ``False`` immediately —
+    an already-running task holding the old (now-revoked) source version is denied at its next read/use
+    check, with no sweep required (DCA-050). A revocation only ever makes a right MORE restrictive; it
+    never re-enables or widens one. An approval is platform control-plane data and, on its own, enables
+    no acquisition (the source catalog entry staying ENABLED is a separate, disabled capability — DCA-044).
     """
 
     ACTIVE = "active"
@@ -805,6 +814,13 @@ class SourceTermsApproval(Base):
         server_default=SourceApprovalStatus.ACTIVE.value,
         index=True,
     )
+    # DCA-050 revocation record — all NULL until a platform operator revokes this approval. ``revoked_by``
+    # is the opaque operator subject id (never a name/email); ``revocation_reason`` is a short opaque
+    # reason code/explanation; ``revoked_at`` is when it was pulled. They make the approval row itself the
+    # durable who/when/why of the revocation (mirroring how the review essentials capture the approval).
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    revocation_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

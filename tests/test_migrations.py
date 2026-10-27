@@ -843,6 +843,70 @@ def test_0019_creates_business_source_entitlements_on_a_preexisting_database(cle
 
 
 @requires_pg
+def test_0020_adds_revocation_columns_on_a_preexisting_database(clean_schema):
+    """DCA-050 — the 0020 add-column branch (for a DB migrated before the revocation columns existed).
+
+    A fresh DB gets ``source_term_approvals`` WITH ``revoked_at``/``revoked_by``/``revocation_reason``
+    from the metadata baseline (0001), so 0020 is a no-op there. To exercise 0020's real job, upgrade to
+    head, DROP the three columns, seed one pre-existing approval row, stamp history back to 0019, then
+    upgrade to head again — 0020 must re-add exactly those columns (backfilling the existing row to NULL)
+    with no new table and no RLS policy (control-plane catalog, like 0016..0018).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "source_term_approvals" DROP COLUMN "revocation_reason", '
+                'DROP COLUMN "revoked_by", DROP COLUMN "revoked_at"'
+            )
+        )
+        # Seed one pre-existing (pre-revocation) approval row to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO source_term_approvals "
+                "(id, source_key, terms_version, reviewer_id, reviewer_type, review_evidence, "
+                "reviewed_at, expires_at, approved_operation_rights, approved_field_rights, status, "
+                "created_at) VALUES "
+                "('appr-legacy', 'legacy_source', 1, 'op-legacy', 'platform_operator', '{}', now(), "
+                "now(), '{}', '{}', 'active', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0019_business_entitlements")  # pretend we predate the revocation columns
+    command.upgrade(cfg, "head")  # 0020 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("source_term_approvals", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT revoked_at, revoked_by, revocation_reason FROM source_term_approvals "
+                "WHERE id = 'appr-legacy'"
+            )
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'source_term_approvals' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert {"revoked_at", "revoked_by", "revocation_reason"}.issubset(cols)  # columns re-added
+    assert backfilled == (None, None, None)  # pre-existing row backfilled to "not revoked"
+    assert policy is None  # control-plane catalog: still no tenant RLS policy
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 

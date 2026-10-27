@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi.testclient import TestClient
 
-from app.db.models import SourceApprovalStatus, SourceTermsApproval
+from app.db.models import DiscoveryRun, SourceApprovalStatus, SourceTermsApproval
 from app.services.source_approval import (
     ReviewerPrincipal,
     SourceApprovalReview,
@@ -107,3 +107,92 @@ def test_maintenance_tick_expires_a_lapsed_source_approval():
     # EXPIRED, transitions nothing — proving the wiring is a safe, idempotent no-op.
     tick_result = tick_maintenance(app.state.session_factory, settings)
     assert tick_result.transitioned == 0
+
+
+def test_maintenance_tick_invalidates_observations_from_a_revoked_source():
+    """DCA-050: the scheduled maintenance tick also runs the revocation-invalidation sweep, flipping a
+    still-current observation from a now-revoked source to stale (committing its own unit of work)."""
+    from app.db.models import ProspectCandidate, ScoreStatus, Source, SourceStatus
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_revocation import RevokerPrincipal, SourceRevocationStore
+
+    settings = make_settings()
+    app = create_app(settings)
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    key = "mca_master_data"
+    biz = "66666666-6666-6666-6666-666666666666"
+
+    with app.state.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=key,
+                operations={"collect": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            ReviewerPrincipal(subject="op-001", roles=("platform_operator",)),
+        )
+        source = session.query(Source).filter(Source.key == key).one()
+        source.status = SourceStatus.ENABLED.value
+        source.enabled = True
+        BusinessSourceEntitlementStore(session, biz).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=key, enabled=True, operations={"collect": True}, purposes=["prospecting"]
+            ),
+            BusinessEntitler(subject="admin-66", roles=("owner", "admin")),
+            now=now,
+        )
+        run = DiscoveryRun(business_id=biz, source_keys=[key], status="completed")
+        session.add(run)
+        session.flush()
+        candidate = ProspectCandidate(
+            business_id=biz,
+            run_id=run.id,
+            org_name="Synthetic Co",
+            org_identifier="CIN-66",
+            contact={},
+            source_key=key,
+            source_ref="synthetic://x",
+            trust_tier="official_registry",
+            match_score=1.0,
+            rationale="",
+        )
+        session.add(candidate)
+        session.flush()
+        candidate_id = candidate.id
+        SourceRevocationStore(session).revoke(
+            key,
+            1,
+            RevokerPrincipal(subject="op-001", roles=("platform_operator",)),
+            reason="pulled",
+            now=now,
+        )
+        session.commit()
+
+    tick_maintenance(app.state.session_factory, settings)
+
+    with app.state.session_factory() as session:
+        assert session.get(ProspectCandidate, candidate_id).score_status == ScoreStatus.STALE.value

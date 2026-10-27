@@ -43,6 +43,11 @@ class Scope(str, Enum):
     # so approving them is never a tenant-admin right. Kept on the platform plane precisely so a
     # business administrator (``source.approve`` below) can never perform the catalog approval.
     SOURCE_TERMS_APPROVE = "platform.source.terms.approve"
+    # operator: revoke a previously-approved source configuration (DCA-050). A distinct, explicit
+    # platform scope from the approve scope above — revoking WITHDRAWS a right, a deliberately separate
+    # authority from granting one — yet still never a tenant-admin right (the catalog is shared
+    # control-plane data). A business administrator can never revoke a catalog approval.
+    SOURCE_TERMS_REVOKE = "platform.source.terms.revoke"
 
 
 # Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
@@ -64,14 +69,16 @@ BUSINESS_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
 # business map on purpose: membership in a business can never yield a platform scope.
 PLATFORM_OPERATOR_ROLE = "platform_operator"
 PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
-    PLATFORM_OPERATOR_ROLE: frozenset({Scope.PLATFORM_OPS_READ, Scope.SOURCE_TERMS_APPROVE}),
+    PLATFORM_OPERATOR_ROLE: frozenset(
+        {Scope.PLATFORM_OPS_READ, Scope.SOURCE_TERMS_APPROVE, Scope.SOURCE_TERMS_REVOKE}
+    ),
 }
 
 _BUSINESS_SCOPES = frozenset().union(*BUSINESS_ROLE_SCOPES.values())
 _PLATFORM_SCOPES = frozenset().union(*PLATFORM_ROLE_SCOPES.values())
-assert _BUSINESS_SCOPES.isdisjoint(_PLATFORM_SCOPES), (
-    "business and platform scopes must not overlap"
-)
+assert _BUSINESS_SCOPES.isdisjoint(
+    _PLATFORM_SCOPES
+), "business and platform scopes must not overlap"
 
 
 def scopes_for_business_roles(roles: tuple[str, ...]) -> frozenset[Scope]:
