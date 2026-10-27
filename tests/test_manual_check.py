@@ -109,6 +109,25 @@ def test_dca039_scenario_runs_and_proves_versioning_and_denials(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca040_scenario_runs_and_proves_confirm_and_denials(capsys):
+    # The DCA-040 ICP-confirmation scenario runs on local synthetic SQLite: it proves v1 becomes
+    # active, editing to v2 keeps v1 active until v2 is confirmed, the unknown/no-targeting/bad-actor
+    # denials each leave the active version unchanged, and tenant isolation (B cannot confirm A's).
+    result = execute(_args(story_id="DCA-040"))
+    assert result.exit_code == 0
+    assert result.summary["active_after_v1"]["version"] == 1
+    assert result.summary["active_after_v1"]["grantsCampaignAuthority"] is False
+    assert result.summary["active_before_v2_confirm"] == 1  # edit did not flip the active version
+    assert result.summary["active_after_v2"] == 2
+    assert result.summary["denials"]["unknown_version"]["status"] == 404
+    assert result.summary["denials"]["no_material_targeting"]["status"] == 422
+    assert result.summary["denials"]["contact_data_actor"]["status"] == 422
+    assert result.summary["denials"]["active_unchanged"] is True
+    assert result.summary["cross_tenant"]["b_active"] is False
+    assert result.summary["cross_tenant"]["b_confirm_status"] == 404
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

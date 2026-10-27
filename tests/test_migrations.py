@@ -40,6 +40,7 @@ DCA_TABLES = {
     "idempotency_records",
     "business_profile_drafts",
     "icp_drafts",
+    "icp_confirmations",
 }
 
 
@@ -499,6 +500,48 @@ def test_0012_creates_icp_drafts_on_a_preexisting_database(clean_schema):
         ).first()
     eng.dispose()
     assert "uq_icp_draft_version" in uniques  # one version per tenant; a version never overwrites
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0013_creates_icp_confirmations_on_a_preexisting_database(clean_schema):
+    """DCA-040 — the 0013 create branch (for a DB migrated before ``icp_confirmations`` existed).
+
+    Same shape as the 0005..0012 tests: a fresh DB gets the table from the metadata baseline (0001) and
+    its RLS policy from 0002, so 0013 is a no-op there. To exercise 0013's real job, upgrade to head,
+    drop the table + policy, stamp history back to 0012, then upgrade to head again — 0013 must recreate
+    the table (with its one-active-per-business constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "icp_confirmations" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0012_icp_drafts")  # pretend we predate the ICP confirmation table
+    command.upgrade(cfg, "head")  # 0013 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "icp_confirmations" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("icp_confirmations", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'icp_confirmations' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_icp_confirmation_business" in uniques  # one active ICP version per tenant
     assert policy is not None  # RLS re-established, not just the bare table
 
 

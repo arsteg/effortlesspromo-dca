@@ -294,6 +294,51 @@ class IcpDraft(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class IcpConfirmation(TenantOwned, Base):
+    """DCA-040 — the ONE confirmed/active ICP version for a business (tenant-owned, RLS-protected).
+
+    An explicit confirmation operation selects which :class:`IcpDraft` version is *active* for the
+    business, recording WHO confirmed it (``actor_id`` / ``actor_type`` — an opaque subject id, never a
+    name/email) and WHEN (``confirmed_at``). There is exactly ONE such row per business
+    (``business_id`` is unique), so a business has at most one active ICP version at a time; confirming
+    a different version re-points this single row rather than inserting a second.
+
+    This is the *pointer*, kept separate from the immutable DCA-039 :class:`IcpDraft` version history:
+    drafts stay insert-only (editing an ICP always creates a NEW draft version and never touches this
+    row), so a freshly-edited draft does NOT become active — the previously-confirmed version stays
+    active until a new version is explicitly confirmed. Only a draft version that exists for this
+    business AND carries material targeting can be confirmed (see
+    :mod:`app.services.icp_confirmation`); an unknown version or an empty (no-material-targeting) draft
+    is refused before this row is touched.
+
+    Confirmation selects the active targeting version ONLY. It grants no campaign/sending authority —
+    the DCA has no send path, and acquisition/consent/suppression remain platform-gated — so marking a
+    version active can never, on its own, cause a message to be sent.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one tenant can never read or change another's active ICP.
+    """
+
+    __tablename__ = "icp_confirmations"
+    # Exactly one confirmation (active version) per business — a business never has two active ICPs.
+    __table_args__ = (UniqueConstraint("business_id", name="uq_icp_confirmation_business"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The active IcpDraft version for this business (the version that was confirmed).
+    version: Mapped[int] = mapped_column(Integer)
+    # WHO confirmed — an opaque subject/service id (never a name/email) plus its kind. Supplied by the
+    # caller (the service-auth gate authenticates the calling service, not the acting user) and screened
+    # for secret/contact data by the audit sink in the SAME unit of work.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    # WHEN the active version was last confirmed (set/updated on every confirm).
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
 class DiscoveryRun(TenantOwned, Base):
     """One agent cycle for one tenant — the explainability record of what happened and why."""
 

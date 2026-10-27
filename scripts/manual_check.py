@@ -3372,6 +3372,189 @@ def _dca_039(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-040",
+    "confirm one ICP version: A confirms v1 (active, records actor/time); editing to v2 leaves v1 "
+    "active until v2 is confirmed; unknown version (404), no-material-targeting draft (422) and a "
+    "contact-data actor id (422) are refused with no state change; confirming grants no campaign "
+    "authority; B cannot confirm A's version (tenant isolation)",
+)
+def _dca_040(ctx: CheckContext) -> dict:
+    """Drive the real DCA-040 ICP-confirmation API over the HTTP API against synthetic A and B,
+    following the developer manual-test steps:
+
+      1. register A and B;
+      2. A saves a valid ICP draft (v1, material targeting) and confirms it -> it becomes ACTIVE,
+         recording actor + time; GET /icp/active shows v1;
+      3. edit the ICP (save v2) and verify v1 REMAINS active until v2 is confirmed; then confirm v2 ->
+         v2 active, v1 superseded;
+      4. reproduce the denials, each leaving the active version unchanged:
+         - confirm an unknown version (99) -> 404,
+         - confirm a draft with no material targeting (exclusions only) -> 422,
+         - confirm with an actor id carrying contact data -> 422;
+      5. prove confirming grants no campaign authority (grantsCampaignAuthority=false), and tenant
+         isolation: B has nothing active and cannot confirm A's version (404).
+
+    Local synthetic only (AI disabled, ephemeral DB). Every call is shown with its real body so a human
+    can compare against the acceptance criteria rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.services.icp_confirmation import (
+        REASON_DRAFT_VERSION_NOT_FOUND,
+        REASON_NO_MATERIAL_TARGETING,
+    )
+
+    biz_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    biz_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    actor = "00000000-0000-4000-9000-0000000a0040"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    def draft(business_id, **overrides) -> dict:
+        base: dict = {
+            "industries": [],
+            "sizeBands": [],
+            "roles": [],
+            "geography": [],
+            "exclusions": [],
+        }
+        base.update(overrides)
+        return base
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        for biz in (biz_a, biz_b):
+            client.post("/v1/tenants", json={"businessId": biz}, headers=auth)
+
+        # 2) save v1 and confirm it
+        client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=draft(biz_a, industries=["retail"], sizeBands=["small"], geography=["KA"]),
+            headers=auth,
+        )
+        c1 = client.post(
+            f"/v1/tenants/{biz_a}/icp/confirm", json={"version": 1, "actorId": actor}, headers=auth
+        )
+        active1 = client.get(f"/v1/tenants/{biz_a}/icp/active", headers=auth).json()
+        print(
+            f"\n2) confirm v1 -> HTTP {c1.status_code}  active version={c1.json().get('version')}"
+        )
+        print(
+            f"   GET /icp/active -> version={active1['version']} actorId={active1['actorId']} "
+            f"confirmedAt={active1['confirmedAt']}  grantsCampaignAuthority="
+            f"{active1['grantsCampaignAuthority']}"
+        )
+        out["confirm_v1"] = {"status": c1.status_code, "body": c1.json()}
+        out["active_after_v1"] = active1
+
+        # 3) edit to v2; v1 must stay active until v2 is confirmed
+        client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=draft(biz_a, industries=["retail", "wholesale"], roles=["owner"]),
+            headers=auth,
+        )
+        active_mid = client.get(f"/v1/tenants/{biz_a}/icp/active", headers=auth).json()
+        drafts_mid = client.get(f"/v1/tenants/{biz_a}/icp/drafts", headers=auth).json()
+        active_flags = {row["version"]: row["active"] for row in drafts_mid}
+        print(
+            f"\n3) after editing to v2 (no confirm): active still version={active_mid['version']} "
+            f"| drafts active flags={active_flags}"
+        )
+        c2 = client.post(
+            f"/v1/tenants/{biz_a}/icp/confirm", json={"version": 2, "actorId": actor}, headers=auth
+        )
+        active2 = client.get(f"/v1/tenants/{biz_a}/icp/active", headers=auth).json()
+        print(f"   confirm v2 -> HTTP {c2.status_code}  active version now={active2['version']}")
+        out["active_before_v2_confirm"] = active_mid["version"]
+        out["active_after_v2"] = active2["version"]
+
+        # 4) denials — each leaves the active version unchanged
+        active_before = client.get(f"/v1/tenants/{biz_a}/icp/active", headers=auth).json()
+        unknown = client.post(
+            f"/v1/tenants/{biz_a}/icp/confirm", json={"version": 99, "actorId": actor}, headers=auth
+        )
+        client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=draft(biz_a, exclusions=["competitors"]),  # v3: no positive targeting
+            headers=auth,
+        )
+        empty = client.post(
+            f"/v1/tenants/{biz_a}/icp/confirm", json={"version": 3, "actorId": actor}, headers=auth
+        )
+        bad_actor = client.post(
+            f"/v1/tenants/{biz_a}/icp/confirm",
+            json={"version": 1, "actorId": "victim@example.com"},
+            headers=auth,
+        )
+        active_after = client.get(f"/v1/tenants/{biz_a}/icp/active", headers=auth).json()
+        print("\n4) denials (active version must stay unchanged):")
+        for label, resp in [
+            ("unknown version 99", unknown),
+            ("no material targeting", empty),
+            ("contact-data actor id", bad_actor),
+        ]:
+            msg = resp.json().get("error", {}).get("message", resp.json())
+            print(f"   {label:24} -> HTTP {resp.status_code} ({msg})")
+        print(
+            f"   active unchanged: {active_after['version'] == active_before['version']} "
+            f"(still v{active_after['version']})"
+        )
+        out["denials"] = {
+            "unknown_version": {
+                "status": unknown.status_code,
+                "message": unknown.json()["error"]["message"],
+            },
+            "no_material_targeting": {
+                "status": empty.status_code,
+                "message": empty.json()["error"]["message"],
+            },
+            "contact_data_actor": {
+                "status": bad_actor.status_code,
+                "message": bad_actor.json()["error"]["message"],
+            },
+            "active_unchanged": active_after["version"] == active_before["version"],
+        }
+
+        # 5) tenant isolation
+        b_active = client.get(f"/v1/tenants/{biz_b}/icp/active", headers=auth).json()
+        b_confirm = client.post(
+            f"/v1/tenants/{biz_b}/icp/confirm", json={"version": 1, "actorId": actor}, headers=auth
+        )
+        print(
+            f"\n5) B active={b_active['active']} (none); B confirm A's version 1 -> "
+            f"HTTP {b_confirm.status_code} ({b_confirm.json().get('error', {}).get('message')})"
+        )
+        out["cross_tenant"] = {
+            "b_active": b_active["active"],
+            "b_confirm_status": b_confirm.status_code,
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"confirmed_v1={out['confirm_v1']['status'] == 200 and out['active_after_v1']['version'] == 1}  "
+        f"edit_keeps_v1_active={out['active_before_v2_confirm'] == 1}  "
+        f"v2_active_after_confirm={out['active_after_v2'] == 2}  "
+        f"grants_no_campaign_authority={out['active_after_v1']['grantsCampaignAuthority'] is False}  "
+        f"unknown_404={out['denials']['unknown_version']['status'] == 404 and out['denials']['unknown_version']['message'] == REASON_DRAFT_VERSION_NOT_FOUND}  "
+        f"no_targeting_422={out['denials']['no_material_targeting']['status'] == 422 and out['denials']['no_material_targeting']['message'] == REASON_NO_MATERIAL_TARGETING}  "
+        f"bad_actor_422={out['denials']['contact_data_actor']['status'] == 422}  "
+        f"no_state_change={out['denials']['active_unchanged']}  "
+        f"tenant_isolation={out['cross_tenant']['b_active'] is False and out['cross_tenant']['b_confirm_status'] == 404}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; confirming selects the active ICP version only — "
+        "it records actor/time and grants no campaign/sending authority; editing creates a new draft "
+        "and never changes the active version until that version is itself confirmed; every denial "
+        "left the active version unchanged; B never sees or confirms A's version)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
