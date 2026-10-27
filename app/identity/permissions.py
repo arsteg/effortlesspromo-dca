@@ -48,6 +48,12 @@ class Scope(str, Enum):
     # authority from granting one — yet still never a tenant-admin right (the catalog is shared
     # control-plane data). A business administrator can never revoke a catalog approval.
     SOURCE_TERMS_REVOKE = "platform.source.terms.revoke"
+    # operator: approve a compliance POLICY rulepack version (DCA-053). Like SOURCE_TERMS_APPROVE this
+    # is a PLATFORM action, NOT a business one: a policy rulepack is platform control-plane data shared
+    # across all tenants, so approving one is never a tenant-admin right. Kept on the platform plane
+    # precisely so a business administrator (the ``policy.approve`` business scope above is a
+    # business-local intent, not authority over the shared policy registry) can never perform it.
+    POLICY_RULEPACK_APPROVE = "platform.policy.rulepack.approve"
 
 
 # Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
@@ -70,7 +76,12 @@ BUSINESS_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
 PLATFORM_OPERATOR_ROLE = "platform_operator"
 PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
     PLATFORM_OPERATOR_ROLE: frozenset(
-        {Scope.PLATFORM_OPS_READ, Scope.SOURCE_TERMS_APPROVE, Scope.SOURCE_TERMS_REVOKE}
+        {
+            Scope.PLATFORM_OPS_READ,
+            Scope.SOURCE_TERMS_APPROVE,
+            Scope.SOURCE_TERMS_REVOKE,
+            Scope.POLICY_RULEPACK_APPROVE,
+        }
     ),
 }
 

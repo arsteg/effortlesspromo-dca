@@ -323,18 +323,43 @@ class RuleChannel(str, Enum):
 
 
 class PolicyRulepackStatus(str, Enum):
-    """Lifecycle state of a compliance policy rulepack version (DCA-052).
+    """Lifecycle state of a compliance policy rulepack version (DCA-052/DCA-053).
 
-    ``DRAFT`` — a reviewable, NOT-in-force rulepack version. Every pack is created here as a draft:
-    defining rules documents what the policy *would* decide, but puts nothing in force on its own —
-    ``no rule becomes live just by existing``. ``ACTIVE`` is the state a future, DISABLED approval
-    capability (its own later story, gated behind a policy review) would promote one reviewed version
-    to. No path in this service writes an ``ACTIVE`` pack, so saving a draft can never silently make a
-    rule enforceable.
+    ``DRAFT`` — a reviewable, NOT-in-force rulepack version. Every pack is created here as a draft
+    (DCA-052): defining rules documents what the policy *would* decide, but puts nothing in force on
+    its own — ``no rule becomes live just by existing``. ``ACTIVE`` is the state the DCA-053 policy
+    approval promotes ONE reviewed version to when a platform operator records a complete review
+    (approver + references + review expiry). ``EXPIRED`` is the terminal state a lapsed ACTIVE version
+    moves to once the approval that promoted it is past its review-expiry window (the scheduled sweep
+    is a later story; until then a lapse is detected by the explicit window, never by the flag alone —
+    :meth:`~app.services.policy_approval.PolicyApprovalStore.is_in_force`). A DRAFT or EXPIRED pack
+    authorizes nothing: only an ACTIVE version inside its approval window is in force, and changing
+    approved content requires a NEW version (the store is insert-only), never an edit in place.
     """
 
     DRAFT = "draft"
     ACTIVE = "active"
+    EXPIRED = "expired"
+
+
+class PolicyApprovalStatus(str, Enum):
+    """Lifecycle state of a compliance policy approval (DCA-053).
+
+    ``ACTIVE`` — the approval a platform operator recorded is in force: it endorses exactly one
+    :class:`CompliancePolicyRulepack` version and carries the review essentials (the approver, the
+    references/evidence relied on, the review date and an explicit review expiry). ``EXPIRED`` is the
+    terminal state a lapsed ACTIVE approval moves to once past its explicit ``expires_at`` review
+    deadline — a durable record that the endorsement must be re-reviewed (the scheduled sweep is a
+    later story). The in-force decision is governed by the explicit validity window
+    (:meth:`~app.services.policy_approval.PolicyApprovalStore.is_in_force` honours
+    ``effective_from``/``expires_at`` at ``now``), never by the flag alone, so a lapsed approval
+    endorses nothing the moment its window closes — even before any sweep stamps it EXPIRED. An
+    approval is platform control-plane data and, on its own, enables no acquisition/contact: the
+    policy engine that would CONSULT an in-force pack stays a disabled future capability.
+    """
+
+    ACTIVE = "active"
+    EXPIRED = "expired"
 
 
 class BusinessProfileDraft(TenantOwned, Base):
@@ -963,6 +988,80 @@ class CompliancePolicyRulepack(Base):
         String(16),
         default=PolicyRulepackStatus.DRAFT.value,
         server_default=PolicyRulepackStatus.DRAFT.value,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class CompliancePolicyApproval(Base):
+    """DCA-053 — a platform operator's review/approval of one compliance policy rulepack version.
+
+    Approving a POLICY *version* is the capability that lets a reviewed
+    :class:`CompliancePolicyRulepack` version (DCA-052) be accepted independently. One row is one
+    approval: it endorses exactly one ``(jurisdiction, policy_version)`` and records the review
+    essentials the story requires —
+
+    - ``review_references`` — the references/evidence the operator relied on to approve
+      (``{reference, kind, uri}``); an approval cannot be staged without a non-empty ``reference`` (a
+      bare approval is refused). This is why the service never AUTHORS a legal conclusion: the operator
+      cites the external basis and the row records it, rather than the system synthesizing one.
+    - ``reviewer_id`` / ``reviewer_type`` — WHO approved: an opaque subject id of a *platform
+      operator* (never a name/email). Approval is a platform-plane action
+      (:attr:`~app.identity.permissions.Scope.POLICY_RULEPACK_APPROVE`); a tenant administrator can
+      never perform it — the policy registry is shared control-plane data, not a tenant resource.
+    - ``reviewed_at`` — the review DATE (when the operator reviewed), required.
+    - ``expires_at`` — the approval's EXPLICIT review expiry, required: an approval lapses rather than
+      living forever, so a stale endorsement must be re-reviewed. ``effective_from`` optionally delays
+      when it takes effect.
+
+    ``content_fingerprint`` is a stable digest of the rulepack's normalized rules at approval time, so
+    the approval is bound to the EXACT content it reviewed — ``immutable approved versions``: changing
+    approved content means recording a NEW version (the DCA-052 store is insert-only), which starts as
+    a fresh DRAFT and is unapproved until separately reviewed. An approval can never silently follow an
+    edited pack.
+
+    Like :class:`CompliancePolicyRulepack` / the source registries, this is platform CONTROL-PLANE
+    data — a shared registry, deliberately OUTSIDE tenant RLS and never tenant-scoped. It holds only
+    the review record (opaque reviewer id + references + a content digest): no prospect contact data
+    and no secrets. Approving a version promotes that rulepack row ``draft`` → ``active``, but on its
+    own enables NO acquisition/contact: the policy engine that would CONSULT an in-force pack stays a
+    disabled future capability, so an approval never, by itself, authorizes production behavior.
+    """
+
+    __tablename__ = "compliance_policy_approvals"
+    # One approval per rulepack version: a (jurisdiction, policy_version) pair is approved at most
+    # once, so a double approval is a constraint violation, never a silent second endorsement.
+    __table_args__ = (
+        UniqueConstraint("jurisdiction", "policy_version", name="uq_policy_approval_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # India-only, mirroring the rulepack it endorses: always "IN".
+    jurisdiction: Mapped[str] = mapped_column(
+        String(2), default="IN", server_default="IN", index=True
+    )
+    # The rulepack version this approval endorses (validated to exist as a DCA-052 draft).
+    policy_version: Mapped[int] = mapped_column(Integer)
+    # WHO approved — an opaque platform-operator subject id (never a name/email) plus its kind.
+    reviewer_id: Mapped[str] = mapped_column(String(128))
+    reviewer_type: Mapped[str] = mapped_column(
+        String(32), default="platform_operator", server_default="platform_operator"
+    )
+    # The references/evidence the operator relied on: {"reference": str, "kind": str, "uri": str}.
+    # Required (a non-empty reference) — the approval cites an external basis; it authors no conclusion.
+    review_references: Mapped[dict] = mapped_column(JSON, default=dict)
+    # WHEN the operator reviewed (the review date) — required.
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The approval's EXPLICIT review-expiry window — it lapses rather than living in a never-expiring flag.
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # Stable digest of the rulepack's normalized rules at approval time — binds the approval to the
+    # EXACT content reviewed, so changing approved content requires a new (unapproved) version.
+    content_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=PolicyApprovalStatus.ACTIVE.value,
+        server_default=PolicyApprovalStatus.ACTIVE.value,
         index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

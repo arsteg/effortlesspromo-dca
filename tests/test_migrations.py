@@ -47,6 +47,7 @@ DCA_TABLES = {
     "source_term_approvals",
     "business_source_entitlements",
     "compliance_policy_rulepacks",
+    "compliance_policy_approvals",
 }
 
 
@@ -905,6 +906,51 @@ def test_0020_adds_revocation_columns_on_a_preexisting_database(clean_schema):
     assert {"revoked_at", "revoked_by", "revocation_reason"}.issubset(cols)  # columns re-added
     assert backfilled == (None, None, None)  # pre-existing row backfilled to "not revoked"
     assert policy is None  # control-plane catalog: still no tenant RLS policy
+
+
+@requires_pg
+def test_0022_creates_compliance_policy_approvals_on_a_preexisting_database(clean_schema):
+    """DCA-053 — the 0022 create branch (for a DB migrated before ``compliance_policy_approvals``).
+
+    ``compliance_policy_approvals`` is platform control-plane data (NOT tenant-owned), like the source
+    registries (0016..0018) and the policy rulepacks (0021), so it has NO RLS policy. A fresh DB gets
+    the table from the metadata baseline (0001), so 0022 is a no-op there. To exercise 0022's real job,
+    upgrade to head, drop the table, stamp history back to 0021, then upgrade to head again — 0022 must
+    recreate the table (with its unique (jurisdiction, policy_version) constraint) and add NO
+    tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "compliance_policy_approvals" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0021_compliance_policy_rulepacks")  # pretend we predate the approval table
+    command.upgrade(cfg, "head")  # 0022 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "compliance_policy_approvals" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("compliance_policy_approvals", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'compliance_policy_approvals' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_policy_approval_version" in uniques  # one approval per policy version; never reused
+    assert policy is None  # control-plane registry: no tenant RLS policy
 
 
 @requires_pg

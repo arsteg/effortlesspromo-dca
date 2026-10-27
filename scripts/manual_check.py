@@ -5704,6 +5704,250 @@ def _dca_052(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-053",
+    "approve a policy version: a platform operator's complete review (references + reviewer + review "
+    "date + review expiry) approves a recorded rulepack version and promotes it to active; evaluating "
+    "an UNAPPROVED (draft) version is denied; a tenant administrator cannot approve (no state change); "
+    "an incomplete review is refused; and modifying approved content is a NEW, unapproved version",
+)
+def _dca_053(ctx: CheckContext) -> dict:
+    """Drive the real DCA-053 policy-approval store against a disposable DB, following the developer
+    manual-test steps and showing actual rows (``compliance_policy_approvals`` is a platform registry,
+    so there is no tenant HTTP surface — the inspectable artifact is the approval row, the promoted
+    rulepack status and the lifecycle evaluation):
+
+      1. record a DCA-052 India rulepack DRAFT version to review;
+      2. EVALUATE the unapproved version -> DENIED (not approved); it authorizes nothing;
+      3. a TENANT ADMINISTRATOR attempts the approval -> refused (not a platform operator); the
+         version stays a draft and NO approval row is created;
+      4. an INCOMPLETE operator review (no references) -> refused, nothing staged;
+      5. a PLATFORM OPERATOR's COMPLETE review -> approved: all four essentials (references, reviewer,
+         review date, review expiry) + a content fingerprint are recorded and the version is promoted
+         draft -> active; evaluating it now -> IN FORCE;
+      6. MODIFY the approved content -> a NEW draft version (v2), unapproved: v1 stays in force, v2
+         authorizes nothing, and v1's approval fingerprint still binds v1's content (not v2's).
+
+    Local synthetic only (AI disabled, ephemeral DB). Promoting a version authorizes no production
+    behavior on its own — the policy engine that would CONSULT an in-force pack stays disabled.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.policy_rulepacks import (
+        CompliancePolicyRulepackStore,
+        PolicyRuleInput,
+        RulepackInput,
+    )
+    from app.db.models import CompliancePolicyApproval, PolicyRulepackStatus
+    from app.services.policy_approval import (
+        REASON_MISSING_REFERENCES,
+        REASON_NOT_APPROVED,
+        REASON_NOT_PLATFORM_OPERATOR,
+        PolicyApprovalAuthorizationError,
+        PolicyApprovalError,
+        PolicyApprovalReview,
+        PolicyApprovalStore,
+        PolicyReviewerPrincipal,
+        content_fingerprint,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    operator = PolicyReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    tenant_admin = PolicyReviewerPrincipal(subject="user-owner-A", roles=("owner", "admin"))
+    evidence = {"reference": "DPDP-2023-s7", "kind": "statute", "uri": "https://example.test/law"}
+
+    base_pack = RulepackInput(
+        jurisdiction="IN",
+        title="India baseline policy",
+        evidence={"reference": "POLICY-REVIEW-2026-11", "kind": "legal_review"},
+        rules=[
+            PolicyRuleInput(
+                effect="allow",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required"},
+                evidence=evidence,
+            )
+        ],
+    )
+    base_review = PolicyApprovalReview(
+        reviewer_id="op-001",
+        references={"reference": "LEGAL-REVIEW-2026-11", "kind": "legal_review"},
+        reviewed_at=now,
+        expires_at=now + timedelta(days=365),
+    )
+
+    def rulepack(**overrides) -> RulepackInput:
+        return replace(base_pack, **overrides)
+
+    def review(**overrides) -> PolicyApprovalReview:
+        return replace(base_review, **overrides)
+
+    out: dict = {}
+
+    # 1) record a DCA-052 rulepack draft version
+    with ctx.session_factory() as session:
+        CompliancePolicyRulepackStore(session).add_version(rulepack())
+        session.commit()
+
+    # 2) evaluating the unapproved (draft) version is denied — it authorizes nothing
+    with ctx.session_factory() as session:
+        decision = PolicyApprovalStore(session).evaluate(1, now=now)
+        out["unapproved_in_force"] = decision.in_force
+        out["unapproved_reason"] = decision.reason
+
+    # 3) a tenant administrator cannot approve — refused, nothing changes
+    with ctx.session_factory() as session:
+        store = PolicyApprovalStore(session)
+        try:
+            store.approve(1, review(reviewer_id="user-owner-A"), tenant_admin)
+            out["tenant_admin_refused"] = "UNEXPECTEDLY APPROVED"
+        except PolicyApprovalAuthorizationError as exc:
+            out["tenant_admin_refused"] = exc.code
+        session.commit()
+    with ctx.session_factory() as session:
+        pack = CompliancePolicyRulepackStore(session).get_version(1)
+        out["status_after_tenant_attempt"] = pack.status if pack else None
+        out["approvals_after_tenant_attempt"] = session.query(CompliancePolicyApproval).count()
+
+    # 4) an incomplete operator review (no references) is refused (nothing staged)
+    with ctx.session_factory() as session:
+        store = PolicyApprovalStore(session)
+        try:
+            store.approve(1, review(references={}), operator)
+            out["incomplete_refused"] = "UNEXPECTEDLY APPROVED"
+        except PolicyApprovalError as exc:
+            out["incomplete_refused"] = exc.code
+        session.commit()
+    with ctx.session_factory() as session:
+        out["approvals_after_incomplete"] = session.query(CompliancePolicyApproval).count()
+
+    # 5) a platform operator's complete review approves and promotes the version
+    with ctx.session_factory() as session:
+        PolicyApprovalStore(session).approve(1, review(), operator)
+        session.commit()
+    with ctx.session_factory() as session:
+        store = PolicyApprovalStore(session)
+        approval = store.approval_for(1)
+        assert approval is not None
+        pack = CompliancePolicyRulepackStore(session).get_version(1)
+        assert pack is not None
+        decision = store.evaluate(1, now=now)
+        out["approved"] = {
+            "jurisdiction": approval.jurisdiction,
+            "policy_version": approval.policy_version,
+            "reviewer_id": approval.reviewer_id,
+            "reviewer_type": approval.reviewer_type,
+            "references_reference": approval.review_references.get("reference"),
+            "reviewed_at": approval.reviewed_at.isoformat() if approval.reviewed_at else None,
+            "expires_at": approval.expires_at.isoformat() if approval.expires_at else None,
+            "content_fingerprint": approval.content_fingerprint[:16] + "…",
+            "in_force_now": decision.in_force,
+        }
+        out["status_after_approval"] = pack.status
+
+    # 6) modify the approved content -> a NEW draft version (v2), unapproved
+    with ctx.session_factory() as session:
+        CompliancePolicyRulepackStore(session).add_version(
+            rulepack(
+                title="India baseline policy v2",
+                rules=[
+                    PolicyRuleInput(
+                        effect="deny",  # changed effect — different content
+                        action="contact",
+                        channel="email",
+                        authority="law",
+                        conditions={"consent": "required"},
+                        evidence=evidence,
+                    )
+                ],
+            )
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        store = PolicyApprovalStore(session)
+        rulepacks = CompliancePolicyRulepackStore(session)
+        v1_decision = store.evaluate(1, now=now)
+        v2_decision = store.evaluate(2, now=now)
+        approval = store.approval_for(1)
+        v1 = rulepacks.get_version(1)
+        v2 = rulepacks.get_version(2)
+        assert approval is not None and v1 is not None and v2 is not None
+        out["after_modification"] = {
+            "v1_status": v1.status,
+            "v1_in_force": v1_decision.in_force,
+            "v2_status": v2.status,
+            "v2_in_force": v2_decision.in_force,
+            "v2_reason": v2_decision.reason,
+            "fingerprint_binds_v1": approval.content_fingerprint == content_fingerprint(v1.rules),
+            "fingerprint_differs_v2": approval.content_fingerprint
+            != content_fingerprint(v2.rules),
+        }
+
+    print("\n1) recorded a DCA-052 India rulepack DRAFT (version 1).")
+    print("\n2) evaluate the UNAPPROVED version:")
+    print(
+        f"   in_force={out['unapproved_in_force']}  reason={out['unapproved_reason']!r} "
+        "(a draft authorizes nothing)"
+    )
+    print("\n3) tenant administrator attempts the approval:")
+    print(
+        f"   owner/admin@A -> REFUSED ({out['tenant_admin_refused']})  "
+        f"status still '{out['status_after_tenant_attempt']}'  "
+        f"approvals={out['approvals_after_tenant_attempt']}"
+    )
+    print("\n4) incomplete operator review (no references):")
+    print(
+        f"   -> refused ({out['incomplete_refused']})  "
+        f"approvals after refusal: {out['approvals_after_incomplete']}"
+    )
+    print("\n5) platform operator's COMPLETE review -> approved (actual approval row):")
+    for k, v in out["approved"].items():
+        print(f"     {k:22} = {v}")
+    print(
+        f"   endorsed version promoted: status now '{out['status_after_approval']}' (was 'draft')"
+    )
+    print("\n6) modify approved content -> a NEW, unapproved version:")
+    for k, v in out["after_modification"].items():
+        print(f"     {k:22} = {v}")
+
+    checks = {
+        "unapproved_denied": out["unapproved_reason"] == REASON_NOT_APPROVED,
+        "tenant_admin_refused": out["tenant_admin_refused"] == REASON_NOT_PLATFORM_OPERATOR,
+        "no_state_change_on_tenant_attempt": (
+            out["status_after_tenant_attempt"] == PolicyRulepackStatus.DRAFT.value
+            and out["approvals_after_tenant_attempt"] == 0
+        ),
+        "incomplete_refused": out["incomplete_refused"] == REASON_MISSING_REFERENCES,
+        "incomplete_staged_nothing": out["approvals_after_incomplete"] == 0,
+        "operator_approved_and_promoted": (
+            out["approved"]["reviewer_type"] == "platform_operator"
+            and out["status_after_approval"] == PolicyRulepackStatus.ACTIVE.value
+            and out["approved"]["in_force_now"] is True
+        ),
+        "modification_is_new_unapproved_version": (
+            out["after_modification"]["v1_in_force"] is True
+            and out["after_modification"]["v2_in_force"] is False
+            and out["after_modification"]["v2_reason"] == REASON_NOT_APPROVED
+            and out["after_modification"]["fingerprint_binds_v1"] is True
+            and out["after_modification"]["fingerprint_differs_v2"] is True
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Approval is a PLATFORM-operator action — a tenant "
+        "administrator cannot perform it; the approval records references/reviewer/review-date/expiry "
+        "and a content fingerprint, so changing approved content requires a NEW version. A draft or "
+        "expired version authorizes nothing, and promoting a version does NOT enable the policy engine "
+        f"(a disabled future capability). Table used: {CompliancePolicyApproval.__tablename__} — a "
+        "platform control-plane registry, not tenant-scoped.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
