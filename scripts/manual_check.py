@@ -3555,6 +3555,212 @@ def _dca_040(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-042",
+    "per-business spending limits: an administrator sets A's INR caps (versioned, audited); an "
+    "ordinary user cannot raise caps and a negative value is rejected, each with no state change; "
+    "B's configuration is unchanged (tenant isolation)",
+)
+def _dca_042(ctx: CheckContext) -> dict:
+    """Drive the real DCA-042 spending-limit API over HTTP against synthetic Businesses A and B,
+    following the developer manual-test steps:
+
+      1. an administrator (owner of A) sets A's daily/monthly/per-run INR caps -> version 1 stored,
+         audited; GET shows the in-force caps (precise minor units + derived rupee view + timezone);
+      2. raise A's caps -> version 2 stored, version 1 preserved in the immutable history;
+      3. reproduce the denials, each leaving A's stored caps unchanged and staging nothing:
+         - an ordinary user (viewer of A) tries to raise caps -> 403 (lacks budget.manage),
+         - a platform operator (no membership in A) tries to set caps -> 403 (no bypass),
+         - a negative cap -> 422, a non-INR currency -> 422;
+      4. prove tenant isolation: B starts unconfigured and setting A never configured B; B's own admin
+         sets B's (different) caps and A's caps are untouched.
+
+    The end-user auth contract is wired with a synthetic HS256 key so authorization is really enforced
+    (membership + budget.manage scope), exactly like the DCA-019 probe scenario. Local synthetic only
+    (AI disabled, ephemeral DB). Every call is shown with its real body/HTTP status so a human can
+    compare against the acceptance criteria rather than a bare PASS.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    import jwt
+    from fastapi.testclient import TestClient
+
+    from app.identity.fake import BUSINESS_A, BUSINESS_B, USER_ALICE, USER_BOB, USER_CAROL
+    from app.main import create_app
+    from app.services.budget_store import (
+        REASON_NEGATIVE_CAP,
+        REASON_UNSUPPORTED_CURRENCY,
+    )
+
+    issuer = "https://issuer.dca.local"
+    audience = "dca-api"
+    secret = "manual-check-signing-secret"  # synthetic, local-only
+    operator = "00000000-0000-4000-9000-00000090e701"
+
+    def mint(subject: str, roles: list[str] | None = None) -> str:
+        now = datetime.now(UTC)
+        claims: dict = {
+            "sub": subject,
+            "iss": issuer,
+            "aud": audience,
+            "iat": int(now.timestamp()),
+            "exp": int((now + timedelta(minutes=5)).timestamp()),
+        }
+        if roles is not None:
+            claims["roles"] = roles
+        return jwt.encode(claims, secret, algorithm="HS256")
+
+    def bearer(subject: str, roles: list[str] | None = None) -> dict:
+        return {"Authorization": f"Bearer {mint(subject, roles)}"}
+
+    configured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token="manual-check-local",
+        auth_token_issuer=issuer,
+        auth_token_audience=audience,
+        auth_token_signing_secret=secret,
+        synthetic_sources_enabled=True,
+    )
+
+    limits = {"dailyCapMinor": 200_000, "monthlyCapMinor": 5_000_000, "perRunCapMinor": 50_000}
+    raised = {"dailyCapMinor": 400_000, "monthlyCapMinor": 8_000_000, "perRunCapMinor": 100_000}
+
+    app = create_app(configured)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        # 1) admin sets A's caps -> v1, audited
+        set1 = client.post(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", json=limits, headers=bearer(USER_ALICE)
+        )
+        a_v1 = client.get(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", headers=bearer(USER_ALICE)
+        ).json()
+        print(
+            f"\n1) admin (owner@A) set caps -> HTTP {set1.status_code}  version={a_v1['version']}"
+        )
+        print(
+            f"   in-force: daily={a_v1['dailyCapMinor']} paise (₹{a_v1['dailyCapMajor']})  "
+            f"monthly={a_v1['monthlyCapMinor']} paise  perRun={a_v1['perRunCapMinor']} paise  "
+            f"currency={a_v1['currency']}  timezone={a_v1['timezone']}"
+        )
+        out["set_v1"] = {"status": set1.status_code, "version": a_v1["version"]}
+
+        # 2) raise caps -> v2, v1 preserved in history
+        client.post(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", json=raised, headers=bearer(USER_ALICE)
+        )
+        versions = client.get(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits/versions", headers=bearer(USER_ALICE)
+        ).json()
+        a_latest = client.get(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", headers=bearer(USER_ALICE)
+        ).json()
+        print(
+            f"\n2) raised caps -> versions stored={[v['version'] for v in versions]} "
+            f"(v1 daily={versions[0]['dailyCapMinor']} preserved)  in-force version={a_latest['version']}"
+        )
+        out["versions"] = [v["version"] for v in versions]
+        out["in_force_version"] = a_latest["version"]
+
+        # 3) denials — each leaves A's stored caps unchanged
+        before = client.get(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", headers=bearer(USER_ALICE)
+        ).json()
+        ordinary = client.post(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", json=raised, headers=bearer(USER_CAROL)
+        )
+        op = client.post(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits",
+            json=raised,
+            headers=bearer(operator, ["platform_operator"]),
+        )
+        negative = client.post(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits",
+            json={**limits, "dailyCapMinor": -1},
+            headers=bearer(USER_ALICE),
+        )
+        bad_currency = client.post(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits",
+            json={**limits, "currency": "USD"},
+            headers=bearer(USER_ALICE),
+        )
+        after = client.get(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", headers=bearer(USER_ALICE)
+        ).json()
+        print("\n3) denials (A's in-force caps must stay unchanged):")
+        for label, resp in [
+            ("ordinary user raises caps", ordinary),
+            ("platform operator sets caps", op),
+            ("negative daily cap", negative),
+            ("non-INR currency", bad_currency),
+        ]:
+            msg = resp.json().get("error", {}).get("message", resp.json())
+            print(f"   {label:28} -> HTTP {resp.status_code} ({msg})")
+        unchanged = (
+            after["version"] == before["version"]
+            and after["dailyCapMinor"] == before["dailyCapMinor"]
+        )
+        print(f"   A in-force unchanged: {unchanged} (still v{after['version']})")
+        out["denials"] = {
+            "ordinary_user_status": ordinary.status_code,
+            "operator_status": op.status_code,
+            "negative_status": negative.status_code,
+            "negative_code": negative.json().get("error", {}).get("message"),
+            "bad_currency_status": bad_currency.status_code,
+            "a_unchanged": unchanged,
+        }
+
+        # 4) tenant isolation — B starts unconfigured; B's admin sets B's own caps; A untouched
+        b_before = client.get(
+            f"/v1/tenants/{BUSINESS_B}/budget/limits", headers=bearer(USER_BOB)
+        ).json()
+        b_body = {"dailyCapMinor": 10_000, "monthlyCapMinor": 100_000, "perRunCapMinor": 5_000}
+        client.post(
+            f"/v1/tenants/{BUSINESS_B}/budget/limits", json=b_body, headers=bearer(USER_BOB)
+        )
+        b_after = client.get(
+            f"/v1/tenants/{BUSINESS_B}/budget/limits", headers=bearer(USER_BOB)
+        ).json()
+        a_final = client.get(
+            f"/v1/tenants/{BUSINESS_A}/budget/limits", headers=bearer(USER_ALICE)
+        ).json()
+        print(
+            f"\n4) tenant isolation: B configured before A's work? {b_before['configured']} "
+            f"(false); after B's own set -> B daily={b_after['dailyCapMinor']} | "
+            f"A daily still={a_final['dailyCapMinor']} (unchanged)"
+        )
+        out["isolation"] = {
+            "b_configured_before": b_before["configured"],
+            "b_daily_after": b_after["dailyCapMinor"],
+            "a_daily_final": a_final["dailyCapMinor"],
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"admin_set_v1={out['set_v1']['status'] == 201 and out['set_v1']['version'] == 1}  "
+        f"versioned_history={out['versions'] == [1, 2] and out['in_force_version'] == 2}  "
+        f"ordinary_user_denied={out['denials']['ordinary_user_status'] == 403}  "
+        f"operator_denied={out['denials']['operator_status'] == 403}  "
+        f"negative_rejected={out['denials']['negative_status'] == 422 and out['denials']['negative_code'] == REASON_NEGATIVE_CAP}  "
+        f"bad_currency_rejected={out['denials']['bad_currency_status'] == 422}  "
+        f"a_unchanged_after_denials={out['denials']['a_unchanged']}  "
+        f"tenant_isolation={out['isolation']['b_configured_before'] is False and out['isolation']['a_daily_final'] == 400_000 and out['isolation']['b_daily_after'] == 10_000}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; caps are precise INR minor units with India-local "
+        "timezone semantics; only an administrator may set/raise caps — an ordinary user and a "
+        "platform operator are denied; invalid/negative values are refused; storing a limit grants no "
+        f"spend; every denial left A's configuration unchanged and B's config independent. "
+        f"REASON_UNSUPPORTED_CURRENCY={REASON_UNSUPPORTED_CURRENCY})"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

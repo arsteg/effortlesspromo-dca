@@ -54,6 +54,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "business_profile_drafts",
         "icp_drafts",
         "icp_confirmations",
+        "budget_limits",
     }
 
 

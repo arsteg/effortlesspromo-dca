@@ -128,6 +128,26 @@ def test_dca040_scenario_runs_and_proves_confirm_and_denials(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca042_scenario_runs_and_proves_authz_versioning_and_isolation(capsys):
+    # The DCA-042 spending-limit scenario runs on local synthetic SQLite with the end-user auth
+    # contract wired: it proves an administrator sets versioned INR caps, an ordinary user and a
+    # platform operator are denied (403), a negative value / non-INR currency are refused (422) with
+    # A's config unchanged, and B's configuration stays independent (tenant isolation).
+    result = execute(_args(story_id="DCA-042"))
+    assert result.exit_code == 0
+    assert result.summary["set_v1"]["status"] == 201 and result.summary["set_v1"]["version"] == 1
+    assert result.summary["versions"] == [1, 2] and result.summary["in_force_version"] == 2
+    assert result.summary["denials"]["ordinary_user_status"] == 403
+    assert result.summary["denials"]["operator_status"] == 403
+    assert result.summary["denials"]["negative_status"] == 422
+    assert result.summary["denials"]["bad_currency_status"] == 422
+    assert result.summary["denials"]["a_unchanged"] is True
+    assert result.summary["isolation"]["b_configured_before"] is False
+    assert result.summary["isolation"]["a_daily_final"] == 400_000  # A's own raised (v2) value
+    assert result.summary["isolation"]["b_daily_after"] == 10_000  # B's independent value
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

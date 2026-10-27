@@ -15,6 +15,7 @@ from app.api.idempotency import install_idempotency
 from app.api.routes import (
     auth,
     authz,
+    budget,
     health,
     icp,
     profiles,
@@ -121,5 +122,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(targeting.router)
     app.include_router(auth.router)
     app.include_router(authz.router)
+    app.include_router(budget.router)
     app.include_router(service_integration.router)
     return app

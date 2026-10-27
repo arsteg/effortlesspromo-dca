@@ -167,6 +167,61 @@ def require_business_permission(
     return dependency
 
 
+def require_business_permission_on_path(
+    scope: Scope,
+) -> Callable[[Request, str, AuthenticatedPrincipal], TenantContext]:
+    """DCA-019 — require a business-plane ``scope`` for the business named in the ROUTE PATH.
+
+    Like :func:`require_business_permission`, but it resolves the tenant scope from the path parameter
+    ``business_id`` (the shape the ``/v1/tenants/{business_id}/...`` surface uses) rather than the
+    ``X-Business-Id`` header. The authenticated subject must hold an *active membership* in that path
+    business — a non-member (including a platform operator, who has no membership in any client
+    business) is denied before the scope check — and then the explicit scope check runs on top. So an
+    ordinary business user is denied an administrator scope (e.g. ``budget.manage``), and global
+    operator rights never authorize a client-business action. Every decision — grant or denial — is
+    audited via :func:`_audit_authz`.
+
+    Fail-closed: no identity client wired (contract disabled, e.g. production without the live
+    adapter) → 403; the subject has no active membership in the path business → 403 (generic, never an
+    oracle for whether the business exists); holds the membership but lacks the scope → 403.
+    """
+
+    def dependency(
+        request: Request,
+        business_id: str,
+        principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_subject)],
+    ) -> TenantContext:
+        identity_client = getattr(request.app.state, "identity_client", None)
+        if identity_client is None:
+            raise HTTPException(status_code=403, detail="tenant resolution is not available")
+        try:
+            context = resolve_tenant_context(
+                principal=principal,
+                requested_business_id=business_id,
+                identity_client=identity_client,
+            )
+        except TenantResolutionError as exc:
+            # Missing/denied membership both collapse to a generic 403 here: the path business is
+            # always supplied (it is a route parameter), so there is no "scope missing" case.
+            raise HTTPException(
+                status_code=403, detail="not authorized for the requested business"
+            ) from exc
+        request.state.tenant_context = context
+        allowed = scope in scopes_for_business_roles(context.roles)
+        _audit_authz(
+            plane="business",
+            subject=context.subject,
+            scope=scope,
+            allowed=allowed,
+            business_id=context.business_id,
+        )
+        if not allowed:
+            raise HTTPException(status_code=403, detail="operation not permitted for this role")
+        return context
+
+    return dependency
+
+
 def require_platform_permission(
     scope: Scope,
 ) -> Callable[[Request, AuthenticatedPrincipal], AuthenticatedPrincipal]:

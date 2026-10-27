@@ -19,6 +19,7 @@ from enum import Enum
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -337,6 +338,63 @@ class IcpConfirmation(TenantOwned, Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
+
+
+class BudgetLimit(TenantOwned, Base):
+    """DCA-042 — a scoped, versioned set of per-business spending limits (tenant-owned, RLS-protected).
+
+    One row is one *version* of a business's spend caps: how much the agent is allowed to spend in a
+    civil day, in a civil month, and in a single agent run. Each save inserts a NEW version
+    (``(business_id, version)`` is unique), so a new set of limits **preserves** every prior version
+    rather than mutating it; there is no update path, mirroring :class:`BusinessProfileDraft` (DCA-036)
+    and :class:`IcpDraft` (DCA-039). The highest version is the one in force; older versions are kept
+    as an immutable, auditable history of what the caps were and who changed them.
+
+    **Precise monetary values.** Amounts are stored as **integer minor units** (INR *paise*), never a
+    floating-point rupee value, so a limit is exact and never accrues binary-float rounding error. The
+    service is India-only, so ``currency`` is always ``INR`` (the store refuses anything else). A major
+    (rupee) view is derived for display only; the minor-unit integer is the source of truth.
+
+    **Timezone semantics.** ``timezone`` is the IANA zone whose civil calendar defines when the *daily*
+    and *monthly* windows begin and end (e.g. a "day" is midnight-to-midnight in that zone, not UTC).
+    India observes a single zone, so it is ``Asia/Kolkata``; the store validates it and normalizes the
+    legacy ``Asia/Calcutta`` alias to it. Storing the zone with the caps keeps the limit unambiguous:
+    the same paise figure means a different wall-clock window in a different zone, so the window is
+    pinned here rather than guessed by a reader.
+
+    ``actor_id`` / ``actor_type`` record WHO set this version (an opaque subject id, never a name/email)
+    — the same actor the atomic DCA-026 audit entry carries. Setting caps is an administrator action
+    (:data:`~app.identity.permissions.Scope.BUDGET_MANAGE`); an ordinary user cannot create a version.
+
+    Storing a limit grants no spend: the DCA has no send/charge path here, and these caps are the
+    ceiling a *future* (disabled) spending capability would enforce. Tenant-owned: it inherits the
+    DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant data table, so one
+    tenant can never read or change another's spending limits.
+    """
+
+    __tablename__ = "budget_limits"
+    # A version number is unique PER business: the same ordinal recurs across tenants but never within
+    # one, so a new version can never collide with or overwrite an existing version of the same tenant.
+    __table_args__ = (tenant_unique("version", name="uq_budget_limit_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # 1-based version ordinal within the business; a new set of limits is always max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # India-only: always "INR". The store refuses any other currency (a clear 422).
+    currency: Mapped[str] = mapped_column(String(3), default="INR", server_default="INR")
+    # Caps in INR MINOR units (paise) — integer, exact, never a float. Non-negative (validated).
+    daily_cap_minor: Mapped[int] = mapped_column(BigInteger)
+    monthly_cap_minor: Mapped[int] = mapped_column(BigInteger)
+    per_run_cap_minor: Mapped[int] = mapped_column(BigInteger)
+    # The IANA zone whose civil day/month bounds the daily/monthly windows (India: "Asia/Kolkata").
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Kolkata", server_default="Asia/Kolkata"
+    )
+    # WHO set this version — an opaque subject id (never a name/email) plus its kind, screened by the
+    # audit sink in the SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class DiscoveryRun(TenantOwned, Base):

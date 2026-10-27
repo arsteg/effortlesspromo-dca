@@ -41,6 +41,7 @@ DCA_TABLES = {
     "business_profile_drafts",
     "icp_drafts",
     "icp_confirmations",
+    "budget_limits",
 }
 
 
@@ -542,6 +543,48 @@ def test_0013_creates_icp_confirmations_on_a_preexisting_database(clean_schema):
         ).first()
     eng.dispose()
     assert "uq_icp_confirmation_business" in uniques  # one active ICP version per tenant
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0014_creates_budget_limits_on_a_preexisting_database(clean_schema):
+    """DCA-042 — the 0014 create branch (for a DB migrated before ``budget_limits`` existed).
+
+    Same shape as the 0005..0013 tests: a fresh DB gets the table from the metadata baseline (0001) and
+    its RLS policy from 0002, so 0014 is a no-op there. To exercise 0014's real job, upgrade to head,
+    drop the table + policy, stamp history back to 0013, then upgrade to head again — 0014 must recreate
+    the table (with its per-tenant version constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "budget_limits" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0013_icp_confirmations")  # pretend we predate the budget-limit table
+    command.upgrade(cfg, "head")  # 0014 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "budget_limits" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {u["name"] for u in insp.get_unique_constraints("budget_limits", schema=clean_schema)}
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'budget_limits' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_budget_limit_version" in uniques
+    )  # one version per tenant; a version never overwrites
     assert policy is not None  # RLS re-established, not just the bare table
 
 
