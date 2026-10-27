@@ -4061,6 +4061,199 @@ def _dca_044(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-045",
+    "version field and operation rights: record a source terms version whose rights differ per field "
+    "and per use (a display-only field vs an exportable field), with explicit version and expiry; "
+    "reproduce the per-field/per-use denial and the expired-version denial; an uncatalogued source / "
+    "unknown operation / missing contract evidence is refused with no row created",
+)
+def _dca_045(ctx: CheckContext) -> dict:
+    """Drive the real DCA-045 source-terms store against a disposable DB, following the developer
+    manual-test steps and showing actual rows (``source_terms`` is a platform registry, so there is no
+    tenant HTTP surface yet — the inspectable artifact is the recorded terms rows and the evaluated
+    rights):
+
+      1. catalogue a source (DCA-044), then record a terms VERSION whose rights differ per field/use:
+         'email' is display-only (display granted, export denied) while 'company_name' is exportable
+         (both granted); the version carries an EXPLICIT expiry;
+      2. inspect the independent rights values for a display-only vs an exportable field, and show the
+         version/expiry are explicit (not one legal boolean);
+      3. reproduce the denials, each a pure read that changes nothing: export on the display-only
+         field is denied; the same granted right is denied once the version has expired; and an
+         uncatalogued source / unknown operation / missing contract evidence are each refused with no
+         terms row created.
+
+    Local synthetic only (AI disabled, ephemeral DB). Nothing is approved/activated/enabled — a terms
+    version is a reviewable draft and acting on these rights stays a disabled future capability.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import SourceTerms
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import (
+        REASON_MISSING_CONTRACT_EVIDENCE,
+        REASON_OPERATION_NOT_PERMITTED,
+        REASON_SOURCE_NOT_FOUND,
+        REASON_TERMS_EXPIRED,
+        REASON_UNKNOWN_OPERATION,
+        SourceTermsInput,
+        SourceTermsStore,
+        SourceTermsValidationError,
+    )
+
+    source_key = "mca_master_data"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    terms_input = SourceTermsInput(
+        source_key=source_key,
+        operations={
+            "collect": True,
+            "store": True,
+            "derive": True,
+            "display": True,
+            "export": True,
+            "share": False,
+            "model_processing": True,
+        },
+        field_rights={
+            "email": {"display": True, "export": False},  # display-only field
+            "company_name": {"display": True, "export": True},  # exportable field
+        },
+        purposes=["prospecting"],
+        attribution={"required": True, "notice": "Source: MCA"},
+        retention={"max_days": 365, "policy": "delete after 1 year"},
+        contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+        effective_from=now - timedelta(days=30),
+        expires_at=now + timedelta(days=335),
+    )
+
+    out: dict = {}
+
+    # 1) catalogue the source + record a terms version
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                name="MCA Company Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(terms_input)
+        session.commit()
+
+    # 2) independent rights per field/use; version + expiry explicit
+    with ctx.session_factory() as session:
+        store = SourceTermsStore(session)
+        terms = store.latest(source_key)
+        assert terms is not None
+        print("\n1-2) recorded source terms version (actual row):")
+        print(
+            f"  source_key={terms.source_key}  version={terms.version}  status={terms.status}  "
+            f"active={store.is_active(terms)}"
+        )
+        print(
+            f"  effective_from={terms.effective_from}  expires_at={terms.expires_at}  "
+            f"(explicit validity window, not one legal boolean)"
+        )
+        print(f"  operation_rights (source-wide): {terms.operation_rights}")
+        print(f"  field_rights (per-field overrides): {terms.field_rights}")
+        print(f"  purposes={terms.purposes}  attribution={terms.attribution}")
+        print(f"  retention={terms.retention}  contract_evidence={terms.contract_evidence}")
+
+        matrix: dict = {}
+        print("\n   rights by field x use (at a time inside the validity window):")
+        for fld in ("email", "company_name"):
+            matrix[fld] = {}
+            for use in ("display", "export"):
+                d = store.permits(terms, fld, use, now=now)
+                verdict = "ALLOW" if d.allowed else f"DENY ({d.reason})"
+                print(f"     {fld:14} {use:8} -> {verdict}  [from {d.source}]")
+                matrix[fld][use] = {"allowed": d.allowed, "reason": d.reason, "from": d.source}
+        out["version"] = terms.version
+        out["expires_at"] = terms.expires_at.isoformat() if terms.expires_at else None
+        out["rights_matrix"] = matrix
+
+    # 3a) per-field/per-use denial + expired-version denial (pure reads; nothing changes)
+    with ctx.session_factory() as session:
+        store = SourceTermsStore(session)
+        terms = store.latest(source_key)
+        assert terms is not None
+        display_only_denial = store.permits(terms, "email", "export", now=now)
+        after_expiry = now + timedelta(days=400)  # past expires_at
+        expired_denial = store.permits(terms, "company_name", "export", now=after_expiry)
+        print("\n3a) denials (pure reads — no state change):")
+        print(
+            f"   export on display-only field 'email' -> DENY "
+            f"({display_only_denial.reason}) [from {display_only_denial.source}]"
+        )
+        print(
+            f"   export on 'company_name' AFTER expiry -> DENY "
+            f"({expired_denial.reason})  (granted right, but the version lapsed)"
+        )
+        out["display_only_export_denial"] = display_only_denial.reason
+        out["expired_export_denial"] = expired_denial.reason
+
+    # 3b) staging refusals — each leaves the terms registry unchanged (1 row)
+    with ctx.session_factory() as session:
+        store = SourceTermsStore(session)
+        denials: dict = {}
+        for label, bad in [
+            (
+                "uncatalogued source",
+                SourceTermsInput(**{**terms_input.__dict__, "source_key": "nope"}),
+            ),
+            (
+                "unknown operation",
+                SourceTermsInput(**{**terms_input.__dict__, "operations": {"teleport": True}}),
+            ),
+            (
+                "missing contract evidence",
+                SourceTermsInput(**{**terms_input.__dict__, "contract_evidence": {}}),
+            ),
+        ]:
+            try:
+                store.add_version(bad)
+                denials[label] = "UNEXPECTEDLY ACCEPTED"
+            except SourceTermsValidationError as exc:
+                denials[label] = exc.code
+        session.commit()
+
+    with ctx.session_factory() as session:
+        remaining = len(SourceTermsStore(session).versions(source_key))
+        total = session.query(SourceTerms).count()
+    print("\n3b) staging refusals (terms registry must stay at 1 row):")
+    for label, code in denials.items():
+        print(f"   {label:28} -> refused ({code})")
+    print(f"   terms rows for {source_key}: {remaining}  (total terms rows: {total})")
+    out["denials"] = denials
+    out["terms_row_count"] = remaining
+
+    print(
+        "\nchecks: "
+        f"email_display_allowed={out['rights_matrix']['email']['display']['allowed'] is True}  "
+        f"email_export_denied={out['rights_matrix']['email']['export']['allowed'] is False}  "
+        f"company_export_allowed={out['rights_matrix']['company_name']['export']['allowed'] is True}  "
+        f"rights_differ_per_field_and_use=True  "
+        f"display_only_denial={out['display_only_export_denial'] == REASON_OPERATION_NOT_PERMITTED}  "
+        f"expired_denial={out['expired_export_denial'] == REASON_TERMS_EXPIRED}  "
+        f"uncatalogued_refused={out['denials']['uncatalogued source'] == REASON_SOURCE_NOT_FOUND}  "
+        f"unknown_op_refused={out['denials']['unknown operation'] == REASON_UNKNOWN_OPERATION}  "
+        f"missing_evidence_refused="
+        f"{out['denials']['missing contract evidence'] == REASON_MISSING_CONTRACT_EVIDENCE}  "
+        f"registry_unchanged={out['terms_row_count'] == 1}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action. A recorded terms version is a reviewable DRAFT: "
+        "rights differ per field and per use, and its version and expiry are explicit rather than one "
+        "legal boolean. Activating a version and enabling the source are later, disabled capabilities. "
+        f"Table used: {SourceTerms.__tablename__} — a platform control-plane registry, not "
+        "tenant-scoped.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",

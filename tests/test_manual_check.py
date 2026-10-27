@@ -186,6 +186,30 @@ def test_dca044_scenario_catalogues_disabled_drafts_and_reproduces_denials(capsy
     assert result.cleaned_up is True
 
 
+def test_dca045_scenario_proves_per_field_rights_and_reproduces_denials(capsys):
+    # The DCA-045 source-terms scenario runs on local synthetic SQLite: it proves a terms version whose
+    # rights differ per field and per use (display-only vs exportable), with an explicit version and
+    # expiry, reproduces the per-field/per-use denial and the expired-version denial (pure reads), and
+    # refuses invalid terms with no row created.
+    result = execute(_args(story_id="DCA-045"))
+    assert result.exit_code == 0
+    matrix = result.summary["rights_matrix"]
+    assert matrix["email"]["display"]["allowed"] is True
+    assert matrix["email"]["export"]["allowed"] is False
+    assert (
+        matrix["company_name"]["export"]["allowed"] is True
+    )  # rights differ per field for 'export'
+    assert result.summary["version"] == 1
+    assert result.summary["expires_at"] is not None  # expiry is explicit, not a boolean
+    assert result.summary["display_only_export_denial"] == "operation_not_permitted"
+    assert result.summary["expired_export_denial"] == "terms_expired"
+    assert result.summary["denials"]["uncatalogued source"] == "source_not_found"
+    assert result.summary["denials"]["unknown operation"] == "unknown_operation"
+    assert result.summary["denials"]["missing contract evidence"] == "missing_contract_evidence"
+    assert result.summary["terms_row_count"] == 1  # refusals staged nothing
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

@@ -182,6 +182,46 @@ class SourceStatus(str, Enum):
     ENABLED = "enabled"
 
 
+class SourceOperation(str, Enum):
+    """The distinct *uses* a source's terms grant (or withhold) a right for, per field (DCA-045).
+
+    Source rights are modelled per operation — never as one legal boolean — so a terms version can,
+    for example, permit ``DISPLAY`` of a field but withhold ``EXPORT`` of it. The lifecycle a datum
+    travels, each gated independently:
+
+    - ``COLLECT`` — acquire the datum from the source at all.
+    - ``STORE`` — retain it durably in this service.
+    - ``DERIVE`` — compute derived facts/signals from it (e.g. scoring features).
+    - ``DISPLAY`` — show it back to the owning business in-product.
+    - ``EXPORT`` — hand it out of the service (download / push to the platform / to a tenant).
+    - ``SHARE`` — disclose it to a third party / across businesses.
+    - ``MODEL_PROCESSING`` — send it to the AI gateway for model processing.
+    """
+
+    COLLECT = "collect"
+    STORE = "store"
+    DERIVE = "derive"
+    DISPLAY = "display"
+    EXPORT = "export"
+    SHARE = "share"
+    MODEL_PROCESSING = "model_processing"
+
+
+class SourceTermsStatus(str, Enum):
+    """Lifecycle state of a source terms version (DCA-045).
+
+    ``DRAFT`` — a reviewable, NOT-yet-active terms version. Every terms version is created here as a
+    draft. Recording a version documents what a source's contract *would* permit; it does not, on its
+    own, put any right in force — acting on these rights additionally requires the source to be an
+    ENABLED catalog entry (DCA-044), which stays a DISABLED future capability. ``ACTIVE`` is the state
+    a future, disabled approval story would promote one reviewed version to; no path in this service
+    writes an ``ACTIVE`` terms version, so cataloguing rights can never silently authorize acquisition.
+    """
+
+    DRAFT = "draft"
+    ACTIVE = "active"
+
+
 class BusinessProfileDraft(TenantOwned, Base):
     """DCA-036 — a scoped, versioned draft of a business's profile (tenant-owned, RLS-protected).
 
@@ -606,6 +646,72 @@ class Source(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
+
+
+class SourceTerms(Base):
+    """DCA-045 — one *version* of a catalog source's field-and-operation rights.
+
+    A terms version records what the source's contract/licence permits, expressed NOT as a single
+    legal boolean but as rights that can differ per field and per use (:class:`SourceOperation`):
+
+    - ``operation_rights`` — the source-wide default grant for each of the seven operations
+      (collect/store/derive/display/export/share/model_processing). Deny-by-default: an operation
+      absent here is not granted.
+    - ``field_rights`` — per-field OVERRIDES: ``{field: {operation: granted}}``. A field named here
+      overrides the source-wide default for exactly the operations it lists (so one field can be
+      display-only while another is also exportable); a field not named inherits the defaults.
+    - ``purposes`` — the purposes the rights are bound to (rights are purpose-limited, not blanket).
+    - ``attribution`` — any attribution the source requires when its data is shown/used.
+    - ``retention`` — how long the data may be retained (``{"max_days": int|None, "policy": str}``).
+    - ``contract_evidence`` — the evidence the right exists (``{"reference", "kind", "uri"}``); a
+      terms version cannot be staged without it.
+    - ``effective_from`` / ``expires_at`` — the right's validity window is EXPLICIT: an expired
+      version grants nothing (:class:`~app.services.source_terms.SourceTermsStore` denies with a
+      stable code), rather than a boolean that never lapses.
+
+    Versioned per source: ``(source_key, version)`` is unique and the store is insert-only, so every
+    prior version is preserved for review and a version never overwrites another. ``status`` is always
+    ``DRAFT`` — a terms version is reviewable but never in force on its own; promotion to ``ACTIVE``,
+    and the source-enable capability it would pair with, stay DISABLED future stories.
+
+    Like :class:`Source`, this is platform CONTROL-PLANE data — a shared registry of source rights,
+    deliberately OUTSIDE tenant RLS and never tenant-scoped. It holds only declarative rights metadata:
+    no prospect contact data and no secrets.
+    """
+
+    __tablename__ = "source_terms"
+    # One version per source; a (source_key, version) pair is never reused — insert-only history.
+    __table_args__ = (UniqueConstraint("source_key", "version", name="uq_source_terms_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The catalog key of the Source these terms describe (DCA-044); validated to exist by the store.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # Monotonic per-source version (1-based); explicit, so rights history is reviewable version-by-version.
+    version: Mapped[int] = mapped_column(Integer)
+    # Source-wide default grant per operation: {operation: bool}. Deny-by-default (missing => not granted).
+    operation_rights: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Per-field overrides: {field: {operation: bool}} — lets rights differ per field (display-only vs export).
+    field_rights: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The purposes the rights are limited to (rights are purpose-bound, not blanket).
+    purposes: Mapped[list] = mapped_column(JSON, default=list)
+    # Attribution the source requires: {"required": bool, "notice": str}.
+    attribution: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Retention terms: {"max_days": int|None, "policy": str}.
+    retention: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Evidence the right exists (contract/licence): {"reference": str, "kind": str, "uri": str}. Required.
+    contract_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Explicit validity window — rights lapse rather than living in one never-expiring boolean.
+    effective_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # draft (reviewable, NOT in force) vs active (approved). Promotion is disabled, so every row here
+    # is 'draft'; recording rights never puts them in force on its own.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=SourceTermsStatus.DRAFT.value,
+        server_default=SourceTermsStatus.DRAFT.value,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class AuditEvent(TenantOwned, Base):
