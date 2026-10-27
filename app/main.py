@@ -16,6 +16,7 @@ from app.api.routes import (
     auth,
     authz,
     health,
+    icp,
     profiles,
     service_integration,
     targeting,
@@ -116,6 +117,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(tenants.router)
     app.include_router(profiles.router)
+    app.include_router(icp.router)
     app.include_router(targeting.router)
     app.include_router(auth.router)
     app.include_router(authz.router)

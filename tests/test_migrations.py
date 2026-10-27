@@ -39,6 +39,7 @@ DCA_TABLES = {
     "revision_pending_events",
     "idempotency_records",
     "business_profile_drafts",
+    "icp_drafts",
 }
 
 
@@ -459,6 +460,46 @@ def test_0011_adds_provenance_columns_on_a_preexisting_database(clean_schema):
     eng.dispose()
     assert {"source", "source_version", "provenance"}.issubset(cols)  # columns re-added
     assert backfilled == ("", "")  # the pre-existing row backfilled to "not imported"
+
+
+@requires_pg
+def test_0012_creates_icp_drafts_on_a_preexisting_database(clean_schema):
+    """DCA-039 — the 0012 create branch (for a DB migrated before ``icp_drafts`` existed).
+
+    Same shape as the 0005..0010 tests: a fresh DB gets the table from the metadata baseline (0001) and
+    its RLS policy from 0002, so 0012 is a no-op there. To exercise 0012's real job, upgrade to head,
+    drop the table + policy, stamp history back to 0011, then upgrade to head again — 0012 must recreate
+    the table (with its per-tenant version constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "icp_drafts" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0011_profile_import_provenance")  # pretend we predate the ICP draft table
+    command.upgrade(cfg, "head")  # 0012 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "icp_drafts" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {u["name"] for u in insp.get_unique_constraints("icp_drafts", schema=clean_schema)}
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'icp_drafts' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_icp_draft_version" in uniques  # one version per tenant; a version never overwrites
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg

@@ -95,6 +95,20 @@ def test_dca038_scenario_runs_and_leaves_state_unchanged(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca039_scenario_runs_and_proves_versioning_and_denials(capsys):
+    # The DCA-039 ICP-draft scenario runs on local synthetic SQLite: it proves per-business versioning,
+    # the invalid-band/unsupported-field/geography/profile-link denials (each 422, no state change),
+    # and tenant isolation (B cannot read A's version).
+    result = execute(_args(story_id="DCA-039"))
+    assert result.exit_code == 0
+    assert result.summary["a_versions"] == [1, 2]
+    assert result.summary["denials"]["invalid_band"]["status"] == 422
+    assert result.summary["denials"]["versions_unchanged"] is True
+    assert result.summary["cross_tenant"]["b_get_a_status"] == 404
+    assert result.summary["cross_tenant"]["b_list"] == []
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

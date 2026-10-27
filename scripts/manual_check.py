@@ -3190,6 +3190,188 @@ def _dca_038(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-039",
+    "store versioned ICP drafts: A saves valid + versioned ICPs; invalid band / unsupported field / "
+    "non-India geography / unknown profile-version are refused (clear 422) with no state change; "
+    "B cannot retrieve A's version (tenant isolation)",
+)
+def _dca_039(ctx: CheckContext) -> dict:
+    """Drive the real DCA-039 ICP-draft API over the HTTP API against synthetic A and B, following the
+    developer manual-test steps:
+
+      1. register A and B;
+      2. A saves a valid ICP draft (v1), then a second valid draft (v2) — prior versions are preserved
+         and versioning is per business;
+      3. reproduce the four denials, each a clear 422 that stages NO version:
+         - an invalid size band ('ginormous'),
+         - an unsupported request field (extra='forbid'),
+         - a non-India geography ('Texas'),
+         - a link to a non-existent business-profile draft version;
+      4. link an ICP draft to an existing business-profile draft version (valid);
+      5. tenant isolation: B cannot retrieve A's version 1 (reads as 404), and B's own list is empty.
+
+    Local synthetic only (AI disabled, ephemeral DB). Every call is shown with its real body/row count
+    so a human can compare against the acceptance criteria rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+    from app.services.icp_store import (
+        REASON_INVALID_SIZE_BAND,
+        REASON_PROFILE_VERSION_NOT_FOUND,
+        REASON_UNSUPPORTED_GEOGRAPHY,
+    )
+
+    biz_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    biz_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    def body(**overrides) -> dict:
+        base: dict = {
+            "industries": [],
+            "sizeBands": [],
+            "roles": [],
+            "geography": [],
+            "exclusions": [],
+        }
+        base.update(overrides)
+        return base
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        for biz in (biz_a, biz_b):
+            client.post("/v1/tenants", json={"businessId": biz}, headers=auth)
+
+        # 2) two valid, versioned ICP drafts for A
+        v1 = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=body(industries=["retail"], sizeBands=["small", "medium"], geography=["KA"]),
+            headers=auth,
+        )
+        v2 = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=body(industries=["retail", "wholesale"], roles=["owner"]),
+            headers=auth,
+        )
+        v1b, v2b = v1.json(), v2.json()
+        print(f"\n1) A save ICP v1 -> HTTP {v1.status_code}")
+        print(
+            f"   v1: version={v1b['version']} status={v1b['status']} "
+            f"sizeBands={v1b['sizeBands']} geography={v1b['geography']}"
+        )
+        print(f"2) A save ICP v2 -> HTTP {v2.status_code}  version={v2b['version']}")
+        listed = client.get(f"/v1/tenants/{biz_a}/icp/drafts", headers=auth).json()
+        print(f"   A versions retained: {[r['version'] for r in listed]}")
+        out["v1"] = {"status": v1.status_code, "body": v1b}
+        out["v2_version"] = v2b["version"]
+        out["a_versions"] = [r["version"] for r in listed]
+
+        # 3) the four denials, each 422 with no new version
+        before = client.get(f"/v1/tenants/{biz_a}/icp/drafts", headers=auth).json()
+        bad_band = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts", json=body(sizeBands=["ginormous"]), headers=auth
+        )
+        bad_field = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json={**body(industries=["x"]), "autoAccept": True},
+            headers=auth,
+        )
+        bad_geo = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts", json=body(geography=["Texas"]), headers=auth
+        )
+        bad_link = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=body(industries=["x"], profileVersion=99),
+            headers=auth,
+        )
+        after = client.get(f"/v1/tenants/{biz_a}/icp/drafts", headers=auth).json()
+        print("\n3) denials (each a clear 422; no version created):")
+        for label, resp in [
+            ("invalid size band", bad_band),
+            ("unsupported field", bad_field),
+            ("non-India geography", bad_geo),
+            ("unknown profile version", bad_link),
+        ]:
+            msg = resp.json().get("error", {}).get("message", resp.json())
+            print(f"   {label:26} -> HTTP {resp.status_code} ({msg})")
+        print(f"   A versions unchanged: {after == before} (still {[r['version'] for r in after]})")
+        out["denials"] = {
+            "invalid_band": {
+                "status": bad_band.status_code,
+                "message": bad_band.json()["error"]["message"],
+            },
+            "unsupported_field": {"status": bad_field.status_code},
+            "non_india_geography": {
+                "status": bad_geo.status_code,
+                "message": bad_geo.json()["error"]["message"],
+            },
+            "unknown_profile_version": {
+                "status": bad_link.status_code,
+                "message": bad_link.json()["error"]["message"],
+            },
+            "versions_unchanged": after == before,
+        }
+
+        # 4) link to an existing business-profile draft version
+        client.post(
+            f"/v1/tenants/{biz_a}/profile/drafts",
+            json={
+                "products": [],
+                "businessType": "retail",
+                "valueProposition": "",
+                "languages": [],
+                "confirmedFacts": [],
+                "unknowns": [],
+            },
+            headers=auth,
+        )
+        linked = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json=body(industries=["retail"], profileVersion=1),
+            headers=auth,
+        )
+        print(
+            f"\n4) link ICP to business-profile draft v1 -> HTTP {linked.status_code} "
+            f"(profileVersion={linked.json().get('profileVersion')})"
+        )
+        out["linked"] = {
+            "status": linked.status_code,
+            "profileVersion": linked.json().get("profileVersion"),
+        }
+
+        # 5) tenant isolation: B cannot retrieve A's version
+        b_get_a = client.get(f"/v1/tenants/{biz_b}/icp/drafts/1", headers=auth)
+        b_list = client.get(f"/v1/tenants/{biz_b}/icp/drafts", headers=auth).json()
+        print(
+            f"\n5) B GET A's ICP version 1 -> HTTP {b_get_a.status_code} "
+            f"({b_get_a.json().get('error', {}).get('message')}); B's own list={b_list}"
+        )
+        out["cross_tenant"] = {"b_get_a_status": b_get_a.status_code, "b_list": b_list}
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"versioned={out['a_versions'] == [1, 2]}  "
+        f"invalid_band_422={out['denials']['invalid_band']['status'] == 422 and out['denials']['invalid_band']['message'] == REASON_INVALID_SIZE_BAND}  "
+        f"unsupported_field_422={out['denials']['unsupported_field']['status'] == 422}  "
+        f"geography_422={out['denials']['non_india_geography']['status'] == 422 and out['denials']['non_india_geography']['message'] == REASON_UNSUPPORTED_GEOGRAPHY}  "
+        f"bad_link_422={out['denials']['unknown_profile_version']['status'] == 422 and out['denials']['unknown_profile_version']['message'] == REASON_PROFILE_VERSION_NOT_FOUND}  "
+        f"no_state_change={out['denials']['versions_unchanged']}  "
+        f"linked={out['linked']['status'] == 201 and out['linked']['profileVersion'] == 1}  "
+        f"tenant_isolation={out['cross_tenant']['b_get_a_status'] == 404 and out['cross_tenant']['b_list'] == []}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; ICPs are business-scoped and versioned; invalid "
+        "bands / unsupported fields / non-India geography / unknown profile versions are refused with "
+        "a clear 422 and no state change; B never sees A's version)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

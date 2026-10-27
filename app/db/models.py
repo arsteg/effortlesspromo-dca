@@ -218,7 +218,13 @@ class TenantAgent(Base):
 
 
 class IcpProfile(Base):
-    """The tenant's Ideal Customer Profile — what the agent looks for. One active profile each."""
+    """The tenant's Ideal Customer Profile — what the agent looks for. One active profile each.
+
+    This is the EARLY single-active ICP record (platform-owned control-plane catalog, like
+    :class:`TenantAgent`, deliberately outside tenant RLS). The *reviewable, versioned* ideal-customer
+    profile drafts live in :class:`IcpDraft` (DCA-039); this row is retained for the existing
+    ``PUT /v1/tenants/{id}/icp`` upsert and is not touched by the draft store.
+    """
 
     __tablename__ = "icp_profiles"
 
@@ -234,6 +240,58 @@ class IcpProfile(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
     )
+
+
+class IcpDraft(TenantOwned, Base):
+    """DCA-039 — a scoped, versioned draft Ideal Customer Profile (tenant-owned, RLS-protected).
+
+    One row is one *version* of the tenant's ideal-customer profile: the structured target the agent
+    should look for — ``industries``, ``size_bands`` (a controlled vocabulary), ``roles``, ``geography``
+    (recognized Indian states/UTs — the service is India-only), and ``exclusions``. Each save inserts a
+    new version (``(business_id, version)`` is unique), so a new draft **preserves** every prior version
+    rather than mutating it; there is no update path, mirroring :class:`BusinessProfileDraft` (DCA-036).
+
+    ``profile_version`` links the ICP draft to the business-profile draft version it was authored
+    against (the DCA-036 :class:`BusinessProfileDraft` ``version`` for the SAME business), so an ICP can
+    be reviewed alongside the business profile it describes. It is optional (``None`` when no profile
+    version is linked); when supplied it must name an existing draft version of this business —
+    :class:`~app.services.icp_store.IcpStore` rejects an unknown version before staging anything.
+
+    ``status`` separates a reviewable DRAFT from a future accepted/active ICP. Promotion is a DISABLED
+    future capability (its own later story): the store only ever stages ``status='draft'`` rows and
+    never mutates an existing one, so a draft can never silently become the active targeting profile.
+
+    This is the tenant's OWN targeting content (not prospect contact data or secrets), so — unlike the
+    audit/outbox/inbox/revision payloads — its fields are NOT opaque-reference screened. Tenant-owned:
+    it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant
+    data table, so one tenant can never read another's ICP versions.
+    """
+
+    __tablename__ = "icp_drafts"
+    # A version number is unique PER business: the same ordinal recurs across tenants but never within
+    # one, so a new version can never collide with or overwrite an existing version of the same tenant.
+    __table_args__ = (tenant_unique("version", name="uq_icp_draft_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # 1-based version ordinal within the business; a new draft is always max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # The structured target — free-text/controlled lists (NOT opaque references, NOT contact data).
+    industries: Mapped[list] = mapped_column(JSON, default=list)
+    # Controlled vocabulary (app.services.icp_store.SIZE_BANDS); an unsupported band is a 422.
+    size_bands: Mapped[list] = mapped_column(JSON, default=list)
+    roles: Mapped[list] = mapped_column(JSON, default=list)
+    # Recognized Indian states/UTs (ISO 3166-2:IN codes); an unrecognized value is a 422 (India-only).
+    geography: Mapped[list] = mapped_column(JSON, default=list)
+    exclusions: Mapped[list] = mapped_column(JSON, default=list)
+    # Optional link to the DCA-036 business-profile draft version this ICP was authored against. NULL
+    # when unlinked; when set it must be an existing draft version of this business.
+    profile_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # draft (reviewable, versioned) vs a future active/accepted ICP. Promotion is disabled, so every
+    # row written here is 'draft'; nothing promotes a draft to 'active' yet.
+    status: Mapped[str] = mapped_column(
+        String(16), default="draft", server_default="draft", index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class DiscoveryRun(TenantOwned, Base):
