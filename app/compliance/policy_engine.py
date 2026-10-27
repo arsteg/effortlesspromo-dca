@@ -42,10 +42,32 @@ Decision semantics:
 Precedence (``law > provider > product``) is reported as the *decisive authority* and orders the
 evidence; it never turns a deny into an allow, because the resolution is deny-dominant (strictest wins)
 — the safe direction for personal data.
+
+DCA-056 — select rules by effective date + immutable evaluation-time snapshot
+----------------------------------------------------------------------------
+Rule selection is **obligation-specific and effective-date-driven**: each rule carries its OWN explicit
+validity window (``effective_from``/``expires_at``, from DCA-052), which is where a DPDP/TRAI
+obligation's *per-provision* commencement date lands (DCA-054 §1). A boundary timestamp selects the
+correct rule — a rule whose obligation has NOT yet commenced (``now < effective_from``) or has lapsed
+(``now >= expires_at``) is simply not in the selected set at that instant. There is deliberately **no
+universal ``dpdp_enabled`` flag**: applicability is resolved one obligation at a time from its own
+window (:func:`obligation_key` / :func:`select_effective_rules`), so staged tranches switch on
+independently and the exact same request flips from DENY to ALLOW only once its governing obligation's
+effective date is reached.
+
+Every pack-backed evaluation also carries an **immutable evaluation-time rule snapshot**
+(:class:`EvaluationSnapshot`): a frozen, content-fingerprinted capture of the evaluation moment, the
+rulepack version / approval, and the exact rules that were in force and governed the request at that
+instant (each with its obligation key and window). Because it is frozen (no field can be reassigned;
+rule content is a canonical JSON string, the rule list a tuple), it never drifts after capture, and
+:func:`replay` reproduces the identical decision from the snapshot ALONE — even if the live rulepack has
+since changed — with no DB access and no state change.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -122,6 +144,48 @@ def _parse_dt(value: object) -> datetime | None:
     return _as_utc(datetime.fromisoformat(str(value)))
 
 
+def _iso_or_none(value: object) -> str | None:
+    """Render a stored window bound as a canonical ISO-UTC string (or ``None``) for the snapshot."""
+    parsed = _parse_dt(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _canonical_json(value: object) -> str:
+    """Deterministic JSON (sorted keys, no whitespace) — used for stable snapshot fingerprints and to
+    store a rule's conditions as an immutable string the snapshot can round-trip in :func:`replay`."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def obligation_key(rule: dict) -> str:
+    """Stable identity of the OBLIGATION a rule implements — its cited provision (evidence reference),
+    falling back to its scope when no reference is present.
+
+    An obligation is what carries an effective date (DCA-054 §1: store a commencement date *per
+    obligation*, e.g. a specific DPDP provision, never a single ``dpdp_enabled`` flag). Keying selection
+    by this makes "which rule is in force now" a per-obligation question resolved from that obligation's
+    own window — so staged tranches commence independently.
+    """
+    reference = str((rule.get("evidence") or {}).get("reference", "")).strip()
+    if reference:
+        return reference
+    action = (rule.get("action") or "").strip().lower()
+    channel = (rule.get("channel") or RuleChannel.ANY.value).strip().lower()
+    authority = (rule.get("authority") or "").strip().lower()
+    return f"{authority}:{action}:{channel}"
+
+
+def select_effective_rules(rules: Iterable[dict], *, now: datetime) -> list[dict]:
+    """Select the rules in force at ``now`` purely by each rule's OWN effective window.
+
+    This is the obligation-specific effective-date selection: a rule whose obligation has not yet
+    commenced (``now < effective_from``) or has already lapsed (``now >= expires_at``) is excluded; an
+    unset bound is unbounded on that side. There is no universal flag — each rule is selected (or not)
+    independently from its own window, so a boundary timestamp selects exactly the obligations that have
+    commenced and not lapsed at that instant.
+    """
+    return [rule for rule in rules if _rule_time_eligible(rule, now)]
+
+
 @dataclass(frozen=True)
 class PolicyRequest:
     """One deterministic policy question.
@@ -160,6 +224,51 @@ class InForcePack:
 
 
 @dataclass(frozen=True)
+class RuleSnapshot:
+    """One rule exactly as it stood at evaluation time — an immutable record (DCA-056).
+
+    Captures the rule's obligation identity and its EXPLICIT effective window (so a reader can see *why*
+    a boundary timestamp did or did not select it), plus the effect/scope/authority/conditions that drove
+    the decision. ``conditions_json`` is a canonical JSON string (not a mutable dict) so the whole
+    snapshot is genuinely immutable and :func:`replay` can round-trip it. ``time_eligible`` records
+    whether the rule's own window covered the evaluation moment.
+    """
+
+    obligation: str
+    effect: str
+    action: str
+    channel: str
+    authority: str
+    conditions_json: str
+    reference: str
+    effective_from: str | None
+    expires_at: str | None
+    time_eligible: bool
+
+
+@dataclass(frozen=True)
+class EvaluationSnapshot:
+    """An immutable, content-fingerprinted capture of a single evaluation (DCA-056).
+
+    Pins the evaluation moment, the in-force rulepack version / approval, the engine version, and the
+    exact rules that were IN FORCE and governed the request at that instant (:class:`RuleSnapshot`). It
+    is frozen (no attribute can be reassigned) and holds only immutable members (a tuple of frozen
+    rule snapshots, strings), so it can never drift after capture. ``fingerprint`` is a sha256 over the
+    canonical content, so two identical evaluations produce the same fingerprint and a later change to
+    the live pack cannot silently alter a recorded decision. :func:`replay` reproduces the identical
+    decision from this snapshot alone — no DB, no live pack, no state change.
+    """
+
+    evaluated_at: str
+    jurisdiction: str
+    rulepack_version: int | None
+    approval_id: str | None
+    engine_version: int
+    selected_rules: tuple[RuleSnapshot, ...]
+    fingerprint: str
+
+
+@dataclass(frozen=True)
 class PolicyEvaluation:
     """The result of evaluating one policy request — a reproducible, auditable record.
 
@@ -181,6 +290,7 @@ class PolicyEvaluation:
     decisive_authority: str | None = None
     engine_version: int = POLICY_ENGINE_VERSION
     llm_consulted: bool = False
+    snapshot: EvaluationSnapshot | None = None
 
     @property
     def allowed(self) -> bool:
@@ -323,17 +433,124 @@ def _rule_time_eligible(rule: dict, now: datetime) -> bool:
 def _rule_evidence(rule: dict) -> dict:
     return {
         "source": "rule",
+        "obligation": obligation_key(rule),
         "effect": rule.get("effect"),
         "action": rule.get("action"),
         "channel": rule.get("channel"),
         "authority": rule.get("authority"),
         "conditions": rule.get("conditions", {}),
+        "effective_from": rule.get("effective_from"),
+        "expires_at": rule.get("expires_at"),
         "evidence": rule.get("evidence", {}),
     }
 
 
+def _rule_snapshot(rule: dict, *, now: datetime) -> RuleSnapshot:
+    """Freeze one rule as it stood at ``now`` — immutable, with its obligation key and window."""
+    return RuleSnapshot(
+        obligation=obligation_key(rule),
+        effect=(rule.get("effect") or "").strip().lower(),
+        action=(rule.get("action") or "").strip().lower(),
+        channel=(rule.get("channel") or RuleChannel.ANY.value).strip().lower(),
+        authority=(rule.get("authority") or "").strip().lower(),
+        conditions_json=_canonical_json(rule.get("conditions", {}) or {}),
+        reference=str((rule.get("evidence") or {}).get("reference", "")).strip(),
+        effective_from=_iso_or_none(rule.get("effective_from")),
+        expires_at=_iso_or_none(rule.get("expires_at")),
+        time_eligible=_rule_time_eligible(rule, now),
+    )
+
+
+def _build_snapshot(
+    *,
+    moment: datetime,
+    jurisdiction: str,
+    pack: InForcePack,
+    selected: Sequence[dict],
+) -> EvaluationSnapshot:
+    """Build the immutable evaluation-time snapshot from the rules that actually governed the request.
+
+    ``selected`` are the in-force, governing rules (time-eligible, conditions not contradicted) that
+    drove the decision — the ones a reproduction needs. The fingerprint is a sha256 over the canonical
+    content (moment + versions + each selected rule), so an identical evaluation yields an identical
+    fingerprint and a later change to the live pack cannot silently rewrite a recorded decision.
+    """
+    rule_snaps = tuple(_rule_snapshot(rule, now=moment) for rule in selected)
+    content = _canonical_json(
+        {
+            "evaluated_at": moment.isoformat(),
+            "jurisdiction": jurisdiction,
+            "rulepack_version": pack.version,
+            "approval_id": pack.approval_id,
+            "engine_version": POLICY_ENGINE_VERSION,
+            "selected_rules": [
+                {
+                    "obligation": s.obligation,
+                    "effect": s.effect,
+                    "action": s.action,
+                    "channel": s.channel,
+                    "authority": s.authority,
+                    "conditions_json": s.conditions_json,
+                    "reference": s.reference,
+                    "effective_from": s.effective_from,
+                    "expires_at": s.expires_at,
+                    "time_eligible": s.time_eligible,
+                }
+                for s in rule_snaps
+            ],
+        }
+    )
+    fingerprint = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return EvaluationSnapshot(
+        evaluated_at=moment.isoformat(),
+        jurisdiction=jurisdiction,
+        rulepack_version=pack.version,
+        approval_id=pack.approval_id,
+        engine_version=POLICY_ENGINE_VERSION,
+        selected_rules=rule_snaps,
+        fingerprint=fingerprint,
+    )
+
+
+def _rule_from_snapshot(snap: RuleSnapshot) -> dict:
+    """Rebuild a rule dict (DCA-052 shape) from a frozen :class:`RuleSnapshot`, for :func:`replay`."""
+    return {
+        "effect": snap.effect,
+        "action": snap.action,
+        "channel": snap.channel,
+        "authority": snap.authority,
+        "conditions": json.loads(snap.conditions_json),
+        "evidence": {"reference": snap.reference},
+        "effective_from": snap.effective_from,
+        "expires_at": snap.expires_at,
+    }
+
+
+def replay(request: PolicyRequest, snapshot: EvaluationSnapshot) -> PolicyEvaluation:
+    """Reproduce a decision from its immutable snapshot ALONE — no DB, no live pack, no state change.
+
+    Rebuilds the exact rules that were in force at evaluation time and re-decides at the SAME recorded
+    moment, so it yields the identical decision even if the live rulepack has since changed, been
+    superseded, or expired. This is the DCA-056 reproducibility guarantee: a recorded snapshot is a
+    complete, self-contained, re-runnable record of *why* an action was allowed or denied at that instant.
+    """
+    moment = _parse_dt(snapshot.evaluated_at)
+    pack = InForcePack(
+        jurisdiction=snapshot.jurisdiction,
+        version=snapshot.rulepack_version if snapshot.rulepack_version is not None else 0,
+        approval_id=snapshot.approval_id,
+        rules=[_rule_from_snapshot(s) for s in snapshot.selected_rules],
+    )
+    return decide(request, pack, now=moment)
+
+
 def _fail_closed(
-    request: PolicyRequest, jurisdiction: str, reason: str, *, evidence: Iterable[dict] = ()
+    request: PolicyRequest,
+    jurisdiction: str,
+    reason: str,
+    *,
+    evidence: Iterable[dict] = (),
+    snapshot: EvaluationSnapshot | None = None,
 ) -> PolicyEvaluation:
     """Build a DENY with no permission granted — the fail-closed default for personal data."""
     return PolicyEvaluation(
@@ -343,6 +560,7 @@ def _fail_closed(
         channel=request.channel,
         reasons=(reason,),
         evidence=tuple(evidence),
+        snapshot=snapshot,
     )
 
 
@@ -415,6 +633,14 @@ def decide(
         else:
             governing_allow.append(rule)
 
+    # 4b) Freeze the rules that actually governed this request at ``moment`` into an immutable, content-
+    #     fingerprinted snapshot (DCA-056). Built from the SELECTED set (time-eligible, conditions not
+    #     contradicted) so a reproduction needs nothing but the snapshot; see :func:`replay`.
+    selected = governing_deny + governing_allow + indeterminate
+    snapshot = _build_snapshot(
+        moment=moment, jurisdiction=jurisdiction, pack=pack, selected=selected
+    )
+
     # 5) Deny-dominant resolution (strictest wins — the safe direction; a lower authority may only
     #    narrow a higher one, never widen past it). A single applicable DENY blocks the action.
     if governing_deny:
@@ -430,6 +656,7 @@ def decide(
             rulepack_version=pack.version,
             approval_id=pack.approval_id,
             decisive_authority=decisive.get("authority"),
+            snapshot=snapshot,
         )
 
     if governing_allow:
@@ -447,6 +674,7 @@ def decide(
             rulepack_version=pack.version,
             approval_id=pack.approval_id,
             decisive_authority=decisive.get("authority"),
+            snapshot=snapshot,
         )
 
     # 6) No confidently-applicable rule. If a rule plausibly governs but a required fact was missing,
@@ -463,10 +691,15 @@ def decide(
             evidence=tuple(evidence),
             rulepack_version=pack.version,
             approval_id=pack.approval_id,
+            snapshot=snapshot,
         )
 
     return _fail_closed(
-        request, jurisdiction, REASON_NO_MATCHING_RULE, evidence=[pack_evidence, approval_evidence]
+        request,
+        jurisdiction,
+        REASON_NO_MATCHING_RULE,
+        evidence=[pack_evidence, approval_evidence],
+        snapshot=snapshot,
     )
 
 

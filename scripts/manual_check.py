@@ -6121,6 +6121,215 @@ def _dca_055(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-056",
+    "select rules by effective date: an obligation's own effective_from gates the decision, so the SAME "
+    "consented request DENIES just before commencement and ALLOWs at/after it (no universal dpdp_enabled "
+    "flag); every decision carries an IMMUTABLE evaluation-time snapshot that replay() reproduces — the "
+    "result AND the relevant denial — even after the live pack changes, with no state change",
+)
+def _dca_056(ctx: CheckContext) -> dict:
+    """Drive the real evaluator across an obligation's effective-date BOUNDARY against a disposable DB,
+    showing the actual decision flip and the immutable, reproducible snapshot (manual-test step 2):
+
+      1. record a DCA-052 India rulepack whose only rule COMMENCES at 2026-11-01 (its effective_from),
+         then a DCA-053 operator approval promotes it in force (the approval window is open the whole
+         time — only the RULE's effective date gates the decision);
+      2. BEFORE commencement (one second earlier) -> DENY  (no_matching_rule: the obligation is not yet
+         in force; there is no universal flag that pre-enables it);
+      3. AT commencement (the exact instant, half-open window) -> ALLOW (allowed_by_rule);
+      4. AFTER commencement -> ALLOW;
+      5. replay() the AT-snapshot and the BEFORE-snapshot -> the same ALLOW / DENY reproduced from the
+         immutable snapshot alone (no DB), even after the live pack is superseded by a deny.
+
+    The evaluator is pure Python — no model is consulted — and reading it writes nothing (row counts are
+    shown unchanged). Local synthetic only (AI disabled, ephemeral DB). Wired into no send/acquisition
+    path: expressing a decision enforces nothing — future capabilities stay disabled.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.policy_engine import (
+        REASON_ALLOWED_BY_RULE,
+        REASON_DENIED_BY_RULE,
+        REASON_NO_MATCHING_RULE,
+        InForcePack,
+        PolicyDecision,
+        PolicyEvaluator,
+        PolicyRequest,
+        decide,
+        replay,
+    )
+    from app.compliance.policy_rulepacks import (
+        CompliancePolicyRulepackStore,
+        PolicyRuleInput,
+        RulepackInput,
+    )
+    from app.db.models import CompliancePolicyApproval, CompliancePolicyRulepack
+    from app.services.policy_approval import (
+        PolicyApprovalReview,
+        PolicyApprovalStore,
+        PolicyReviewerPrincipal,
+    )
+
+    commence = datetime(2026, 11, 1, 0, 0, tzinfo=UTC)
+    before = commence - timedelta(seconds=1)
+    after = commence + timedelta(days=30)
+    operator = PolicyReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    pack = RulepackInput(
+        jurisdiction="IN",
+        title="India notice/consent — staged commencement",
+        evidence={"reference": "POLICY-REVIEW-2026-11", "kind": "legal_review"},
+        rules=[
+            PolicyRuleInput(
+                effect="allow",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required"},
+                evidence={"reference": "DPDP-2023-s7", "kind": "statute"},
+                # The obligation's per-provision commencement date lands on the rule's OWN window.
+                effective_from=commence,
+            )
+        ],
+    )
+    review = PolicyApprovalReview(
+        reviewer_id="op-001",
+        references={"reference": "LEGAL-REVIEW-2026-11", "kind": "legal_review"},
+        reviewed_at=before,  # approved before commencement; still gated by the rule's effective date
+        expires_at=after + timedelta(days=365),
+    )
+    req = PolicyRequest(action="contact", channel="email", facts={"consent": "present"})
+
+    out: dict = {}
+
+    # 1) record the DCA-052 draft version and promote it in force (DCA-053 approval)
+    with ctx.session_factory() as session:
+        CompliancePolicyRulepackStore(session).add_version(pack)
+        session.commit()
+    with ctx.session_factory() as session:
+        PolicyApprovalStore(session).approve(1, review, operator)
+        session.commit()
+
+    # 2-4) evaluate the SAME request on three sides of the boundary (read-only)
+    with ctx.session_factory() as session:
+        evaluator = PolicyEvaluator(session)
+        d_before = evaluator.evaluate(req, now=before)
+        d_at = evaluator.evaluate(req, now=commence)
+        d_after = evaluator.evaluate(req, now=after)
+        packs_after = session.query(CompliancePolicyRulepack).count()
+        approvals_after = session.query(CompliancePolicyApproval).count()
+
+    # 5) reproduce from the IMMUTABLE snapshots alone — no DB — even after the live pack is superseded.
+    superseded = InForcePack(
+        jurisdiction="IN",
+        version=2,
+        approval_id="appr-2",
+        rules=[
+            {
+                "effect": "deny",
+                "action": "contact",
+                "channel": "email",
+                "authority": "law",
+                "conditions": {},
+                "evidence": {"reference": "LATER-OVERRIDE"},
+                "effective_from": None,
+                "expires_at": None,
+            }
+        ],
+    )
+    current_after_supersede = decide(req, superseded, now=commence)
+    replay_at = replay(req, d_at.snapshot) if d_at.snapshot else None
+    replay_before = replay(req, d_before.snapshot) if d_before.snapshot else None
+    fingerprint_matches = (
+        replay_at is not None
+        and replay_at.snapshot is not None
+        and d_at.snapshot is not None
+        and replay_at.snapshot.fingerprint == d_at.snapshot.fingerprint
+    )
+
+    out["before_commencement"] = {
+        "decision": d_before.decision.value,
+        "reasons": list(d_before.reasons),
+        "snapshot_selected_rules": len(d_before.snapshot.selected_rules)
+        if d_before.snapshot
+        else None,
+    }
+    out["at_commencement"] = {
+        "decision": d_at.decision.value,
+        "reasons": list(d_at.reasons),
+        "decisive_authority": d_at.decisive_authority,
+        "snapshot_obligations": (
+            [r.obligation for r in d_at.snapshot.selected_rules] if d_at.snapshot else None
+        ),
+        "snapshot_fingerprint": (d_at.snapshot.fingerprint[:12] + "…") if d_at.snapshot else None,
+    }
+    out["after_commencement"] = {
+        "decision": d_after.decision.value,
+        "reasons": list(d_after.reasons),
+    }
+    out["replay"] = {
+        "live_decision_after_supersede": current_after_supersede.decision.value,
+        "replay_at_decision": replay_at.decision.value if replay_at else None,
+        "replay_before_decision": replay_before.decision.value if replay_before else None,
+        "replay_at_fingerprint_matches": fingerprint_matches,
+    }
+    out["rows_after_eval"] = {"rulepacks": packs_after, "approvals": approvals_after}
+
+    print("\n1) recorded a DCA-052 India rulepack whose rule COMMENCES 2026-11-01 and promoted it.")
+    print("\n2) BEFORE commencement (same consented request, one second earlier):")
+    for k, v in out["before_commencement"].items():
+        print(f"     {k:28} = {v}")
+    print("\n3) AT commencement (the exact effective instant):")
+    for k, v in out["at_commencement"].items():
+        print(f"     {k:28} = {v}")
+    print("\n4) AFTER commencement:")
+    print(
+        f"     decision={out['after_commencement']['decision']}  "
+        f"reasons={out['after_commencement']['reasons']}"
+    )
+    print("\n5) reproduce from the IMMUTABLE snapshot alone (live pack superseded by a deny):")
+    for k, v in out["replay"].items():
+        print(f"     {k:28} = {v}")
+    print(
+        f"\nregistry rows after the three evaluations (unchanged): {out['rows_after_eval']} "
+        "(evaluating writes nothing)"
+    )
+
+    checks = {
+        "before_denies_no_universal_flag": (
+            out["before_commencement"]["decision"] == PolicyDecision.DENY.value
+            and out["before_commencement"]["reasons"] == [REASON_NO_MATCHING_RULE]
+        ),
+        "at_boundary_allows": (
+            out["at_commencement"]["decision"] == PolicyDecision.ALLOW.value
+            and out["at_commencement"]["reasons"] == [REASON_ALLOWED_BY_RULE]
+        ),
+        "after_allows": out["after_commencement"]["decision"] == PolicyDecision.ALLOW.value,
+        "live_flips_after_supersede": (
+            out["replay"]["live_decision_after_supersede"] == PolicyDecision.DENY.value
+        ),
+        "snapshot_reproduces_allow": out["replay"]["replay_at_decision"]
+        == PolicyDecision.ALLOW.value,
+        "snapshot_reproduces_denial": (
+            out["replay"]["replay_before_decision"] == PolicyDecision.DENY.value
+        ),
+        "snapshot_fingerprint_reproducible": out["replay"]["replay_at_fingerprint_matches"] is True,
+        "evaluation_changed_no_state": out["rows_after_eval"] == {"rulepacks": 1, "approvals": 1},
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Rule selection is obligation-specific and driven by "
+        "each rule's OWN effective date — there is NO universal dpdp_enabled flag. The REASON_DENIED_BY_RULE "
+        f"code ({REASON_DENIED_BY_RULE}) is reserved for a rule that is in force and forbids; a not-yet- "
+        "commenced obligation is a default-deny. Each decision carries an immutable snapshot that replay() "
+        "reproduces exactly — the result and the relevant denial — even after the live pack changes, with "
+        "no state change. The evaluator is wired into no send/acquisition path: future capabilities stay "
+        "disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
