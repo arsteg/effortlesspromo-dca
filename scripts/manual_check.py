@@ -5882,8 +5882,7 @@ def _dca_053(ctx: CheckContext) -> dict:
             "v2_in_force": v2_decision.in_force,
             "v2_reason": v2_decision.reason,
             "fingerprint_binds_v1": approval.content_fingerprint == content_fingerprint(v1.rules),
-            "fingerprint_differs_v2": approval.content_fingerprint
-            != content_fingerprint(v2.rules),
+            "fingerprint_differs_v2": approval.content_fingerprint != content_fingerprint(v2.rules),
         }
 
     print("\n1) recorded a DCA-052 India rulepack DRAFT (version 1).")
@@ -5944,6 +5943,180 @@ def _dca_053(ctx: CheckContext) -> dict:
         "expired version authorizes nothing, and promoting a version does NOT enable the policy engine "
         f"(a disabled future capability). Table used: {CompliancePolicyApproval.__tablename__} — a "
         "platform control-plane registry, not tenant-scoped.)"
+    )
+    return out
+
+
+@register(
+    "DCA-055",
+    "evaluate one deterministic policy request: an in-force rule ALLOWs (consent present) and DENYs "
+    "(no granting rule); a MISSING pack and an AMBIGUOUS/unresolved country can NEVER allow (both fail "
+    "closed to DENY); the LLM is never consulted and evaluating changes no state",
+)
+def _dca_055(ctx: CheckContext) -> dict:
+    """Drive the real DCA-055 policy EVALUATOR against a disposable DB, showing the actual decision,
+    reasons, evidence and versions for four synthetic inputs (the developer manual-test step 2):
+
+      1. record a DCA-052 India rulepack DRAFT, then a DCA-053 operator approval promotes it IN FORCE;
+      2. ALLOWED input   (contact/email, consent present)          -> ALLOW  (allowed_by_rule);
+      3. DENIED input    (contact/sms, no granting rule)           -> DENY   (no_matching_rule);
+      4. MISSING-pack    (same request BEFORE approval)            -> DENY   (no_in_force_pack);
+      5. AMBIGUOUS-country (jurisdiction unresolved = "")          -> DENY   (unresolved_jurisdiction).
+
+    Steps 4 is reproduced from the pre-approval state; a missing pack and an unresolved jurisdiction
+    can NEVER yield ALLOW. The evaluator is pure Python — no model is consulted (``llm_consulted`` is
+    always False) — and reading it writes nothing (row counts are shown unchanged). Local synthetic
+    only (AI disabled, ephemeral DB). The evaluator is wired into no send/acquisition path: expressing
+    a decision enforces nothing — future capabilities stay disabled.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.policy_engine import (
+        REASON_ALLOWED_BY_RULE,
+        REASON_NO_IN_FORCE_PACK,
+        REASON_NO_MATCHING_RULE,
+        REASON_UNRESOLVED_JURISDICTION,
+        PolicyDecision,
+        PolicyEvaluator,
+        PolicyRequest,
+    )
+    from app.compliance.policy_rulepacks import (
+        CompliancePolicyRulepackStore,
+        PolicyRuleInput,
+        RulepackInput,
+    )
+    from app.db.models import CompliancePolicyApproval, CompliancePolicyRulepack
+    from app.services.policy_approval import (
+        PolicyApprovalReview,
+        PolicyApprovalStore,
+        PolicyReviewerPrincipal,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    operator = PolicyReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    evidence = {"reference": "DPDP-2023-s7", "kind": "statute", "uri": "https://example.test/law"}
+    pack = RulepackInput(
+        jurisdiction="IN",
+        title="India baseline policy",
+        evidence={"reference": "POLICY-REVIEW-2026-11", "kind": "legal_review"},
+        rules=[
+            PolicyRuleInput(
+                effect="allow",
+                action="contact",
+                channel="email",
+                authority="law",
+                conditions={"consent": "required"},
+                evidence=evidence,
+            )
+        ],
+    )
+    review = PolicyApprovalReview(
+        reviewer_id="op-001",
+        references={"reference": "LEGAL-REVIEW-2026-11", "kind": "legal_review"},
+        reviewed_at=now,
+        expires_at=now + timedelta(days=365),
+    )
+    allowed_req = PolicyRequest(action="contact", channel="email", facts={"consent": "present"})
+    denied_req = PolicyRequest(action="contact", channel="sms")
+    ambiguous_req = PolicyRequest(action="contact", channel="email", jurisdiction="")
+
+    out: dict = {}
+
+    # 1) record the DCA-052 draft version
+    with ctx.session_factory() as session:
+        CompliancePolicyRulepackStore(session).add_version(pack)
+        session.commit()
+
+    # 4-first) BEFORE approval there is no in-force pack: the allowed request still DENIES (a missing
+    #          pack can never allow). Reproduced here from the pre-approval state.
+    with ctx.session_factory() as session:
+        decision = PolicyEvaluator(session).evaluate(allowed_req, now=now)
+        out["missing_pack"] = {
+            "decision": decision.decision.value,
+            "reasons": list(decision.reasons),
+        }
+
+    # 1b) a platform operator approves the version -> it is in force
+    with ctx.session_factory() as session:
+        PolicyApprovalStore(session).approve(1, review, operator)
+        session.commit()
+
+    # 2-3,5) evaluate the four inputs against the in-force pack (read-only)
+    with ctx.session_factory() as session:
+        evaluator = PolicyEvaluator(session)
+        allowed = evaluator.evaluate(allowed_req, now=now)
+        denied = evaluator.evaluate(denied_req, now=now)
+        ambiguous = evaluator.evaluate(ambiguous_req, now=now)
+        # evaluating writes nothing: the registry row counts stay put
+        packs_after = session.query(CompliancePolicyRulepack).count()
+        approvals_after = session.query(CompliancePolicyApproval).count()
+
+    out["allowed"] = {
+        "decision": allowed.decision.value,
+        "reasons": list(allowed.reasons),
+        "rulepack_version": allowed.rulepack_version,
+        "approval_id": (allowed.approval_id or "")[:12] + "…" if allowed.approval_id else None,
+        "decisive_authority": allowed.decisive_authority,
+        "evidence_sources": sorted({e["source"] for e in allowed.evidence}),
+        "llm_consulted": allowed.llm_consulted,
+    }
+    out["denied"] = {"decision": denied.decision.value, "reasons": list(denied.reasons)}
+    out["ambiguous_country"] = {
+        "decision": ambiguous.decision.value,
+        "reasons": list(ambiguous.reasons),
+    }
+    out["rows_after_eval"] = {"rulepacks": packs_after, "approvals": approvals_after}
+
+    print(
+        "\n1) recorded a DCA-052 India rulepack DRAFT and promoted it IN FORCE (DCA-053 approval)."
+    )
+    print("\n2) ALLOWED input (contact/email, consent present):")
+    for k, v in out["allowed"].items():
+        print(f"     {k:20} = {v}")
+    print("\n3) DENIED input (contact/sms, no granting rule in the pack):")
+    print(f"     decision={out['denied']['decision']}  reasons={out['denied']['reasons']}")
+    print("\n4) MISSING-pack input (same allowed request BEFORE approval existed):")
+    print(
+        f"     decision={out['missing_pack']['decision']}  reasons={out['missing_pack']['reasons']}"
+    )
+    print("\n5) AMBIGUOUS-country input (jurisdiction could not be resolved):")
+    print(
+        f"     decision={out['ambiguous_country']['decision']}  "
+        f"reasons={out['ambiguous_country']['reasons']}"
+    )
+    print(
+        f"\nregistry rows after the three evaluations (unchanged): {out['rows_after_eval']} "
+        "(evaluating writes nothing)"
+    )
+
+    checks = {
+        "allowed_is_allow": (
+            out["allowed"]["decision"] == PolicyDecision.ALLOW.value
+            and out["allowed"]["reasons"] == [REASON_ALLOWED_BY_RULE]
+        ),
+        "denied_is_deny": (
+            out["denied"]["decision"] == PolicyDecision.DENY.value
+            and out["denied"]["reasons"] == [REASON_NO_MATCHING_RULE]
+        ),
+        "missing_pack_never_allows": (
+            out["missing_pack"]["decision"] == PolicyDecision.DENY.value
+            and out["missing_pack"]["reasons"] == [REASON_NO_IN_FORCE_PACK]
+        ),
+        "ambiguous_country_never_allows": (
+            out["ambiguous_country"]["decision"] == PolicyDecision.DENY.value
+            and out["ambiguous_country"]["reasons"] == [REASON_UNRESOLVED_JURISDICTION]
+        ),
+        "llm_never_consulted": out["allowed"]["llm_consulted"] is False,
+        "evaluation_changed_no_state": out["rows_after_eval"] == {"rulepacks": 1, "approvals": 1},
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. The policy EVALUATOR is pure deterministic "
+        "Python — it consults no model and changes no state. A missing pack and an unresolved "
+        "jurisdiction can NEVER yield ALLOW (both fail closed to DENY). The evaluator is wired into no "
+        "send/acquisition path: expressing a decision enforces nothing — future capabilities stay "
+        "disabled.)"
     )
     return out
 
