@@ -236,6 +236,25 @@ class BusinessSourceEntitlementStore:
 
     # -- the platform ceiling -----------------------------------------------------------------------
 
+    def in_force_approval(
+        self, source_key: str, *, now: datetime | None = None
+    ) -> SourceTermsApproval | None:
+        """The in-force platform approval ceiling for ``source_key`` at ``now``, or ``None``.
+
+        A public read over :meth:`_in_force_approval` for composing consumers (the DCA-048 source
+        preflight), so a reader can resolve the ceiling without reaching into a private method. A
+        pure, side-effect-free read.
+        """
+        return self._in_force_approval(source_key, now=now)
+
+    def approved_purposes(self, approval: SourceTermsApproval) -> set[str]:
+        """The purposes the terms version this ``approval`` endorses documents (the purpose ceiling).
+
+        A public read over :meth:`_approved_purposes` for the DCA-048 preflight, so the purpose
+        ceiling can be evaluated without reaching into a private method.
+        """
+        return self._approved_purposes(approval)
+
     def _in_force_approval(
         self, source_key: str, *, now: datetime | None = None
     ) -> SourceTermsApproval | None:

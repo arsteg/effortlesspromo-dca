@@ -263,6 +263,42 @@ def test_dca047_scenario_proves_per_business_narrowing_and_reproduces_denials(ca
     assert result.cleaned_up is True
 
 
+def test_dca048_scenario_proves_preflight_allows_and_denials_make_zero_adapter_calls(capsys):
+    # The DCA-048 source-preflight scenario runs on local synthetic SQLite with isolated Businesses
+    # A/B: a fully-authorized operation ALLOWS and reaches a counted fake adapter, while every denial
+    # (operation/purpose not entitled or denied at platform, an unapproved or draft source, an unknown
+    # source) makes ZERO adapter calls — and an official-origin + robots-allowed source with no rights
+    # is still denied, proving origin/robots cannot bypass the rights chain.
+    result = execute(_args(story_id="DCA-048"))
+    assert result.exit_code == 0
+    allowed = result.summary["allowed"]
+    assert allowed["decision"] is True and allowed["adapter_called"] is True
+    assert allowed["adapter_calls"] == 1
+    # Every denial made zero adapter calls.
+    assert result.summary["denied_adapter_calls_total"] == 0
+    denials = result.summary["denials"]
+    assert all(d["adapter_called"] is False and d["adapter_calls"] == 0 for d in denials.values())
+    assert (
+        denials["op 'export' (approved but not entitled by A)"]["reason"]
+        == "operation_not_entitled"
+    )
+    assert denials["op 'share' (denied at platform)"]["reason"] == "operation_denied_at_platform"
+    assert denials["purpose 'resale' (not documented)"]["reason"] == "purpose_denied_at_platform"
+    # Official origin + permissive robots.txt cannot bypass the rights chain.
+    assert (
+        denials["UNAPPROVED source (official origin + robots ok)"]["reason"]
+        == "source_not_platform_approved"
+    )
+    assert denials["DRAFT source (not enabled)"]["reason"] == "source_not_enabled"
+    assert denials["unknown source"]["reason"] == "source_not_found"
+    # Tenant isolation + reproducibility; the preflight staged nothing beyond the DCA-047 entitlement.
+    assert tuple(result.summary["A_allowed_repeatable"]) == (True, True)
+    assert tuple(result.summary["B_decision"]) == (False, "source_not_entitled")
+    assert result.summary["entitlement_rows_total"] == 1
+    assert result.summary["audit_actions"] == ["source.entitlement.set"]
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

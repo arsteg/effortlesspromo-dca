@@ -4698,6 +4698,278 @@ def _dca_047(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-048",
+    "authorize a source operation before fetching: a fully-authorized op ALLOWS and reaches a counted "
+    "fake adapter, while every denial (unknown/draft source, no platform approval, operation/purpose "
+    "denied or not entitled) makes ZERO adapter calls — and an official-origin + robots-allowed source "
+    "with no rights is still denied (origin/robots cannot bypass rights)",
+)
+def _dca_048(ctx: CheckContext) -> dict:
+    """Drive the real DCA-048 source preflight against a disposable DB with isolated synthetic
+    Businesses A/B, following the developer manual-test steps and showing actual decisions + the
+    fake adapter's call count:
+
+      1. catalogue a source (DCA-044), record terms (DCA-045), APPROVE it (DCA-046) and — for the
+         ALLOW path only — synthetically mark the catalog entry ENABLED (nothing in the service does
+         this; it is a test-only enable so the allow branch is reachable). Business A entitles a
+         SUBSET (DCA-047): collect/display, purpose 'prospecting';
+      2. request ALLOWED fields/operations through a COUNTED fake adapter and show it IS reached;
+      3. request PROHIBITED operations/purposes and an UNAPPROVED / DRAFT source, each with an
+         'official origin' + 'robots.txt allows' hint — every one is DENIED with a stable reason and
+         the adapter is NEVER called (official origin / robots cannot bypass the rights chain);
+      4. business B (same platform ceiling, no entitlement) is denied; re-running changes nothing.
+
+    Local synthetic only (AI disabled, ephemeral DB). The preflight is a pure read: it stages
+    nothing and authorizes no acquisition — in the running service every fetch is denied at the
+    source-status gate because no source is ever ENABLED.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import AuditEvent, BusinessSourceEntitlement, Source, SourceStatus
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_preflight import PreflightRequest, SourcePreflight
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    source_key = "mca_master_data"
+    unapproved_key = "commercial_leads"
+    draft_key = "mca_draft_only"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0048", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    # An "official origin" source whose robots.txt permits crawling — advisory hints the gate IGNORES.
+    official_robots = {"official_origin": True, "robots_allowed": True, "trust_tier": "official"}
+
+    class CountingAdapter:
+        key = source_key
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch(self, icp: dict) -> list:
+            self.calls += 1
+            return [{"org_name": "Synthetic Textiles Pvt Ltd", "source_key": self.key}]
+
+    out: dict = {}
+
+    # 1) platform ceiling: an APPROVED + (test-only) ENABLED source, plus an UNAPPROVED and a DRAFT one
+    with ctx.session_factory() as session:
+        catalog = SourceCatalogStore(session)
+        catalog.create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                name="MCA Company Master Data",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        catalog.create_draft(
+            SourceDraftInput(
+                key=unapproved_key,
+                # An OFFICIAL-origin registry with a permissive robots.txt — but NO platform approval.
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        catalog.create_draft(
+            SourceDraftInput(
+                key=draft_key,
+                kind="official",
+                access_method="bulk_download",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "store": True, "display": True, "export": True},
+                field_rights={"email": {"display": True, "export": False}},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        # Test-only synthetic enable so the ALLOW branch is reachable (the service never does this).
+        enabled = session.query(Source).filter(Source.key == source_key).one()
+        enabled.status = SourceStatus.ENABLED.value
+        enabled.enabled = True
+        # The official-origin UNAPPROVED source is ALSO (test-only) enabled, so the ONLY thing it
+        # lacks is a platform approval — proving an official origin + permissive robots.txt cannot,
+        # on their own, bypass the rights chain (the preflight denies 'source_not_platform_approved').
+        unapproved = session.query(Source).filter(Source.key == unapproved_key).one()
+        unapproved.status = SourceStatus.ENABLED.value
+        unapproved.enabled = True
+        # Business A entitles a SUBSET: collect + display, purpose 'prospecting' ('export'/'share' not).
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=source_key,
+                enabled=True,
+                operations={"collect": True, "display": True},
+                field_rights={"email": {"display": True}},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        session.commit()
+
+    # 2) ALLOWED request reaches the counted adapter
+    with ctx.session_factory() as session:
+        gate = SourcePreflight(session, BUSINESS_A)
+        adapter = CountingAdapter()
+        allowed = gate.fetch(
+            adapter,
+            PreflightRequest(
+                source_key=source_key,
+                operation="collect",
+                purpose="prospecting",
+                origin_signals=official_robots,
+            ),
+            icp={"industries": ["textiles"]},
+            now=now,
+        )
+        out["allowed"] = {
+            "decision": allowed.decision.allowed,
+            "reason": allowed.decision.reason,
+            "adapter_called": allowed.adapter_called,
+            "adapter_calls": adapter.calls,
+            "candidates": allowed.candidates,
+        }
+
+    # 3) PROHIBITED requests — each DENIED, each making ZERO adapter calls
+    prohibited = {
+        "op 'export' (approved but not entitled by A)": PreflightRequest(
+            source_key=source_key,
+            operation="export",
+            purpose="prospecting",
+            origin_signals=official_robots,
+        ),
+        "op 'share' (denied at platform)": PreflightRequest(
+            source_key=source_key,
+            operation="share",
+            purpose="prospecting",
+            origin_signals=official_robots,
+        ),
+        "purpose 'resale' (not documented)": PreflightRequest(
+            source_key=source_key,
+            operation="collect",
+            purpose="resale",
+            origin_signals=official_robots,
+        ),
+        "UNAPPROVED source (official origin + robots ok)": PreflightRequest(
+            source_key=unapproved_key,
+            operation="collect",
+            purpose="prospecting",
+            origin_signals=official_robots,
+        ),
+        "DRAFT source (not enabled)": PreflightRequest(
+            source_key=draft_key,
+            operation="collect",
+            purpose="prospecting",
+            origin_signals=official_robots,
+        ),
+        "unknown source": PreflightRequest(
+            source_key="no_such_source",
+            operation="collect",
+            purpose="prospecting",
+            origin_signals=official_robots,
+        ),
+    }
+    denials: dict = {}
+    total_calls = 0
+    with ctx.session_factory() as session:
+        gate = SourcePreflight(session, BUSINESS_A)
+        for label, req in prohibited.items():
+            adapter = CountingAdapter()
+            result = gate.fetch(adapter, req, icp={}, now=now)
+            total_calls += adapter.calls
+            denials[label] = {
+                "reason": result.decision.reason,
+                "adapter_called": result.adapter_called,
+                "adapter_calls": adapter.calls,
+            }
+    out["denials"] = denials
+    out["denied_adapter_calls_total"] = total_calls
+
+    # 4) tenant isolation: B shares the ceiling but has no entitlement -> denied; A re-run is stable
+    with ctx.session_factory() as session:
+        req = PreflightRequest(source_key=source_key, operation="collect", purpose="prospecting")
+        a_first = SourcePreflight(session, BUSINESS_A).authorize(req, now=now)
+        a_second = SourcePreflight(session, BUSINESS_A).authorize(req, now=now)
+        b_decision = SourcePreflight(session, BUSINESS_B).authorize(req, now=now)
+        out["A_allowed_repeatable"] = (a_first.allowed, a_second.allowed)
+        out["B_decision"] = (b_decision.allowed, b_decision.reason)
+        out["entitlement_rows_total"] = session.query(BusinessSourceEntitlement).count()
+        out["audit_actions"] = [a.action for a in session.query(AuditEvent).all()]
+
+    print("\n1) platform ceiling: APPROVED + (test-only) ENABLED 'mca_master_data'")
+    print("   A entitles a SUBSET: collect/display, purpose 'prospecting' (export/share NOT).")
+    print("\n2) ALLOWED request (collect / prospecting, official-origin + robots hint):")
+    a = out["allowed"]
+    print(
+        f"   decision={'ALLOW' if a['decision'] else 'DENY'}  adapter_called={a['adapter_called']}  "
+        f"adapter_calls={a['adapter_calls']}  candidates={a['candidates']}"
+    )
+    print("\n3) PROHIBITED requests (each DENIED, adapter NEVER called):")
+    for label, info in denials.items():
+        print(
+            f"   {label:48} -> {info['reason']:30} "
+            f"adapter_called={info['adapter_called']} calls={info['adapter_calls']}"
+        )
+    print(f"\n   total adapter calls across ALL denied requests: {total_calls} (must be 0)")
+    print("\n4) tenant isolation + reproducibility:")
+    print(f"   A allowed on re-run       : {out['A_allowed_repeatable']} (pure read, stable)")
+    print(f"   B (no entitlement)        : {out['B_decision']}")
+    print(
+        f"   entitlement rows total    : {out['entitlement_rows_total']} (preflight staged nothing)"
+    )
+    print(
+        f"   audit actions             : {out['audit_actions']} (only the DCA-047 entitlement set)"
+    )
+    print(
+        "\nchecks: "
+        f"allowed_reached_adapter={a['decision'] and a['adapter_called'] and a['adapter_calls'] == 1}  "
+        f"all_denials_zero_calls={total_calls == 0}  "
+        f"official_robots_did_not_bypass="
+        f"{denials['UNAPPROVED source (official origin + robots ok)']['reason'] == 'source_not_platform_approved'}  "
+        f"B_denied={out['B_decision'][0] is False}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action. A denied preflight makes ZERO adapter calls and "
+        "an official origin or permissive robots.txt cannot bypass the rights chain. The preflight is "
+        "a pure read — it authorizes no acquisition and, in the running service, denies every fetch at "
+        "the source-status gate because no source is ever ENABLED.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
