@@ -214,12 +214,17 @@ class SourceTermsStatus(str, Enum):
     draft. Recording a version documents what a source's contract *would* permit; it does not, on its
     own, put any right in force — acting on these rights additionally requires the source to be an
     ENABLED catalog entry (DCA-044), which stays a DISABLED future capability. ``ACTIVE`` is the state
-    a future, disabled approval story would promote one reviewed version to; no path in this service
-    writes an ``ACTIVE`` terms version, so cataloguing rights can never silently authorize acquisition.
+    the DCA-046 approval story promotes one reviewed version to. ``EXPIRED`` is the terminal state the
+    DCA-049 scheduled expiry sweep moves a lapsed ACTIVE version to once it is past its own validity
+    window (or once the approval that promoted it has itself lapsed) — a durable record that the rights
+    are no longer in force. The expiry decision is governed by the explicit validity window
+    (:attr:`SourceTerms.effective_from`/:attr:`SourceTerms.expires_at`), never by the status flag alone,
+    so a right is treated as lapsed the moment its window closes even before the sweep stamps it EXPIRED.
     """
 
     DRAFT = "draft"
     ACTIVE = "active"
+    EXPIRED = "expired"
 
 
 class SourceApprovalStatus(str, Enum):
@@ -227,13 +232,20 @@ class SourceApprovalStatus(str, Enum):
 
     ``ACTIVE`` — the approval a platform operator recorded is in force: it endorses one reviewed
     :class:`SourceTerms` version and carries the evidence, reviewer, review date and expiry of the
-    review. ``REVOKED`` is the state a future, disabled revoke capability would move it to; no path
-    in this service writes a ``REVOKED`` approval, so an approval can only be created, never silently
-    withdrawn here. An approval is platform control-plane data and, on its own, enables no acquisition
-    (the source catalog entry staying ENABLED is a separate, disabled capability — DCA-044).
+    review. ``EXPIRED`` is the terminal state the DCA-049 scheduled expiry sweep moves an ACTIVE
+    approval to once it is past its explicit ``expires_at`` review deadline — a durable record that the
+    endorsement has lapsed and must be re-reviewed. The in-force decision is governed by the explicit
+    validity window (:meth:`~app.services.source_approval.SourceApprovalStore.is_in_force` honours
+    ``effective_from``/``expires_at`` at ``now``), never by the status flag alone, so a lapsed approval
+    endorses nothing the moment its window closes — even before the sweep stamps it EXPIRED. ``REVOKED``
+    is the state a future, disabled revoke capability would move it to; no path in this service writes a
+    ``REVOKED`` approval, so an approval can only be created or expire, never silently withdrawn here. An
+    approval is platform control-plane data and, on its own, enables no acquisition (the source catalog
+    entry staying ENABLED is a separate, disabled capability — DCA-044).
     """
 
     ACTIVE = "active"
+    EXPIRED = "expired"
     REVOKED = "revoked"
 
 

@@ -4970,6 +4970,259 @@ def _dca_048(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-049",
+    "expire source access on time: a controllable clock crosses the approval's review deadline — the "
+    "preflight ALLOWS before expiry and DENIES the instant after (while the row is still stored "
+    "'active', i.e. BEFORE any sweep), then the scheduled expiry sweep durably stamps approval+terms "
+    "EXPIRED; a not-yet-effective approval is denied but never swept, and an in-force one is untouched",
+)
+def _dca_049(ctx: CheckContext) -> dict:
+    """Drive the real DCA-049 effective-date check + scheduled expiry sweep against a disposable DB
+    with isolated synthetic Businesses A/B, following the developer manual-test steps:
+
+      1. catalogue a source (DCA-044), record terms (DCA-045), APPROVE it with an EXPLICIT review
+         deadline (DCA-046), (test-only) ENABLE the catalog entry and entitle A (DCA-047);
+      2. with a CONTROLLABLE clock, authorize the same preflight BEFORE expiry (ALLOW) and the instant
+         AFTER expiry (DENY) — and show the approval row is STILL stored 'active', proving the source
+         became unusable by the effective-date check alone, BEFORE any sweep ran;
+      3. run the scheduled expiry sweep at the post-expiry clock and show it durably stamped the
+         approval AND the terms it promoted EXPIRED (idempotent on a second run);
+      4. a not-yet-effective approval (effective_from in the future) is DENIED by the effective-date
+         check yet is NOT expired by the sweep; an in-force approval is left ACTIVE and usable.
+
+    Local synthetic only (AI disabled, ephemeral DB). The preflight is a pure read and the sweep only
+    moves a lapsed right MORE restrictive — nothing here enables acquisition (every production fetch
+    still denies at the source-status gate because no source is ever ENABLED).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        Source,
+        SourceApprovalStatus,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_expiry import SourceExpirySweep
+    from app.services.source_preflight import PreflightRequest, SourcePreflight
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    lapsing_key = "mca_master_data"  # approval expires mid-test (the review deadline)
+    pending_key = "future_registry"  # approval not yet effective
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    expires_at = now + timedelta(days=30)  # the review deadline the clock crosses
+    after_expiry = expires_at + timedelta(seconds=1)  # controllable clock, just past the deadline
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0049", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    req_lapsing = PreflightRequest(
+        source_key=lapsing_key, operation="collect", purpose="prospecting"
+    )
+    req_pending = PreflightRequest(
+        source_key=pending_key, operation="collect", purpose="prospecting"
+    )
+
+    def _catalogue_approve_enable(session, key, *, effective_from, expires):
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=key,
+                operations={"collect": True, "display": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                effective_from=effective_from,
+                expires_at=expires,
+            ),
+            operator,
+        )
+        source = session.query(Source).filter(Source.key == key).one()
+        source.status = SourceStatus.ENABLED.value
+        source.enabled = True
+
+    out: dict = {}
+
+    # 1) seed: a source approved with a 30-day review deadline, plus a not-yet-effective source.
+    with ctx.session_factory() as session:
+        _catalogue_approve_enable(session, lapsing_key, effective_from=None, expires=expires_at)
+        _catalogue_approve_enable(
+            session,
+            pending_key,
+            effective_from=now + timedelta(days=5),  # not yet effective at `now`
+            expires=now + timedelta(days=90),
+        )
+        # Entitle A on both (the pending one is entitled at a moment it IS in force).
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=lapsing_key,
+                enabled=True,
+                operations={"collect": True, "display": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=pending_key,
+                enabled=True,
+                operations={"collect": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now + timedelta(days=6),  # after the pending approval's effective_from
+        )
+        session.commit()
+
+    # 2) controllable clock crosses the deadline — DENY before any sweep, row still 'active'.
+    with ctx.session_factory() as session:
+        gate = SourcePreflight(session, BUSINESS_A)
+        before = gate.authorize(req_lapsing, now=now)
+        after = gate.authorize(req_lapsing, now=after_expiry)
+        status_before_sweep = (
+            session.query(SourceTermsApproval)
+            .filter(SourceTermsApproval.source_key == lapsing_key)
+            .one()
+            .status
+        )
+    out["before_expiry"] = {"allowed": before.allowed, "reason": before.reason}
+    out["after_expiry_before_sweep"] = {"allowed": after.allowed, "reason": after.reason}
+    out["approval_status_before_sweep"] = status_before_sweep
+
+    # 3) scheduled expiry sweep at the post-expiry clock — durable EXPIRED, idempotent.
+    with ctx.session_factory() as session:
+        first = SourceExpirySweep(session).sweep(now=after_expiry)
+        session.commit()
+    with ctx.session_factory() as session:
+        second = SourceExpirySweep(session).sweep(now=after_expiry)
+        session.commit()
+    with ctx.session_factory() as session:
+        approval = (
+            session.query(SourceTermsApproval)
+            .filter(SourceTermsApproval.source_key == lapsing_key)
+            .one()
+        )
+        terms = session.query(SourceTerms).filter(SourceTerms.source_key == lapsing_key).one()
+        post = SourcePreflight(session, BUSINESS_A).authorize(req_lapsing, now=after_expiry)
+    out["sweep_first"] = {
+        "approvals": first.expired_approvals,
+        "terms": first.expired_terms,
+    }
+    out["sweep_second_transitioned"] = second.transitioned
+    out["approval_status_after_sweep"] = approval.status
+    out["terms_status_after_sweep"] = terms.status
+    out["after_sweep_preflight"] = {"allowed": post.allowed, "reason": post.reason}
+
+    # 4) not-yet-effective approval: DENIED by the effective-date check, NOT expired by the sweep.
+    with ctx.session_factory() as session:
+        pending_decision = SourcePreflight(session, BUSINESS_A).authorize(req_pending, now=now)
+        swept = SourceExpirySweep(session).sweep(now=now)
+        session.commit()
+    with ctx.session_factory() as session:
+        pending_status = (
+            session.query(SourceTermsApproval)
+            .filter(SourceTermsApproval.source_key == pending_key)
+            .one()
+            .status
+        )
+    out["pending_decision"] = {
+        "allowed": pending_decision.allowed,
+        "reason": pending_decision.reason,
+    }
+    out["pending_swept_transitioned"] = swept.transitioned
+    out["pending_status"] = pending_status
+    # Tenant isolation: B never entitled either source.
+    with ctx.session_factory() as session:
+        b_decision = SourcePreflight(session, BUSINESS_B).authorize(req_lapsing, now=now)
+    out["B_decision"] = {"allowed": b_decision.allowed, "reason": b_decision.reason}
+
+    print("\n1) seeded 'mca_master_data' approved with a 30-day review deadline; A entitled.")
+    print("\n2) controllable clock crosses the review deadline (BEFORE any sweep):")
+    print(
+        f"   before expiry (now)        -> {'ALLOW' if before.allowed else 'DENY'}  "
+        f"reason={before.reason}"
+    )
+    print(
+        f"   after expiry  (+30d +1s)   -> {'ALLOW' if after.allowed else 'DENY'}  "
+        f"reason={after.reason}"
+    )
+    print(
+        f"   approval row status now    -> {status_before_sweep!r}  "
+        "(STILL 'active' — denial enforced by the effective-date check, not the sweep)"
+    )
+    print("\n3) scheduled expiry sweep at the post-expiry clock:")
+    print(f"   sweep #1 expired approvals={first.expired_approvals} terms={first.expired_terms}")
+    print(f"   sweep #2 transitioned      -> {second.transitioned} (idempotent — nothing left)")
+    print(f"   durable status             -> approval={approval.status!r} terms={terms.status!r}")
+    print(
+        f"   preflight after sweep      -> {'ALLOW' if post.allowed else 'DENY'}  "
+        f"reason={post.reason}"
+    )
+    print("\n4) not-yet-effective approval ('future_registry'):")
+    print(
+        f"   preflight at now           -> {'ALLOW' if pending_decision.allowed else 'DENY'}  "
+        f"reason={pending_decision.reason}  (not yet effective)"
+    )
+    print(
+        f"   sweep transitioned         -> {swept.transitioned} "
+        f"(NOT lapsed); status stays {pending_status!r}"
+    )
+    print(
+        f"   B (no entitlement)         -> {'ALLOW' if b_decision.allowed else 'DENY'}  "
+        f"reason={b_decision.reason}"
+    )
+    checks = {
+        "allowed_before_expiry": before.allowed is True,
+        "denied_after_expiry": after.allowed is False,
+        "unusable_before_sweep": status_before_sweep == SourceApprovalStatus.ACTIVE.value,
+        "sweep_stamped_expired": approval.status == SourceApprovalStatus.EXPIRED.value
+        and terms.status == SourceTermsStatus.EXPIRED.value,
+        "sweep_idempotent": second.transitioned == 0,
+        "pending_denied_not_swept": pending_decision.allowed is False
+        and swept.transitioned == 0
+        and pending_status == SourceApprovalStatus.ACTIVE.value,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. An expired source is unusable the moment its "
+        "window closes — the effective-date check denies BEFORE the scheduled sweep stamps the "
+        "durable EXPIRED state. The sweep only records the lapse; it never enables acquisition.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",

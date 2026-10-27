@@ -299,6 +299,37 @@ def test_dca048_scenario_proves_preflight_allows_and_denials_make_zero_adapter_c
     assert result.cleaned_up is True
 
 
+def test_dca049_scenario_proves_expiry_before_sweep_and_the_durable_transition(capsys):
+    # The DCA-049 source-expiry scenario runs on local synthetic SQLite with isolated Businesses A/B
+    # and a controllable clock: the preflight ALLOWS before the approval's review deadline and DENIES
+    # the instant after — while the row is still stored 'active', proving the effective-date check (not
+    # the status flag or any sweep) makes the source unusable. The scheduled expiry sweep then durably
+    # stamps the approval and the terms it promoted EXPIRED (idempotent), and a not-yet-effective
+    # approval is denied yet never swept.
+    result = execute(_args(story_id="DCA-049"))
+    assert result.exit_code == 0
+    s = result.summary
+    assert s["before_expiry"]["allowed"] is True
+    assert s["after_expiry_before_sweep"] == {
+        "allowed": False,
+        "reason": "source_not_platform_approved",
+    }
+    # Unusable BEFORE the sweep caught up: the lapse was enforced purely by the time check.
+    assert s["approval_status_before_sweep"] == "active"
+    # The scheduled sweep durably recorded the lapse (approval + the terms it promoted), idempotently.
+    assert s["approval_status_after_sweep"] == "expired"
+    assert s["terms_status_after_sweep"] == "expired"
+    assert s["sweep_second_transitioned"] == 0
+    assert s["after_sweep_preflight"]["allowed"] is False
+    # A not-yet-effective approval is denied by the effective-date check but NOT expired by the sweep.
+    assert s["pending_decision"]["allowed"] is False
+    assert s["pending_swept_transitioned"] == 0
+    assert s["pending_status"] == "active"
+    assert s["B_decision"]["allowed"] is False
+    assert all(s["checks"].values())
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

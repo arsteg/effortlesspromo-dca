@@ -1,8 +1,9 @@
 """The 24/7 loop — a plain asyncio ticker, OFF by default (worker_enabled=false).
 
-Each tick runs one discovery cycle per enabled tenant, each in its own session, and a failure for
-one tenant never stops the loop or leaks into another tenant's cycle. The tick body is a plain
-function (``tick_all_tenants``) so tests drive it deterministically without the loop.
+Each tick runs scheduled platform maintenance (the DCA-049 source-expiry sweep) and then one
+discovery cycle per enabled tenant, each in its own session, and a failure for one tenant never stops
+the loop or leaks into another tenant's cycle. The tick bodies are plain functions
+(``tick_maintenance``, ``tick_all_tenants``) so tests drive them deterministically without the loop.
 """
 
 from __future__ import annotations
@@ -16,8 +17,29 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.db.models import TenantAgent
 from app.services.discovery import DiscoveryError, run_discovery
+from app.services.source_expiry import ExpirySweepResult, run_expiry_sweep
 
 log = logging.getLogger("dca.worker")
+
+
+def tick_maintenance(
+    session_factory: sessionmaker[Session], settings: Settings
+) -> ExpirySweepResult:
+    """Run one scheduled platform-maintenance pass (DCA-049): expire lapsed source approvals/terms.
+
+    Control-plane housekeeping, not tenant work — it runs once per cycle (not per tenant) and only
+    ever makes a lapsed right MORE restrictive, so it is not gated behind any feature/source flag. The
+    effective-date checks already deny a lapsed right immediately; this pass just stamps the durable
+    EXPIRED state. A failure here must not stop the loop or block the tenant ticks that follow.
+    """
+    result = run_expiry_sweep(session_factory, settings)
+    if result.transitioned:
+        log.info(
+            "source-expiry sweep: expired %d approval(s), %d terms version(s)",
+            len(result.expired_approvals),
+            len(result.expired_terms),
+        )
+    return result
 
 
 def tick_all_tenants(session_factory: sessionmaker[Session], settings: Settings) -> dict[str, str]:
@@ -43,6 +65,11 @@ def tick_all_tenants(session_factory: sessionmaker[Session], settings: Settings)
 async def worker_loop(session_factory: sessionmaker[Session], settings: Settings) -> None:
     log.info("DCA worker loop started (interval=%ss)", settings.worker_interval_seconds)
     while True:
+        try:
+            # Scheduled maintenance first (control-plane): expire lapsed source rights durably.
+            await asyncio.to_thread(tick_maintenance, session_factory, settings)
+        except Exception:
+            log.exception("maintenance tick crashed; continuing")
         try:
             outcomes = await asyncio.to_thread(tick_all_tenants, session_factory, settings)
             if outcomes:
