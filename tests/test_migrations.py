@@ -38,6 +38,7 @@ DCA_TABLES = {
     "revision_projections",
     "revision_pending_events",
     "idempotency_records",
+    "business_profile_drafts",
 }
 
 
@@ -360,6 +361,53 @@ def test_0009_creates_idempotency_records_on_a_preexisting_database(clean_schema
         ).first()
     eng.dispose()
     assert "uq_idempotency_key" in uniques  # the per-tenant/route key-reuse constraint travelled
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0010_creates_business_profile_drafts_on_a_preexisting_database(clean_schema):
+    """DCA-036 — the 0010 create branch (for a DB migrated before ``business_profile_drafts`` existed).
+
+    Same shape as the 0005..0009 tests: a fresh DB gets the table from the metadata baseline (0001) and
+    its RLS policy from 0002, so 0010 is a no-op there. To exercise 0010's real job, upgrade to head,
+    drop the table + policy, stamp history back to 0009, then upgrade to head again — 0010 must recreate
+    the table (with its per-tenant version constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text('DROP TABLE IF EXISTS "business_profile_drafts" CASCADE')
+        )  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0009_idempotency_records")  # pretend we predate the profile table
+    command.upgrade(cfg, "head")  # 0010 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "business_profile_drafts" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("business_profile_drafts", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'business_profile_drafts' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_profile_draft_version" in uniques
+    )  # one version per tenant; a version never overwrites
     assert policy is not None  # RLS re-established, not just the bare table
 
 

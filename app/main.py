@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.idempotency import install_idempotency
-from app.api.routes import auth, authz, health, service_integration, tenants
+from app.api.routes import auth, authz, health, profiles, service_integration, tenants
 from app.core.config import Settings, get_settings, validate_required
 from app.core.errors import install_error_handling
 from app.core.logging import CorrelationIdMiddleware, configure_logging
@@ -103,6 +103,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     install_idempotency(app)
     app.include_router(health.router)
     app.include_router(tenants.router)
+    app.include_router(profiles.router)
     app.include_router(auth.router)
     app.include_router(authz.router)
     app.include_router(service_integration.router)

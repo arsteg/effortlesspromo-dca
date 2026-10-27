@@ -51,6 +51,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "revision_projections",
         "revision_pending_events",
         "idempotency_records",
+        "business_profile_drafts",
     }
 
 

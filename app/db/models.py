@@ -111,6 +111,73 @@ class InboxStatus(str, Enum):
     PROCESSED = "processed"
 
 
+class ProfileStatus(str, Enum):
+    """Lifecycle state of a business-profile row (DCA-036).
+
+    ``DRAFT`` — a versioned, reviewable draft of the business profile. Every save creates a NEW draft
+    version; prior versions are retained, never overwritten. ``CONFIRMED`` — the single accepted
+    profile a draft may one day be promoted to. **Promotion/confirmation is a DISABLED future
+    capability** (its own later story): no path in this service writes a ``CONFIRMED`` row, so saving a
+    draft can never silently replace the confirmed profile.
+    """
+
+    DRAFT = "draft"
+    CONFIRMED = "confirmed"
+
+
+class BusinessProfileDraft(TenantOwned, Base):
+    """DCA-036 — a scoped, versioned draft of a business's profile (tenant-owned, RLS-protected).
+
+    One row is one *version* of the tenant's own business profile — what the agent learns/records about
+    the business itself (its products, business type, value proposition, languages, and the specific
+    facts it has confirmed). Each save inserts a new version (``(business_id, version)`` is unique), so
+    a new draft **preserves** every prior version rather than mutating it; there is no update path.
+
+    ``unknowns`` makes the profile honest about what is *not* yet known: canonical aspects left empty
+    are retained there explicitly (``app.services.profile_store``) rather than silently dropped, so a
+    reader can tell "unknown" apart from "known to be empty". The aspects named in ``unknowns`` and the
+    populated aspects are kept disjoint by the writer.
+
+    ``status`` separates a reviewable DRAFT from the accepted CONFIRMED profile. Confirmation is a
+    DISABLED future capability (its own later story): :class:`~app.services.profile_store.ProfileStore`
+    only ever stages ``status='draft'`` rows and never mutates an existing one, so a draft can never
+    silently replace the confirmed profile.
+
+    This is the tenant's OWN business content (not prospect contact data or secrets), so — unlike the
+    audit/outbox/inbox/revision payloads — its fields are NOT opaque-reference screened. Tenant-owned:
+    it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant
+    data table, so one tenant can never read another's profile versions.
+    """
+
+    __tablename__ = "business_profile_drafts"
+    # A version number is unique PER business: the same ordinal recurs across tenants but never within
+    # one, so a new version can never collide with or overwrite an existing version of the same tenant.
+    __table_args__ = (tenant_unique("version", name="uq_profile_draft_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # 1-based version ordinal within the business; a new draft is always max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # The tenant's own business content — free text/lists (NOT opaque references, NOT contact data).
+    products: Mapped[list] = mapped_column(JSON, default=list)
+    business_type: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    value_proposition: Mapped[str] = mapped_column(Text, default="", server_default="")
+    languages: Mapped[list] = mapped_column(JSON, default=list)
+    # Facts the tenant has explicitly confirmed true about itself (opaque strings, retained as given).
+    confirmed_facts: Mapped[list] = mapped_column(JSON, default=list)
+    # Canonical aspects explicitly retained as NOT-yet-known (never silently dropped). Disjoint from the
+    # populated aspects — the writer keeps "unknown" and "known" from overlapping.
+    unknowns: Mapped[list] = mapped_column(JSON, default=list)
+    # draft (reviewable, versioned) vs confirmed (the accepted profile). Confirmation is disabled, so
+    # every row written here is 'draft'; nothing promotes a draft to 'confirmed' yet.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=ProfileStatus.DRAFT.value,
+        server_default=ProfileStatus.DRAFT.value,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class TenantAgent(Base):
     """One row per business that has a DCA agent registered. Disabled until explicitly enabled.
 

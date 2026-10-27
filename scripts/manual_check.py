@@ -2841,6 +2841,117 @@ def _dca_035(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-036",
+    "versioned profile drafts: save two versions (prior preserved), unknowns retained, no confirmed "
+    "profile created, and the confirm capability is denied without changing state",
+)
+def _dca_036(ctx: CheckContext) -> dict:
+    """Drive the real DCA-036 versioned business-profile drafts over the HTTP API against synthetic A,
+    following the developer manual-test steps:
+
+      1. register A;
+      2. save draft v1 (some aspects left empty) -> version 1, status 'draft', empty aspects retained
+         in 'unknowns';
+      3. save a SECOND draft -> version 2, and show v1 is still retrievable and UNCHANGED (a new draft
+         preserves prior versions, it does not overwrite);
+      4. GET the confirmed profile -> none exists (saving drafts never created a confirmed profile);
+      5. attempt to confirm v1 -> 403 'profile_confirmation_disabled', changing NO state (still no
+         confirmed profile, draft list unchanged).
+
+    Local synthetic only (AI disabled, ephemeral DB); every call is shown with its real body so a human
+    can compare against the acceptance criteria rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    base = f"/v1/tenants/{biz_a}/profile"
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        client.post("/v1/tenants", json={"businessId": biz_a}, headers=auth)
+
+        # 2) first draft — products & business type known; the rest deliberately left empty
+        v1_body = {
+            "products": ["artisan tea"],
+            "businessType": "retail",
+            "valueProposition": "",
+            "languages": [],
+            "confirmedFacts": [],
+        }
+        v1 = client.post(f"{base}/drafts", json=v1_body, headers=auth)
+        print(f"\n1) save draft v1                 -> HTTP {v1.status_code} {v1.json()}")
+        out["v1"] = {"status": v1.status_code, "body": v1.json()}
+
+        # 3) second draft — a NEW version; v1 must remain
+        v2 = client.post(
+            f"{base}/drafts",
+            json={**v1_body, "businessType": "wholesale", "languages": ["en", "hi"]},
+            headers=auth,
+        )
+        print(f"2) save draft v2                 -> HTTP {v2.status_code} {v2.json()}")
+        listed = client.get(f"{base}/drafts", headers=auth).json()
+        v1_after = client.get(f"{base}/drafts/1", headers=auth).json()
+        print(f"   versions on record            -> {[r['version'] for r in listed]}")
+        print(
+            f"   v1 after v2 saved             -> businessType={v1_after['businessType']} "
+            f"unknowns={v1_after['unknowns']} (unchanged; prior version preserved)"
+        )
+        out["versions"] = [r["version"] for r in listed]
+        out["v1_preserved"] = {
+            "business_type": v1_after["businessType"],
+            "unknowns": v1_after["unknowns"],
+        }
+
+        # 4) no confirmed profile was created automatically
+        confirmed_before = client.get(f"{base}/confirmed", headers=auth).json()
+        print(f"3) GET confirmed profile         -> {confirmed_before}")
+        out["confirmed_before"] = confirmed_before
+
+        # 5) the confirm capability is disabled — denial with no state change
+        drafts_before = client.get(f"{base}/drafts", headers=auth).json()
+        denied = client.post(f"{base}/drafts/1/confirm", headers=auth)
+        confirmed_after = client.get(f"{base}/confirmed", headers=auth).json()
+        drafts_after = client.get(f"{base}/drafts", headers=auth).json()
+        print(
+            f"4) attempt confirm v1            -> HTTP {denied.status_code} "
+            f"({denied.json()['error']['message']})"
+        )
+        print(
+            f"   confirmed profile after deny  -> confirmed={confirmed_after['confirmed']} "
+            f"(still none); drafts unchanged={drafts_after == drafts_before}"
+        )
+        out["confirm_denied"] = {
+            "status": denied.status_code,
+            "message": denied.json()["error"]["message"],
+            "still_no_confirmed": confirmed_after["confirmed"] is False,
+            "drafts_unchanged": drafts_after == drafts_before,
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"two_versions={out['versions'] == [1, 2]}  "
+        f"prior_preserved={out['v1_preserved']['business_type'] == 'retail'}  "
+        "unknowns_retained="
+        f"{set(out['v1_preserved']['unknowns']) == {'value_proposition', 'languages', 'confirmed_facts'}}  "
+        f"no_auto_confirmed={out['confirmed_before']['confirmed'] is False}  "
+        f"confirm_denied_no_change="
+        f"{out['confirm_denied']['status'] == 403 and out['confirm_denied']['still_no_confirmed'] and out['confirm_denied']['drafts_unchanged']}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; the denied confirm and the second draft changed "
+        "no prior version and created no confirmed profile)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------
