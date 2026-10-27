@@ -148,6 +148,24 @@ def test_dca042_scenario_runs_and_proves_authz_versioning_and_isolation(capsys):
     assert result.cleaned_up is True
 
 
+def test_dca043_scenario_runs_and_proves_invalidation_isolation_and_denial(capsys):
+    # The DCA-043 score-staleness scenario runs on local synthetic SQLite: it proves a confirmed
+    # targeting change flips A's affected recommendation SCORES to stale (approval/status preserved,
+    # no sending authority), a denied confirm (unknown version -> 404) invalidates nothing, and B's
+    # scores stay current (tenant isolation).
+    result = execute(_args(story_id="DCA-043"))
+    assert result.exit_code == 0
+    assert result.summary["denied_status"] == 404
+    assert result.summary["a_unchanged_after_denial"] is True
+    assert result.summary["invalidated_count"] == result.summary["a_discovered"]
+    assert result.summary["grants_campaign_authority"] is False
+    assert all(s[1] == "stale" for s in result.summary["a_after"].values())
+    assert result.summary["accepted_still_accepted"] is True
+    assert result.summary["accepted_score_stale"] is True
+    assert result.summary["b_all_current"] is True
+    assert result.cleaned_up is True
+
+
 def test_list_and_bare_invocation_exit_codes(capsys):
     assert run(["--list"]) == 0  # listing is a success
     out = capsys.readouterr().out

@@ -206,6 +206,11 @@ def list_candidates(business_id: str, session: SessionDep, status: str | None = 
             "sourceRef": c.source_ref,
             "trustTier": c.trust_tier,
             "matchScore": c.match_score,
+            # DCA-043 — the recomputation state of matchScore (current|stale) and the confirmed ICP
+            # version it was scored against. "stale" means a confirmed targeting change flagged the
+            # score for recomputation; it is independent of "status" (the acceptance/approval below).
+            "scoreStatus": c.score_status,
+            "scoredTargetingVersion": c.scored_targeting_version,
             "rationale": c.rationale,
             "status": c.status,
             "expiresAt": c.expires_at.isoformat() if c.expires_at else None,

@@ -3761,6 +3761,158 @@ def _dca_042(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-043",
+    "mark recommendations stale after targeting changes: discover recommendations for A, confirm an "
+    "ICP version -> A's affected scores flip to stale (approval/send untouched), B's stay current; a "
+    "denied confirm (unknown version) invalidates nothing",
+)
+def _dca_043(ctx: CheckContext) -> dict:
+    """Drive the real DCA-043 flow over HTTP against synthetic Businesses A and B, following the
+    developer manual-test steps:
+
+      1. discover recommendations for A (synthetic India registry) — every score starts ``current``;
+         accept one recommendation so its approval can be shown to survive;
+      2. the DENIAL: confirm an unknown ICP version for A -> 404, and A's scores are unchanged
+         (no unintended state);
+      3. confirm a real ICP draft version for A (a confirmed targeting change) -> A's affected scores
+         flip to ``stale`` while every recommendation keeps its ``status`` (the accepted one stays
+         accepted) and no sending authority is granted;
+      4. tenant isolation: B discovers its own recommendations and A's confirm never touches them —
+         B's scores stay ``current``.
+
+    All calls use X-Service-Auth (the DCA-040/tenants surface). Local synthetic only (AI disabled,
+    ephemeral DB). Every call is shown with its real body/HTTP status so a human can compare against the
+    acceptance criteria rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    biz_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    biz_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    actor = "00000000-0000-4000-9000-0000000a0043"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    def discover(client, business_id) -> list[dict]:
+        client.post("/v1/tenants", json={"businessId": business_id}, headers=auth)
+        client.post(f"/v1/tenants/{business_id}/enable", headers=auth)
+        client.put(
+            f"/v1/tenants/{business_id}/icp",
+            json={"industries": [], "regions": [], "roles": []},
+            headers=auth,
+        )
+        client.post(f"/v1/tenants/{business_id}/discovery/run", headers=auth)
+        return client.get(f"/v1/tenants/{business_id}/candidates", headers=auth).json()
+
+    def score_states(client, business_id) -> dict:
+        rows = client.get(f"/v1/tenants/{business_id}/candidates", headers=auth).json()
+        return {r["orgName"]: (r["status"], r["scoreStatus"]) for r in rows}
+
+    # The DCA-021 platform feature must be ON for discovery to run (synthetic sources are already on in
+    # the harness profile). AI stays disabled; still local synthetic only.
+    configured = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="development",
+        database_url=ctx.settings.database_url,
+        service_auth_token=ctx.settings.service_auth_token,
+        synthetic_sources_enabled=True,
+        feature_enabled=True,
+    )
+    app = create_app(configured)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        # 1) discover for A; accept one recommendation
+        a_candidates = discover(client, biz_a)
+        accepted_id = a_candidates[0]["id"]
+        client.post(f"/v1/tenants/{biz_a}/candidates/{accepted_id}/accept", headers=auth)
+        print(f"\n1) A discovered {len(a_candidates)} recommendation(s); all scoreStatus=current")
+        print(f"   accepted one ('{a_candidates[0]['orgName']}') to prove approval survives")
+        out["a_discovered"] = len(a_candidates)
+        out["a_before"] = score_states(client, biz_a)
+
+        # 2) the denial — confirm an unknown ICP version for A (404), scores unchanged
+        denied = _confirm_icp(client, biz_a, 99, actor, auth)
+        a_after_denial = score_states(client, biz_a)
+        print(
+            f"\n2) DENIED confirm (unknown version 99) -> HTTP {denied.status_code} "
+            f"({denied.json().get('error', {}).get('message')})"
+        )
+        print(f"   A scores after denial: {a_after_denial} (unchanged — no unintended state)")
+        out["denied_status"] = denied.status_code
+        out["a_unchanged_after_denial"] = a_after_denial == out["a_before"]
+
+        # 3) confirm a real ICP draft version for A -> affected scores go stale, approval untouched
+        draft = client.post(
+            f"/v1/tenants/{biz_a}/icp/drafts",
+            json={
+                "industries": ["textiles"],
+                "sizeBands": [],
+                "roles": [],
+                "geography": [],
+                "exclusions": [],
+            },
+            headers=auth,
+        )
+        confirm = _confirm_icp(client, biz_a, draft.json()["version"], actor, auth)
+        a_after = score_states(client, biz_a)
+        print(
+            f"\n3) confirmed ICP draft v{draft.json()['version']} for A -> HTTP {confirm.status_code}  "
+            f"invalidatedScoreCount={confirm.json().get('invalidatedScoreCount')}  "
+            f"grantsCampaignAuthority={confirm.json().get('grantsCampaignAuthority')}"
+        )
+        print(f"   A scores after confirm: {a_after} (scores stale; status/approval preserved)")
+        out["invalidated_count"] = confirm.json().get("invalidatedScoreCount")
+        out["grants_campaign_authority"] = confirm.json().get("grantsCampaignAuthority")
+        out["a_after"] = a_after
+        accepted_row = next(
+            r
+            for r in client.get(f"/v1/tenants/{biz_a}/candidates", headers=auth).json()
+            if r["id"] == accepted_id
+        )
+        out["accepted_still_accepted"] = accepted_row["status"] == "accepted"
+        out["accepted_score_stale"] = accepted_row["scoreStatus"] == "stale"
+
+        # 4) tenant isolation — B discovers its own; A's confirm never touched them
+        b_candidates = discover(client, biz_b)
+        b_states = score_states(client, biz_b)
+        print(
+            f"\n4) B discovered {len(b_candidates)} recommendation(s); scores: {b_states} "
+            "(all current — A's confirm never touched B)"
+        )
+        out["b_states"] = b_states
+        out["b_all_current"] = all(s[1] == "current" for s in b_states.values())
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"denied_404={out['denied_status'] == 404}  "
+        f"a_unchanged_after_denial={out['a_unchanged_after_denial']}  "
+        f"scores_invalidated={out['invalidated_count'] == out['a_discovered']}  "
+        f"no_campaign_authority={out['grants_campaign_authority'] is False}  "
+        f"a_scores_all_stale={all(s[1] == 'stale' for s in out['a_after'].values())}  "
+        f"approval_preserved={out['accepted_still_accepted'] and out['accepted_score_stale']}  "
+        f"tenant_isolation={out['b_all_current']}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action. A confirmed targeting change marks only the "
+        "business's affected recommendation SCORES stale for recomputation; recommendation approval "
+        "(status) is never altered and no sending authority is granted; another tenant's scores are "
+        "untouched; a denied confirm invalidates nothing. Recomputation itself stays disabled.)"
+    )
+    return out
+
+
+def _confirm_icp(client, business_id, version, actor_id, auth):
+    return client.post(
+        f"/v1/tenants/{business_id}/icp/confirm",
+        json={"version": version, "actorId": actor_id},
+        headers=auth,
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

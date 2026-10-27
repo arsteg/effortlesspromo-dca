@@ -95,6 +95,20 @@ class RevisionStatus(str, Enum):
     GAPPED = "gapped"
 
 
+class ScoreStatus(str, Enum):
+    """Recomputation state of a recommendation's match score (DCA-043).
+
+    ``CURRENT`` — the ``match_score`` reflects the targeting that produced it (the ``scored_targeting_version``
+    it was computed against). ``STALE`` — a *confirmed targeting revision change* (a new ICP version
+    confirmed, DCA-040) has invalidated the score: it is flagged for recomputation by a future (disabled)
+    rescore capability. Flagging a score stale is a score-only change — it NEVER alters the recommendation's
+    ``status`` (its acceptance/approval) and grants/revokes no sending authority (the DCA has no send path).
+    """
+
+    CURRENT = "current"
+    STALE = "stale"
+
+
 class InboxStatus(str, Enum):
     """Processing state of an inbound-event receipt (DCA-028).
 
@@ -431,6 +445,21 @@ class ProspectCandidate(TenantOwned, Base):
     match_score: Mapped[float] = mapped_column(Float, default=0.0)
     rationale: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(16), default="suggested", index=True)
+    # DCA-043 — recomputation state of ``match_score``. ``current`` until a confirmed targeting revision
+    # change (a new ICP version confirmed) invalidates it, flipping it to ``stale`` (flagged for a future,
+    # disabled rescore). This is a SCORE-only marker: it is kept strictly separate from ``status`` (the
+    # recommendation's acceptance/approval) so invalidating a score never alters approval or grants any
+    # sending right.
+    score_status: Mapped[str] = mapped_column(
+        String(16),
+        default=ScoreStatus.CURRENT.value,
+        server_default=ScoreStatus.CURRENT.value,
+        index=True,
+    )
+    # The confirmed ICP version ``match_score`` was computed against, or NULL for a placeholder score
+    # produced before any targeting was confirmed (discovery's deterministic default). A score is
+    # "affected" by a confirmed targeting change when this differs from the newly-confirmed version.
+    scored_targeting_version: Mapped[int | None] = mapped_column(Integer, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 

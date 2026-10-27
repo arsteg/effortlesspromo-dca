@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from app.audit.sink import AuditActor, AuditSink
 from app.db.models import IcpConfirmation, IcpDraft, _now
 from app.services.icp_store import IcpStore
+from app.services.score_invalidation import ScoreInvalidator
 
 # Stable confirmation codes (mapped to HTTP status at the route boundary). Each is raised BEFORE the
 # session is mutated, so a refusal leaves no row and no partial state.
@@ -104,7 +105,17 @@ class IcpConfirmationStore:
         confirm re-points the SAME row (an upsert) to the newly-confirmed version — a new version
         becomes active only when it is itself confirmed. Records ``actor`` + confirmation time and
         audits the action in the caller's unit of work. Grants no campaign/sending authority.
+
+        DCA-043: a confirmed targeting *revision change* (the newly-confirmed version differs from the
+        previously-active one, including a first confirmation) marks this business's affected
+        recommendation scores stale for recomputation in the SAME unit of work. That is a score-only
+        change — it never alters any recommendation's approval and grants no sending authority. The
+        count of invalidated scores is exposed on the returned row as ``invalidated_score_count`` (a
+        transient, non-persisted attribute) for the route's response.
         """
+        # Capture the previously-active version BEFORE the row is re-pointed, so we can tell whether
+        # this confirm is a genuine targeting revision change (vs re-confirming the same version).
+        previous_version = self.active_version()
         draft = IcpStore(self._session, self._business_id).get_version(version)
         if draft is None:
             # Unknown version, or another tenant's version (reads as not-found) — never confirmed.
@@ -147,4 +158,17 @@ class IcpConfirmationStore:
             reason=f"active ICP version set to {version}",
             references={"version": version, "icpDraftId": draft.id},
         )
+
+        # DCA-043 — a genuine targeting revision change invalidates this business's affected
+        # recommendation scores (score-only; approval/send untouched). Re-confirming the SAME version
+        # is not a change and invalidates nothing. The invalidator stages its own atomic audit entry
+        # only when it actually marks ≥1 score, so a no-op leaves no extra state.
+        invalidated = 0
+        if previous_version != version:
+            invalidated = ScoreInvalidator(
+                self._session, self._business_id
+            ).invalidate_for_targeting_change(new_version=version, actor=actor)
+        # Transient (non-persisted) attribute carrying the count to the route's response view. Set via
+        # ``setattr`` so it is not mistaken for a mapped column and never persisted.
+        setattr(confirmation, "invalidated_score_count", invalidated)
         return confirmation

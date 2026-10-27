@@ -194,7 +194,11 @@ def confirm_icp_version(
         # A caller-supplied actor id that carries raw secret/contact data is refused (nothing staged).
         raise HTTPException(status_code=422, detail="actor_id_not_opaque") from exc
     session.flush()  # populate DB-assigned fields (confirmed_at) for the response view
-    return commit_idempotent(session, idem, _confirmation_view(confirmation))
+    # DCA-043: how many of this business's recommendation scores this confirm marked stale (0 when it
+    # was not a targeting change or nothing was affected). Score-only — approval/send is untouched.
+    invalidated = int(getattr(confirmation, "invalidated_score_count", 0))
+    view = {**_confirmation_view(confirmation), "invalidatedScoreCount": invalidated}
+    return commit_idempotent(session, idem, view)
 
 
 @router.get("/{business_id}/icp/active")

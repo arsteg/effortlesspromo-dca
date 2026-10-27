@@ -589,6 +589,72 @@ def test_0014_creates_budget_limits_on_a_preexisting_database(clean_schema):
 
 
 @requires_pg
+def test_0015_adds_score_staleness_columns_on_a_preexisting_database(clean_schema):
+    """DCA-043 — the 0015 add-column branch (for a DB migrated before the score-staleness columns).
+
+    A fresh DB gets ``prospect_candidates`` WITH ``score_status``/``scored_targeting_version`` from the
+    metadata baseline (0001), so 0015 is a no-op there. To exercise 0015's real job, upgrade to head,
+    DROP the two columns, seed one pre-existing row, stamp history back to 0014, then upgrade to head
+    again — 0015 must re-add exactly those columns and backfill the existing row's ``score_status`` to
+    ``current`` (no new table, nothing leaked).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "prospect_candidates" DROP COLUMN "scored_targeting_version", '
+                'DROP COLUMN "score_status"'
+            )
+        )
+        # Seed one pre-existing (pre-staleness) candidate row to prove the backfill. The parent
+        # discovery_run is seeded first to satisfy the run_id foreign key.
+        conn.execute(
+            text(
+                "INSERT INTO discovery_runs "
+                "(id, business_id, status, source_keys, found, screened_out, suggested, started_at) "
+                "VALUES ('run-legacy', 'biz-legacy', 'completed', '[]', 1, 0, 1, now())"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO prospect_candidates "
+                "(id, business_id, run_id, org_name, org_identifier, contact, source_key, "
+                "source_ref, trust_tier, match_score, rationale, status, created_at) VALUES "
+                "('cand-legacy', 'biz-legacy', 'run-legacy', 'Legacy Co', 'ID-LEGACY', '{}', "
+                "'synthetic.mca', 'synthetic://x', 'official_registry', 1.0, '', 'suggested', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0014_budget_limits")  # pretend we predate the score-staleness columns
+    command.upgrade(cfg, "head")  # 0015 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("prospect_candidates", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT score_status, scored_targeting_version FROM prospect_candidates "
+                "WHERE id = 'cand-legacy'"
+            )
+        ).first()
+    eng.dispose()
+    assert {"score_status", "scored_targeting_version"}.issubset(cols)  # columns re-added
+    assert backfilled == (
+        "current",
+        None,
+    )  # pre-existing row backfilled to a current, unversioned score
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 
