@@ -52,6 +52,13 @@ Product/design brief: `../../docs/research/data-acquisition-agent/AGENT-DEVELOPM
   PENDING with its identity intact; a 4xx is a surfaced denial that also changes no state. **Off by
   default** (needs the transport + `platform_outbox_publish_path`); no live relay route is wired —
   driven against the DCA-033 fake server in tests. See `docs/DCA-034-*.md`.
+- Request idempotency (DCA-035, `app/idempotency/`, `app/api/idempotency.py`): a write route carrying
+  an `Idempotency-Key` header runs **at most once** — a byte-identical retry replays the first
+  response (`Idempotent-Replay: true`) with no second state change; the same key reused for a
+  different body is rejected (`409 idempotency_key_reuse`); keys never collide across tenants or
+  routes. The stored record (`idempotency_records`, tenant-owned + RLS) is committed **atomically**
+  with the business change, so a concurrent duplicate loses the unique-constraint race and replays
+  the winner's result. Opt-in: no key ⇒ served normally. See `docs/DCA-035-*.md`.
 
 - Database sessions: a **sync** engine backs the SQLite-friendly dev/test surface; an **async**
   engine (`app/db/base.py` `make_async_engine` / `transactional_session`, dependency

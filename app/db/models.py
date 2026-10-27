@@ -457,6 +457,61 @@ class RevisionPendingEvent(TenantOwned, Base):
     received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class IdempotencyRecord(TenantOwned, Base):
+    """DCA-035 — a durable, tenant/route-scoped request-idempotency record (tenant-owned).
+
+    Protects a *mutation request* against accidental re-execution (a client retry, a double
+    submit, a network hiccup). One record is the stored outcome of one logical write, identified by
+    the caller's ``Idempotency-Key`` within a single ``(business_id, method, route)`` — so the key is
+    scoped to the tenant AND the route, never global.
+
+    Three load-bearing columns, mirroring the platform's idempotency discipline (BR-124):
+
+    - ``idempotency_key`` — the caller-supplied key (an ``Idempotency-Key`` header), opaque to us.
+    - ``request_digest`` — a SHA-256 of the request body bytes. A replay of the SAME key MUST carry
+      the SAME body: a matching digest returns the stored result; a *different* digest is a key reuse
+      and is rejected (``409``), never silently served the first call's result.
+    - ``response_status`` / ``response_body`` — the stored outcome. A replay returns these verbatim,
+      so a retried write produces exactly the first call's response and NO second state change.
+
+    The record is staged into the *caller's* session (like the DCA-026/027/028 sinks) and committed
+    in the SAME unit of work as the business change it records, so the write and its idempotency
+    receipt are atomic: a replay that loses a race on the unique constraint rolls back its own
+    (duplicate) change along with the rejected record, and then returns the winner's stored result —
+    the effect is applied exactly once.
+
+    ``(business_id, method, route, idempotency_key)`` is unique, so the same key reused for the same
+    route within one tenant is constrained (the row that makes a retry a replay), while two tenants —
+    or two routes — may legitimately use the same key and neither constrains the other.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 row-level-security
+    policy like every other tenant data table. Only opaque control fields of the route's own response
+    are stored (ids / statuses / flags), never contact data.
+    """
+
+    __tablename__ = "idempotency_records"
+    # The key is unique PER tenant AND route+method: a client's key scopes to one logical operation on
+    # one business; the same key may recur on another route or another tenant without colliding.
+    __table_args__ = (
+        tenant_unique("method", "route", "idempotency_key", name="uq_idempotency_key"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The caller-supplied Idempotency-Key header value (opaque). Scoped per (business, method, route).
+    idempotency_key: Mapped[str] = mapped_column(String(200), index=True)
+    # The mutating HTTP method (POST/PUT/PATCH/DELETE) — part of the per-operation scope.
+    method: Mapped[str] = mapped_column(String(8))
+    # The route template (or path) the key was used on — the "route-scoped" half of the dedup key.
+    route: Mapped[str] = mapped_column(String(300))
+    # SHA-256 (hex) of the request body bytes: same key + same body replays; same key + different body
+    # is rejected as a key reuse.
+    request_digest: Mapped[str] = mapped_column(String(64))
+    # The stored outcome replayed verbatim on a matching retry (no second state change).
+    response_status: Mapped[int] = mapped_column(Integer, default=200)
+    response_body: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AiInvocation(TenantOwned, Base):
     """Durable record of every effortlesspromo-ai gateway call made by this service (B2/B4)."""
 

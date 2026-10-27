@@ -2717,6 +2717,130 @@ def _dca_034(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-035",
+    "request idempotency: repeat an A write (replay, no 2nd change), same key + different body "
+    "(409), then reuse the key for B (no cross-tenant collision)",
+)
+def _dca_035(ctx: CheckContext) -> dict:
+    """Drive the real DCA-035 request idempotency over the HTTP API against synthetic A/B, following
+    the developer manual-test steps:
+
+      1. register A and B;
+      2. PUT A's config with an Idempotency-Key -> the first result;
+      3. REPEAT the exact request + key -> the SAME result, served as a replay (no second state
+         change: an out-of-band write in between is NOT overwritten by the replay);
+      4. same key, DIFFERENT body -> rejected 409 'idempotency_key_reuse', changing nothing;
+      5. REUSE the same key for B -> B's own result (the key does not collide across tenants).
+
+    Local synthetic only (AI disabled, ephemeral DB); every call is shown with its real body so a
+    human can compare against the acceptance criteria rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.idempotency import IDEMPOTENCY_HEADER
+    from app.main import create_app
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    key = "cfg-key-1"
+
+    def keyed() -> dict:
+        return {**auth, IDEMPOTENCY_HEADER: key}
+
+    def config(client, biz) -> dict:
+        return client.get(f"/v1/tenants/{biz}/config", headers=auth).json()
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        for biz in (biz_a, biz_b):
+            client.post("/v1/tenants", json={"businessId": biz}, headers=auth)
+
+        body = {"dataMode": "suggest_platform_data", "enabled": True}
+
+        # 2) first write with the key
+        first = client.put(f"/v1/tenants/{biz_a}/config", json=body, headers=keyed())
+        print(
+            f"\n1) PUT A config (key={key})            -> HTTP {first.status_code} {first.json()}"
+        )
+        out["first"] = {"status": first.status_code, "body": first.json()}
+
+        # out-of-band write (no key) moves A's config elsewhere, to prove the replay does NOT re-run
+        client.put(
+            f"/v1/tenants/{biz_a}/config",
+            json={"dataMode": "my_data_only", "enabled": False},
+            headers=auth,
+        )
+        moved = config(client, biz_a)
+        print(f"   out-of-band write (no key) moves A    -> dataMode={moved['dataMode']}")
+
+        # 3) repeat the exact first request + key -> replay of the first result, no re-run
+        replay = client.put(f"/v1/tenants/{biz_a}/config", json=body, headers=keyed())
+        after = config(client, biz_a)
+        print(
+            f"2) REPEAT A config (same key+body)     -> HTTP {replay.status_code} {replay.json()} "
+            f"replay_header={replay.headers.get('Idempotent-Replay')}"
+        )
+        print(
+            f"   A config after replay                 -> dataMode={after['dataMode']} "
+            f"(unchanged by the replay - handler did not run)"
+        )
+        out["replay"] = {
+            "status": replay.status_code,
+            "body": replay.json(),
+            "is_replay": replay.headers.get("Idempotent-Replay") == "true",
+            "matched_first_result": replay.json() == first.json(),
+            "no_second_change": after["dataMode"] == "my_data_only" and after["enabled"] is False,
+        }
+
+        # 4) same key, different body -> rejected, nothing changed
+        before = config(client, biz_a)
+        reuse = client.put(
+            f"/v1/tenants/{biz_a}/config", json={"dataMode": "my_data_only"}, headers=keyed()
+        )
+        print(
+            f"3) same key, DIFFERENT body            -> HTTP {reuse.status_code} "
+            f"{reuse.json()['error']['message']}"
+        )
+        out["conflict"] = {
+            "status": reuse.status_code,
+            "message": reuse.json()["error"]["message"],
+            "changed_nothing": config(client, biz_a) == before,
+        }
+
+        # 5) reuse the SAME key for B -> B's own result, no collision with A
+        b_resp = client.put(f"/v1/tenants/{biz_b}/config", json=body, headers=keyed())
+        print(
+            f"4) REUSE key for B                     -> HTTP {b_resp.status_code} {b_resp.json()} "
+            f"replay_header={b_resp.headers.get('Idempotent-Replay')}"
+        )
+        out["cross_tenant"] = {
+            "status": b_resp.status_code,
+            "business_id": b_resp.json().get("businessId"),
+            "is_own_result": b_resp.json().get("businessId") == biz_b,
+            "not_a_replay": b_resp.headers.get("Idempotent-Replay") is None,
+        }
+    finally:
+        app.state.engine.dispose()
+
+    print(
+        "\nchecks: "
+        f"replay_same_result={out['replay']['matched_first_result'] and out['replay']['is_replay']}  "
+        f"no_second_state_change={out['replay']['no_second_change']}  "
+        f"reuse_rejected={out['conflict']['status'] == 409 and out['conflict']['changed_nothing']}  "
+        f"no_cross_tenant_collision="
+        f"{out['cross_tenant']['is_own_result'] and out['cross_tenant']['not_a_replay']}"
+    )
+    print(
+        "\n(local synthetic only; no AI/paid action; the rejected reuse and the replay both changed "
+        "no state beyond the first accepted write)"
+    )
+    return out
+
+
 # --------------------------------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------------------------------

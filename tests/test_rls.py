@@ -50,6 +50,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "inbox_receipts",
         "revision_projections",
         "revision_pending_events",
+        "idempotency_records",
     }
 
 

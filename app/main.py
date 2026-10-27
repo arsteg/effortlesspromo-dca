@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.idempotency import install_idempotency
 from app.api.routes import auth, authz, health, service_integration, tenants
 from app.core.config import Settings, get_settings, validate_required
 from app.core.errors import install_error_handling
@@ -97,6 +98,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(CorrelationIdMiddleware)
     # DCA-011: one standardized error envelope + correlation id for every error response.
     install_error_handling(app)
+    # DCA-035: replay a known idempotent request's stored response verbatim (registered after the
+    # envelope handlers so the specific IdempotencyReplay type wins over the catch-all).
+    install_idempotency(app)
     app.include_router(health.router)
     app.include_router(tenants.router)
     app.include_router(auth.router)

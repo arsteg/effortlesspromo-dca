@@ -37,6 +37,7 @@ DCA_TABLES = {
     "inbox_receipts",
     "revision_projections",
     "revision_pending_events",
+    "idempotency_records",
 }
 
 
@@ -318,6 +319,48 @@ def test_0008_creates_revision_tables_on_a_preexisting_database(clean_schema):
         "revision_projections",
         "revision_pending_events",
     }  # RLS re-established on both, not just the bare tables
+
+
+@requires_pg
+def test_0009_creates_idempotency_records_on_a_preexisting_database(clean_schema):
+    """DCA-035 — the 0009 create branch (for a DB migrated before ``idempotency_records`` existed).
+
+    Same shape as the 0005/0006/0007/0008 tests: a fresh DB gets the table from the metadata baseline
+    (0001) and its RLS policy from 0002, so 0009 is a no-op there. To exercise 0009's real job, upgrade
+    to head, drop the table + policy, stamp history back to 0008, then upgrade to head again — 0009
+    must recreate the table (with its unique key constraint) AND its tenant-isolation policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "idempotency_records" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0008_revision_projections")  # pretend we predate the idempotency table
+    command.upgrade(cfg, "head")  # 0009 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "idempotency_records" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("idempotency_records", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'idempotency_records' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_idempotency_key" in uniques  # the per-tenant/route key-reuse constraint travelled
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg

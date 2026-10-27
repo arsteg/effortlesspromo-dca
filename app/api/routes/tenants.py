@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_session
+from app.api.idempotency import IdempotencyContext, commit_idempotent, idempotency
 from app.core.security import require_service_auth
 from app.db.models import DataMode, DiscoveryRun, IcpProfile, ProspectCandidate, TenantAgent
 from app.services.discovery import REASON_FEATURE_DISABLED, DiscoveryError, run_discovery
@@ -29,6 +30,10 @@ router = APIRouter(
 )
 
 SessionDep = Annotated[Session, Depends(get_session)]
+# DCA-035: a write route takes this to make itself retry-safe. A request carrying an Idempotency-Key
+# replays its stored result (no second state change) or is rejected if the key is reused for a
+# different body; a request with no key is served normally (the context is a no-op).
+IdempotencyDep = Annotated[IdempotencyContext, Depends(idempotency)]
 
 
 class RegisterTenant(BaseModel):
@@ -71,37 +76,38 @@ def _tenant(session: Session, business_id: str) -> TenantAgent:
 
 
 @router.post("", status_code=201)
-def register(body: RegisterTenant, request: Request, session: SessionDep) -> dict:
+def register(
+    body: RegisterTenant, request: Request, session: SessionDep, idem: IdempotencyDep
+) -> dict:
     settings = request.app.state.settings
     if body.country not in settings.allowed_countries:
         raise HTTPException(status_code=422, detail="country_not_allowed: this build is India-only")
     existing = session.scalar(select(TenantAgent).where(TenantAgent.business_id == body.businessId))
     if existing is not None:
-        return {"businessId": existing.business_id, "enabled": existing.enabled, "created": False}
+        result = {"businessId": existing.business_id, "enabled": existing.enabled, "created": False}
+        return commit_idempotent(session, idem, result, status_code=201)
     tenant = TenantAgent(business_id=body.businessId, country=body.country, enabled=False)
     session.add(tenant)
-    session.commit()
-    return {"businessId": tenant.business_id, "enabled": tenant.enabled, "created": True}
+    result = {"businessId": tenant.business_id, "enabled": tenant.enabled, "created": True}
+    return commit_idempotent(session, idem, result, status_code=201)
 
 
 @router.post("/{business_id}/enable")
-def enable(business_id: str, session: SessionDep) -> dict:
+def enable(business_id: str, session: SessionDep, idem: IdempotencyDep) -> dict:
     tenant = _tenant(session, business_id)
     tenant.enabled = True
-    session.commit()
-    return {"businessId": business_id, "enabled": True}
+    return commit_idempotent(session, idem, {"businessId": business_id, "enabled": True})
 
 
 @router.post("/{business_id}/disable")
-def disable(business_id: str, session: SessionDep) -> dict:
+def disable(business_id: str, session: SessionDep, idem: IdempotencyDep) -> dict:
     tenant = _tenant(session, business_id)
     tenant.enabled = False
-    session.commit()
-    return {"businessId": business_id, "enabled": False}
+    return commit_idempotent(session, idem, {"businessId": business_id, "enabled": False})
 
 
 @router.put("/{business_id}/icp")
-def upsert_icp(business_id: str, body: IcpBody, session: SessionDep) -> dict:
+def upsert_icp(business_id: str, body: IcpBody, session: SessionDep, idem: IdempotencyDep) -> dict:
     _tenant(session, business_id)
     icp = session.scalar(select(IcpProfile).where(IcpProfile.business_id == business_id))
     if icp is None:
@@ -112,8 +118,8 @@ def upsert_icp(business_id: str, body: IcpBody, session: SessionDep) -> dict:
     icp.industries, icp.regions = body.industries, body.regions
     icp.roles, icp.exclusions = body.roles, body.exclusions
     icp.status = body.status
-    session.commit()
-    return {"businessId": business_id, "version": icp.version, "status": icp.status}
+    result = {"businessId": business_id, "version": icp.version, "status": icp.status}
+    return commit_idempotent(session, idem, result)
 
 
 @router.get("/{business_id}/config")
@@ -122,7 +128,9 @@ def get_config(business_id: str, session: SessionDep) -> dict:
 
 
 @router.put("/{business_id}/config")
-def put_config(business_id: str, body: AgentConfigBody, session: SessionDep) -> dict:
+def put_config(
+    business_id: str, body: AgentConfigBody, session: SessionDep, idem: IdempotencyDep
+) -> dict:
     tenant = _tenant(session, business_id)
     # Auto-accept is a later story and stays disabled — never settable here.
     if body.autoAccept:
@@ -135,8 +143,7 @@ def put_config(business_id: str, body: AgentConfigBody, session: SessionDep) -> 
     tenant.data_mode = mode.value
     if body.enabled is not None:
         tenant.enabled = body.enabled
-    session.commit()
-    return _config_view(tenant)
+    return commit_idempotent(session, idem, _config_view(tenant))
 
 
 @router.post("/{business_id}/discovery/run")
@@ -216,7 +223,9 @@ def _candidate(session: Session, business_id: str, candidate_id: str) -> Prospec
 
 
 @router.post("/{business_id}/candidates/{candidate_id}/accept")
-def accept_candidate(business_id: str, candidate_id: str, session: SessionDep) -> dict:
+def accept_candidate(
+    business_id: str, candidate_id: str, session: SessionDep, idem: IdempotencyDep
+) -> dict:
     candidate = _candidate(session, business_id, candidate_id)
     if candidate.status != "suggested":
         raise HTTPException(status_code=409, detail=f"candidate is {candidate.status}")
@@ -228,20 +237,21 @@ def accept_candidate(business_id: str, candidate_id: str, session: SessionDep) -
         session.commit()
         raise HTTPException(status_code=409, detail="candidate is expired")
     candidate.status = "accepted"
-    session.commit()
-    return {
+    result = {
         "id": candidate.id,
         "status": candidate.status,
         "consent": False,
         "note": "acceptance is not recipient consent; sending rights are platform-gated",
     }
+    return commit_idempotent(session, idem, result)
 
 
 @router.post("/{business_id}/candidates/{candidate_id}/dismiss")
-def dismiss_candidate(business_id: str, candidate_id: str, session: SessionDep) -> dict:
+def dismiss_candidate(
+    business_id: str, candidate_id: str, session: SessionDep, idem: IdempotencyDep
+) -> dict:
     candidate = _candidate(session, business_id, candidate_id)
     if candidate.status not in ("suggested", "accepted"):
         raise HTTPException(status_code=409, detail=f"candidate is {candidate.status}")
     candidate.status = "dismissed"
-    session.commit()
-    return {"id": candidate.id, "status": candidate.status}
+    return commit_idempotent(session, idem, {"id": candidate.id, "status": candidate.status})
