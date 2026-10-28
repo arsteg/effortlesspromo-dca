@@ -9343,6 +9343,500 @@ def execute(args: argparse.Namespace) -> RunResult:
     )
 
 
+@register(
+    "DCA-074",
+    "persist SCOPED consent evidence: Business A records a person + an email contact point, captures "
+    "the opt-in FORM proof as a DCA-062 evidence object, then stores a COMPLETE permission receipt "
+    "scoped to brand + contact point + channel + purpose + notice/form version + action + language + "
+    "time — grounded in that evidence. A flag-only import (a 'subscribed' flag with NO evidence) is "
+    "refused and stages nothing (permissions are not global contact attributes). The same email "
+    "recorded by Business B carries NO permission, and B cannot read A's receipt by id. Each record "
+    "stages an atomic DCA-026 audit entry whose references never carry the raw email; no prospect/host "
+    "record is created and acting on a permission stays disabled",
+)
+def _dca_074(ctx: CheckContext) -> dict:
+    """Store and screen consent receipts against a disposable DB (manual-test step 2):
+
+      1. Business A records a tenant-private person + email contact point, catalogues a first-party
+         opt-in source, and captures the FORM SUBMISSION as a DCA-062 evidence object (the proof);
+      2. A stores a COMPLETE permission receipt (brand + contact point + channel + purpose + notice/
+         form version + action + language + time) grounded in that evidence — a valid receipt;
+      3. a FLAG-ONLY import (the same contact point marked 'subscribed' but carrying NO evidence) is
+         refused with ``missing_evidence`` and stages nothing — a permission is never a global flag;
+      4. Business B records the SAME email for its own person but grants nothing: B holds no receipt
+         and cannot read A's receipt by id (tenant isolation);
+      5. each stored receipt staged an atomic DCA-026 audit entry whose references never carry the raw
+         email, and no prospect/host record was created.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    Recording a permission is wired into no send path: acting on it stays a disabled future capability.
+    """
+    from datetime import UTC, datetime
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import AuditEvent, ConsentReceipt, ProspectCandidate
+    from app.services.consent_receipt import (
+        AUDIT_ACTION_RECORD_RECEIPT,
+        REASON_MISSING_EVIDENCE,
+        ConsentReceiptError,
+        ConsentReceiptInput,
+        ConsentReceiptStore,
+    )
+    from app.services.contact_point import ContactPointInput, ContactPointStore, PersonInput
+    from app.services.evidence_store import EvidenceInput, EvidenceObjectStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0074", type=ActorType.USER)
+    when = datetime(2026, 10, 25, 14, 30, tzinfo=UTC)
+    email = "priya@synthetic.example"
+    form_raw = '{"form": "newsletter_optin_v3", "subscribed": true, "ts": "2026-10-25T14:30:00Z"}'
+
+    def _seed_source(session, key):
+        if SourceCatalogStore(session).get(key) is not None:
+            return 1
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="api",
+                name="Synthetic Opt-in Form",
+                india_coverage={"nationwide": True},
+            )
+        )
+        return (
+            SourceTermsStore(session)
+            .add_version(
+                SourceTermsInput(
+                    source_key=key,
+                    operations={"collect": True, "store": True},
+                    purposes=["prospecting"],
+                    retention={"max_days": 3650, "policy": "retain"},
+                    contract_evidence={
+                        "reference": "LIC-1",
+                        "kind": "licence",
+                        "uri": "file://lic",
+                    },
+                )
+            )
+            .version
+        )
+
+    def _capture(session, business_id, person_id, ver):
+        return (
+            EvidenceObjectStore(session, business_id)
+            .store(
+                EvidenceInput(
+                    source_key="optin_form",
+                    source_version=ver,
+                    content_kind="optin_record",
+                    content_ref="https://synthetic.example/forms/newsletter/submission/42",
+                    raw_content=form_raw,
+                    captured_at=when,
+                    rights_basis="self_reported_optin;purpose=marketing_email",
+                    content_media_type="application/json",
+                    subject_type="person",
+                    subject_id=person_id,
+                ),
+                actor=actor,
+            )
+            .id
+        )
+
+    def _receipt(cp_id, evidence_id, **over):
+        base = dict(
+            brand_key="AcmeNewsletter",
+            contact_point_id=cp_id,
+            channel="email",
+            purpose="marketing_email",
+            action="grant",
+            notice_version="notice-2026.3",
+            form_version="newsletter_optin_v3",
+            language="en",
+            evidence_id=evidence_id,
+            collected_at=when,
+        )
+        base.update(over)
+        return ConsentReceiptInput(**base)
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b}
+
+    # 1-3) A captures the form proof, stores a COMPLETE receipt, and a flag-only import is refused.
+    with ctx.session_factory() as session:
+        cp_store = ContactPointStore(session, biz_a)
+        person = cp_store.create_person(PersonInput(display_name="Priya Synthetic"), actor=actor)
+        cp = cp_store.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person.id,
+                channel="email",
+                value=email,
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        ver = _seed_source(session, "optin_form")
+        ev_id = _capture(session, biz_a, person.id, ver)
+        store = ConsentReceiptStore(session, biz_a)
+        receipt = store.record(_receipt(cp.id, ev_id), actor=actor)
+
+        flag_only_code = None
+        try:
+            # A flag-only import: it "knows" the contact is subscribed but carries no evidence.
+            store.record(_receipt(cp.id, evidence_id=""), actor=actor)
+        except ConsentReceiptError as exc:
+            flag_only_code = exc.code
+        session.commit()
+        a_receipt_id = receipt.id
+
+    with ctx.session_factory() as session:
+        row = ConsentReceiptStore(session, biz_a).get(a_receipt_id)
+        assert row is not None
+        out["complete_receipt"] = {
+            "brand_key": row.brand_key,
+            "subject_type": row.subject_type,
+            "channel": row.channel,
+            "purpose": row.purpose,
+            "action": row.action,
+            "notice_version": row.notice_version,
+            "form_version": row.form_version,
+            "language": row.language,
+            "grounded_in_evidence": bool(row.evidence_id),
+            "has_collected_at": row.collected_at is not None,
+        }
+        out["flag_only_import"] = {
+            "refusal_code": flag_only_code,
+            "receipt_rows_total": session.query(ConsentReceipt).count(),
+        }
+
+    # 4) B records the SAME email but grants nothing; B cannot read A's receipt by id.
+    with ctx.session_factory() as session:
+        cp_store_b = ContactPointStore(session, biz_b)
+        person_b = cp_store_b.create_person(PersonInput(display_name="Someone Else"), actor=actor)
+        cp_store_b.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person_b.id,
+                channel="email",
+                value=email,  # the SAME value A holds a permission for
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        session.commit()
+
+    with ctx.session_factory() as session:
+        store_b = ConsentReceiptStore(session, biz_b)
+        out["tenant_isolation"] = {
+            "b_receipt_count_for_same_email": len(store_b.receipts()),
+            "b_can_read_a_receipt_by_id": store_b.get(a_receipt_id) is not None,
+        }
+
+    # 5) atomic audit without the raw email + no prospect/host record.
+    with ctx.session_factory() as session:
+        audits = (
+            session.query(AuditEvent).filter(AuditEvent.action == AUDIT_ACTION_RECORD_RECEIPT).all()
+        )
+        out["audit_and_promotion"] = {
+            "receipt_audit_entries": len(audits),
+            "raw_email_in_any_audit": any(email in (repr(a.references) + a.reason) for a in audits),
+            "consent_receipt_rows": session.query(ConsentReceipt).count(),
+            "prospect_candidates": session.query(ProspectCandidate).count(),
+        }
+
+    print("\n1-2) a COMPLETE permission receipt, grounded in captured evidence:")
+    for k, v in out["complete_receipt"].items():
+        print(f"     {k:24} = {v}")
+    print("\n3) a flag-only import (no evidence) is refused and stages nothing:")
+    for k, v in out["flag_only_import"].items():
+        print(f"     {k:24} = {v}")
+    print(
+        "\n4) tenant isolation (same email in B holds no permission; A's receipt invisible to B):"
+    )
+    for k, v in out["tenant_isolation"].items():
+        print(f"     {k:34} = {v}")
+    print("\n5) atomic audit without the raw email + no prospect/host record:")
+    for k, v in out["audit_and_promotion"].items():
+        print(f"     {k:30} = {v}")
+
+    checks = {
+        "complete_receipt_stored_with_full_scope": out["complete_receipt"]["grounded_in_evidence"]
+        is True
+        and out["complete_receipt"]["action"] == "grant"
+        and out["complete_receipt"]["channel"] == "email"
+        and out["complete_receipt"]["notice_version"] == "notice-2026.3",
+        "flag_only_import_rejected": out["flag_only_import"]["refusal_code"]
+        == REASON_MISSING_EVIDENCE,
+        "only_the_evidenced_receipt_persisted": out["flag_only_import"]["receipt_rows_total"] == 1,
+        "same_email_in_b_holds_no_permission": out["tenant_isolation"][
+            "b_receipt_count_for_same_email"
+        ]
+        == 0,
+        "b_cannot_read_a_receipt": out["tenant_isolation"]["b_can_read_a_receipt_by_id"] is False,
+        "raw_email_never_audited": out["audit_and_promotion"]["raw_email_in_any_audit"] is False,
+        "no_prospect_or_host_record": out["audit_and_promotion"]["prospect_candidates"] == 0,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A permission is persisted as a SCOPED, EVIDENCED "
+        "receipt — brand + contact point + channel + purpose + notice/form version + action + language "
+        "+ time — grounded in a captured DCA-062 evidence object. An imported 'subscribed' flag with no "
+        "evidence creates NO valid receipt: permissions are never global contact attributes. Receipts "
+        "are tenant-private — the same email in another business holds no permission and one tenant can "
+        "never read another's receipt. Each record stages an atomic audit entry that never carries the "
+        "raw contact value; no prospect/host record is created. Wired into no send path: acting on a "
+        "permission stays a disabled future capability.)"
+    )
+    return out
+
+
+@register(
+    "DCA-075",
+    "derive CURRENT permission state from the versioned receipt/withdrawal history: Business A records "
+    "a grant then a withdrawal for one scope (brand + email contact point + channel + purpose); a "
+    "delayed OLD grant (collected before the withdrawal, recorded AFTER it) and a duplicate of the "
+    "grant are then appended. The projection — ordered by the subject's action time, not the recording "
+    "order — stays WITHDRAWN: the out-of-order late grant and the duplicate cannot revive permission. "
+    "A separate channel/purpose scope granted in parallel stays GRANTED (scopes are distinct). The full "
+    "event history is preserved and nothing is mutated; the same inputs reproduce the same state",
+)
+def _dca_075(ctx: CheckContext) -> dict:
+    """Project current permission from the append-only consent timeline (manual-test step 2):
+
+      1. Business A captures the opt-in FORM proof and records a COMPLETE grant receipt, then a
+         withdrawal, for ONE scope (brand + email contact point + channel=email + purpose=marketing);
+      2. a DELAYED OLD grant (collected on day 0, recorded on day 9 — out of order) and a DUPLICATE of
+         the original grant are appended to the SAME contact point's timeline;
+      3. the current permission state is derived over the stored receipts: it stays WITHDRAWN — the
+         out-of-order late grant is superseded and the duplicate is ignored, so neither revives it;
+      4. a parallel grant on a DIFFERENT (channel, purpose) scope stays GRANTED — channel/purpose
+         scopes are distinct;
+      5. the full event history is preserved (no rows deleted) and the projection mutates nothing;
+         re-deriving the same events reproduces the same state.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    Deriving a permission state is wired into no send path: acting on it stays a disabled future
+    capability behind the one send pipeline.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.consent import (
+        REASON_DUPLICATE_IGNORED,
+        REASON_LATE_GRANT_SUPERSEDED,
+        PermissionState,
+        derive_permission_state,
+        events_from_receipts,
+        project_permission_states,
+    )
+    from app.db.models import ConsentReceipt
+    from app.services.consent_receipt import ConsentReceiptInput, ConsentReceiptStore
+    from app.services.contact_point import ContactPointInput, ContactPointStore, PersonInput
+    from app.services.evidence_store import EvidenceInput, EvidenceObjectStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0075", type=ActorType.USER)
+    t0 = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    email = "priya@synthetic.example"
+    form_raw = '{"form": "newsletter_optin_v3", "subscribed": true, "ts": "2026-10-01T09:00:00Z"}'
+
+    def _seed_source(session, key):
+        if SourceCatalogStore(session).get(key) is not None:
+            return 1
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="api",
+                name="Synthetic Opt-in Form",
+                india_coverage={"nationwide": True},
+            )
+        )
+        return (
+            SourceTermsStore(session)
+            .add_version(
+                SourceTermsInput(
+                    source_key=key,
+                    operations={"collect": True, "store": True},
+                    purposes=["prospecting"],
+                    retention={"max_days": 3650, "policy": "retain"},
+                    contract_evidence={
+                        "reference": "LIC-1",
+                        "kind": "licence",
+                        "uri": "file://lic",
+                    },
+                )
+            )
+            .version
+        )
+
+    def _capture(session, person_id, ver):
+        return (
+            EvidenceObjectStore(session, biz_a)
+            .store(
+                EvidenceInput(
+                    source_key="optin_form",
+                    source_version=ver,
+                    content_kind="optin_record",
+                    content_ref="https://synthetic.example/forms/newsletter/submission/42",
+                    raw_content=form_raw,
+                    captured_at=t0,
+                    rights_basis="self_reported_optin;purpose=marketing_email",
+                    content_media_type="application/json",
+                    subject_type="person",
+                    subject_id=person_id,
+                ),
+                actor=actor,
+            )
+            .id
+        )
+
+    def _receipt(cp_id, evidence_id, **over):
+        base = dict(
+            brand_key="AcmeNewsletter",
+            contact_point_id=cp_id,
+            channel="email",
+            purpose="marketing_email",
+            action="grant",
+            notice_version="notice-2026.3",
+            form_version="newsletter_optin_v3",
+            language="en",
+            evidence_id=evidence_id,
+            collected_at=t0,
+        )
+        base.update(over)
+        return ConsentReceiptInput(**base)
+
+    out: dict = {"business_a": biz_a}
+
+    # 1-2) Record grant → withdrawal, then append an out-of-order OLD grant and a DUPLICATE grant.
+    with ctx.session_factory() as session:
+        cp_store = ContactPointStore(session, biz_a)
+        person = cp_store.create_person(PersonInput(display_name="Priya Synthetic"), actor=actor)
+        cp = cp_store.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person.id,
+                channel="email",
+                value=email,
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        ver = _seed_source(session, "optin_form")
+        ev_id = _capture(session, person.id, ver)
+        store = ConsentReceiptStore(session, biz_a)
+
+        # original grant (collected day 0), then a withdrawal (collected day 5)
+        store.record(_receipt(cp.id, ev_id, action="grant", collected_at=t0), actor=actor)
+        store.record(
+            _receipt(cp.id, ev_id, action="withdraw", collected_at=t0 + timedelta(days=5)),
+            actor=actor,
+        )
+        # an out-of-order OLD grant: collected day 0 again (a late replay of the opt-in)
+        store.record(_receipt(cp.id, ev_id, action="grant", collected_at=t0), actor=actor)
+        session.commit()
+        cp_id = cp.id
+
+    # 3) Derive the current permission state over the stored receipts (ordered by action time).
+    with ctx.session_factory() as session:
+        rows = (
+            session.query(ConsentReceipt)
+            .filter(ConsentReceipt.business_id == biz_a)
+            .filter(ConsentReceipt.contact_point_id == cp_id)
+            .order_by(ConsentReceipt.created_at)
+            .all()
+        )
+        proj = derive_permission_state(events_from_receipts(rows))
+        # re-derive to show reproducibility
+        again = derive_permission_state(events_from_receipts(rows))
+        out["derived_state"] = {
+            "state": proj.state.value,
+            "granted": proj.granted,
+            "effective_action": proj.effective_action,
+            "reasons": list(proj.reasons),
+            "applied_events": len(proj.applied_event_ids),
+            "superseded_events": len(proj.superseded_event_ids),
+            "duplicate_events": len(proj.duplicate_event_ids),
+            "late_grant_superseded": REASON_LATE_GRANT_SUPERSEDED in proj.reasons,
+            "duplicate_ignored": REASON_DUPLICATE_IGNORED in proj.reasons,
+            "reproducible": again.state is proj.state
+            and again.applied_event_ids == proj.applied_event_ids,
+            "history_rows_preserved": session.query(ConsentReceipt)
+            .filter(ConsentReceipt.business_id == biz_a)
+            .count(),
+            "mutated_state": proj.mutated_state,
+        }
+
+    # 4) A parallel grant on a DIFFERENT (channel, purpose) scope stays GRANTED (scopes are distinct).
+    #    Build the two scopes from the stored email-scope receipts plus an in-memory whatsapp grant.
+    with ctx.session_factory() as session:
+        rows = (
+            session.query(ConsentReceipt)
+            .filter(ConsentReceipt.business_id == biz_a)
+            .filter(ConsentReceipt.contact_point_id == cp_id)
+            .all()
+        )
+        events = events_from_receipts(rows)
+        # a distinct scope: same brand/contact point, different channel+purpose, granted and in force
+        from app.consent import PermissionEvent
+
+        events.append(
+            PermissionEvent(
+                receipt_id="wa-grant",
+                brand_key="acmenewsletter",
+                contact_point_id=cp_id,
+                channel="whatsapp",
+                purpose="marketing_whatsapp",
+                action="grant",
+                collected_at=t0,
+                recorded_at=t0,
+            )
+        )
+        states = project_permission_states(events)
+        by_scope = {(s.channel, s.purpose): p.state.value for s, p in states.items()}
+        out["scope_distinctness"] = {
+            "email/marketing_email": by_scope.get(("email", "marketing_email")),
+            "whatsapp/marketing_whatsapp": by_scope.get(("whatsapp", "marketing_whatsapp")),
+            "distinct_scopes": len(states),
+        }
+
+    print("\n3) current permission state derived over the receipt/withdrawal timeline:")
+    for k, v in out["derived_state"].items():
+        print(f"     {k:26} = {v}")
+    print("\n4) channel/purpose scopes remain distinct (one withdrawn, the other still granted):")
+    for k, v in out["scope_distinctness"].items():
+        print(f"     {k:30} = {v}")
+
+    d = out["derived_state"]
+    checks = {
+        "withdrawn_not_revived": d["state"] == PermissionState.WITHDRAWN.value
+        and d["granted"] is False,
+        "out_of_order_late_grant_superseded": d["late_grant_superseded"] is True,
+        "duplicate_ignored": d["duplicate_ignored"] is True,
+        "history_preserved": d["history_rows_preserved"] == 3,
+        "reproducible_no_mutation": d["reproducible"] is True and d["mutated_state"] is False,
+        "email_scope_withdrawn": out["scope_distinctness"]["email/marketing_email"]
+        == PermissionState.WITHDRAWN.value,
+        "whatsapp_scope_still_granted": out["scope_distinctness"]["whatsapp/marketing_whatsapp"]
+        == PermissionState.GRANTED.value,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. The CURRENT permission is PROJECTED from the "
+        "append-only grant/withdrawal receipts — ordered by the subject's action time, not the "
+        "recording order — so an out-of-order late grant and a duplicate cannot revive a withdrawal. "
+        "Channel/purpose scopes stay distinct: a parallel grant on another channel+purpose is "
+        "unaffected. The full event history is preserved and the projection mutates nothing; the same "
+        "events reproduce the same state. Deriving a permission authorizes no send: acting on it stays "
+        "a disabled future capability behind the one send pipeline.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
