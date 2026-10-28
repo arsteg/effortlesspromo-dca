@@ -13118,6 +13118,173 @@ def _dca_092(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-093",
+    "scoped eligibility endpoint: in isolated synthetic Businesses A/B (each privately recording its "
+    "OWN email contact point), call the authenticated POST /v1/tenants/{business}/eligibility/email — "
+    "(1) A evaluating A's OWN address returns an EXPIRING decision (eligible, with ttlSeconds + "
+    "expiresAt + evidence/version refs); (2) B evaluating A's EXACT address reads 404 "
+    "'contact_point_not_found' — a caller cannot evaluate another business's hidden contact; (3) an "
+    "UNAVAILABLE authoritative suppression view yields outcome 'review', and REVIEW is NOT activation "
+    "permission (activation.eligible=False); (4) no consent in force is a determinate 'blocked'; (5) "
+    "even an ELIGIBLE outcome never authorizes a send (activation.authorizesSend=False). Re-running A's "
+    "query reproduces the identical decision and changes no state. Only the email channel is wired; "
+    "other known channels (whatsapp/mobile) stay explicitly disabled ('channel_not_enabled'). Local "
+    "synthetic; no AI/paid action, "
+    "no network, no send.",
+)
+def _dca_093(ctx: CheckContext) -> dict:
+    """Drive the real HTTP eligibility contract: tenant-scoped resolution (A's contact is invisible to
+    B), the three-state fold (eligible/review/blocked) with REVIEW never activation permission, and the
+    expiring + evidence-bearing response — read-only, reproducible, no send."""
+    from fastapi.testclient import TestClient
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.main import create_app
+
+    biz_a = "11111111-1111-1111-1111-11111111a093"
+    biz_b = "22222222-2222-2222-2222-22222222b093"
+    email_a = "owner@acme-synthetic.example"
+    email_b = "owner@globex-synthetic.example"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0093", type=ActorType.USER)
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        return _run_dca_093(client, app, biz_a, biz_b, email_a, email_b, actor, auth)
+    finally:
+        # Release the app's engine so the ephemeral SQLite file can be unlinked on Windows.
+        app.state.engine.dispose()
+
+
+def _run_dca_093(client, app, biz_a, biz_b, email_a, email_b, actor, auth) -> dict:
+    from datetime import UTC, datetime, timedelta
+
+    from app.services.contact_point import (
+        ContactPointInput,
+        ContactPointStore,
+        PersonInput,
+    )
+
+    # Register both tenants, then each privately records its OWN email contact point (tenant-private;
+    # there is no global index on the value, so A's address is unreachable from B).
+    for biz in (biz_a, biz_b):
+        assert client.post("/v1/tenants", json={"businessId": biz}, headers=auth).status_code == 201
+    with app.state.session_factory() as session:
+        for biz, email in ((biz_a, email_a), (biz_b, email_b)):
+            store = ContactPointStore(session, biz)
+            person = store.create_person(PersonInput(display_name="Synthetic Owner"), actor=actor)
+            store.add_contact_point(
+                ContactPointInput(
+                    person_observation_id=person.id,
+                    channel="email",
+                    value=email,
+                    evidence="self_reported",
+                ),
+                actor=actor,
+            )
+        session.commit()
+
+    def _eligible_body(contact_point: str) -> dict:
+        now = datetime.now(UTC)
+        return {
+            "contactPoint": contact_point,
+            "purpose": "marketing_email",
+            "basis": "consent",
+            "permissionState": "granted",
+            "permissionScopeChannel": "email",
+            "consentCollectedAt": (now - timedelta(days=7)).isoformat(),
+            "sourceRights": {"permitsEmailContact": True},
+            "suppression": {
+                "availability": "available",
+                "version": "supp-v1",
+                "asOf": now.isoformat(),
+                "coveredChannels": ["email"],
+                "suppressedContactPoints": [],
+            },
+            "provider": {"allowed": True},
+        }
+
+    def _call(biz: str, body: dict, channel: str = "email"):
+        return client.post(f"/v1/tenants/{biz}/eligibility/{channel}", json=body, headers=auth)
+
+    # 1) A evaluating its OWN contact -> ELIGIBLE, expiring, with evidence/version references.
+    a_self = _call(biz_a, _eligible_body(email_a))
+    a_body = a_self.json()
+    print(f"\n1) A evaluates A's own address -> {a_self.status_code} outcome={a_body['outcome']}")
+    print(
+        f"   activation={a_body['activation']} ttlSeconds={a_body['ttlSeconds']} "
+        f"expiresAt={a_body['expiresAt']} (> evaluatedAt={a_body['evaluatedAt']})"
+    )
+    print(f"   evidence={a_body['evidence']}")
+
+    # 2) B evaluating A's EXACT address -> 404, never confirming it exists in A.
+    b_cross = _call(biz_b, _eligible_body(email_a))
+    print(
+        f"\n2) B evaluates A's address -> {b_cross.status_code} "
+        f"message={b_cross.json()['error']['message']} (hidden from B)"
+    )
+
+    # 3) Indeterminate suppression (unavailable authoritative view) -> REVIEW, not activation.
+    review_body = _eligible_body(email_a)
+    review_body["suppression"]["availability"] = "unavailable"
+    a_review = _call(biz_a, review_body)
+    r_body = a_review.json()
+    print(
+        f"\n3) A with UNAVAILABLE suppression -> outcome={r_body['outcome']} "
+        f"activation.eligible={r_body['activation']['eligible']} reasons={r_body['reasons']}"
+    )
+
+    # 4) No consent in force -> determinate BLOCKED.
+    blocked_body = _eligible_body(email_a)
+    blocked_body["permissionState"] = "none"
+    a_blocked = _call(biz_a, blocked_body).json()
+    print(
+        f"\n4) A with no consent in force -> outcome={a_blocked['outcome']} "
+        f"reasons={a_blocked['reasons']}"
+    )
+
+    # 5) Reproducible, no state change: re-run (1) and compare the time-independent decision.
+    a_again = _call(biz_a, _eligible_body(email_a)).json()
+    reproduced = all(
+        a_body[k] == a_again[k]
+        for k in ("outcome", "reasons", "blockers", "activation", "recordedContext")
+    )
+
+    # 6) An unwired (but known) channel stays explicitly disabled.
+    unwired = _call(biz_a, _eligible_body(email_a), channel="whatsapp")
+
+    checks = {
+        "a_evaluates_own_contact_eligible": a_self.status_code == 200
+        and a_body["outcome"] == "eligible",
+        "decision_is_expiring": a_body["ttlSeconds"] == 3600
+        and a_body["expiresAt"] > a_body["evaluatedAt"],
+        "evidence_version_references_present": a_body["evidence"]["suppressionVersion"] == "supp-v1"
+        and a_body["evidence"]["permissionState"] == "granted",
+        "b_cannot_evaluate_as_hidden_contact": b_cross.status_code == 404
+        and b_cross.json()["error"]["message"] == "contact_point_not_found",
+        "review_is_not_activation_permission": r_body["outcome"] == "review"
+        and r_body["activation"]["eligible"] is False,
+        "no_consent_is_determinate_blocked": a_blocked["outcome"] == "blocked"
+        and "consent_not_in_force" in a_blocked["reasons"],
+        "eligible_never_authorizes_send": a_body["activation"]["authorizesSend"] is False,
+        "reproduces_with_no_state_change": reproduced,
+        "unwired_channel_disabled": unwired.status_code == 422
+        and unwired.json()["error"]["message"] == "channel_not_enabled",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The endpoint RESOLVES the "
+        "contact point only within the path business — another tenant's private value is invisible and "
+        "reads as 404 — then runs the accepted email evaluator as a PURE function of the caller-supplied "
+        "gate context. REVIEW/BLOCKED never permit activation, and even ELIGIBLE is NOT recipient "
+        "consent and NOT a send authorization: the one send pipeline owns and re-gates the send, which "
+        "stays a disabled future capability. The route reads nothing and writes nothing.)"
+    )
+    return {"a_self": a_body, "b_cross_status": b_cross.status_code, "checks": checks}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
