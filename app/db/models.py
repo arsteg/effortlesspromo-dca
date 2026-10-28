@@ -1658,3 +1658,123 @@ class OrgExternalId(TenantOwned, Base):
     # The identifier value, normalized (trimmed + upper-cased) by the store. A company fact, not contact data.
     value: Mapped[str] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ContactChannel(str, Enum):
+    """DCA-060 — the channel type of a tenant-private contact point (controlled vocabulary).
+
+    A channel names HOW a person would be reached, so a contact point is never an ambiguous bare
+    string. India-oriented set:
+
+    - ``EMAIL`` — an email address.
+    - ``MOBILE`` — a mobile phone number.
+    - ``LANDLINE`` — a fixed-line phone number.
+    - ``WHATSAPP`` — a WhatsApp-reachable number.
+
+    An unrecognized channel is refused by the store — a contact point can never carry an unknown
+    channel. Recording a contact point is NOT consent to use any of these channels; that stays a
+    disabled future capability behind the one send pipeline.
+    """
+
+    EMAIL = "email"
+    MOBILE = "mobile"
+    LANDLINE = "landline"
+    WHATSAPP = "whatsapp"
+
+
+class ContactEvidence(str, Enum):
+    """DCA-060 — the identity evidence behind a tenant-private contact point (controlled vocabulary).
+
+    Evidence records WHY this business believes the contact point belongs to the person — never a
+    model inference about truth, just the provenance class the operator/import asserted:
+
+    - ``SELF_REPORTED`` — the person gave it directly (e.g. filled a form).
+    - ``PUBLIC_LISTING`` — observed on a public website / directory the business has rights to read.
+    - ``IMPORTED`` — came in on a customer-supplied list. An imported value is tenant-private and is
+      **never** automatically promoted to any shared/global data — promotion would be its own story
+      with rights + consent review.
+    - ``VERIFIED`` — the channel itself was confirmed (e.g. a replied-to message / OTP).
+    - ``INFERRED`` — derived by the operator from other evidence; the weakest class.
+
+    An unrecognized evidence class is refused by the store.
+    """
+
+    SELF_REPORTED = "self_reported"
+    PUBLIC_LISTING = "public_listing"
+    IMPORTED = "imported"
+    VERIFIED = "verified"
+    INFERRED = "inferred"
+
+
+class PersonObservation(TenantOwned, Base):
+    """DCA-060 — a tenant-private person observation identity (tenant-owned, RLS-protected).
+
+    One row is ONE person this business has recorded while looking at an organization — a contact /
+    decision-maker it may later want to reach. It is an *identity node* only: a display name, an
+    optional role title, and an optional link to one of THIS business's :class:`OrgObservation`
+    rows (the organization the person belongs to). It is NOT a prospect / host record — no send path,
+    no acquisition — and creating one grants nothing; those stay disabled future capabilities.
+
+    **Tenant-private, never globally visible.** The person is owned by exactly one ``business_id`` and
+    is only ever read within that business (DCA-017/018). The SAME real-world person recorded by two
+    businesses yields TWO independent rows — one per tenant — never a shared global node. Even when two
+    businesses point their organization observations at the SAME external/global organization id (e.g.
+    a shared ``PLATFORM_ORG_ID``), neither business's persons — nor their contact points — are visible
+    to the other: the organization mapping is per-business, so it can never expose A's people to B.
+
+    The actual reachable values (emails / phone numbers) live in a SEPARATE tenant-private table
+    (:class:`ContactPoint`), not inlined here, so an identity never assumes a single primary contact
+    and the value set is kept apart from the identity node.
+    """
+
+    __tablename__ = "person_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The organization observation (an OrgObservation.id within THIS business) this person belongs to;
+    # NULL when not linked. The writer validates it exists in this business — never a cross-tenant link.
+    org_observation_id: Mapped[str | None] = mapped_column(String(36), index=True, default=None)
+    # The person's display name. Tenant-private personal data: kept RLS-protected here, never audited.
+    display_name: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # The person's role/title at the organization (a business fact, e.g. "Procurement Head"); "" when
+    # unknown.
+    role_title: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ContactPoint(TenantOwned, Base):
+    """DCA-060 — a tenant-private contact point for a person observation (tenant-owned, RLS-protected).
+
+    One row is ONE reachable value — a ``channel`` (:class:`ContactChannel`) plus its ``value`` — for a
+    :class:`PersonObservation` within this business, tagged with the identity ``evidence``
+    (:class:`ContactEvidence`) that supports it. Kept apart from the identity node on purpose: a person
+    can carry several contact points (an email and a mobile), and the identity never has to assume a
+    single primary value.
+
+    **Tenant-private; never promoted to shared data.** The value is owned by exactly one ``business_id``
+    and is only ever read within that business. There is NO global index keyed on the value, so the same
+    email recorded by two businesses stays two independent private rows — one tenant can never retrieve
+    another's contact point, even via a shared organization mapping. Nothing in this story copies an
+    imported value into any shared/global table; promotion would be its own rights-and-consent story.
+
+    ``(business_id, channel, value)`` is unique, so within ONE business a given contact point is stored
+    at most once (a duplicate is rejected, never silently re-pointed). The key is PER business: two
+    tenants may legitimately hold the SAME value against their own people and neither constrains the
+    other. The ``value`` is tenant-private contact data — RLS-protected here, and NEVER written to the
+    audit trail (only opaque references are audited).
+    """
+
+    __tablename__ = "contact_points"
+    # A contact point is unique PER business; the same (channel, value) may recur across tenants.
+    __table_args__ = (tenant_unique("channel", "value", name="uq_contact_point"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The person this contact point belongs to (a PersonObservation.id within the same business).
+    person_observation_id: Mapped[str] = mapped_column(String(36), index=True)
+    # email | mobile | landline | whatsapp — the channel this value is reachable on.
+    channel: Mapped[str] = mapped_column(String(16), index=True)
+    # The reachable value, normalized by the store (trimmed; lower-cased for email). Tenant-private
+    # contact data — RLS-protected, never audited, never promoted to shared data.
+    value: Mapped[str] = mapped_column(String(320))
+    # self_reported | public_listing | imported | verified | inferred — the identity-evidence class.
+    evidence: Mapped[str] = mapped_column(String(32), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

@@ -7049,6 +7049,223 @@ def _dca_059(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-060",
+    "store tenant-private contact points: a person observation (optionally linked to one of THIS "
+    "business's organizations) + a SEPARATE tenant-private contact-point table (channel + value + "
+    "identity evidence); store Business A's private email on a person linked to its organization, then "
+    "attempt retrieval from Business B whose OWN organization carries the SAME shared global org id — B "
+    "cannot read A's person or resolve A's private email (no global index exposes it); imported values "
+    "are never promoted to shared data and no prospect/host record is created; a relevant denial "
+    "(cross-tenant org link / duplicate contact point) stages no row; each create stages an atomic "
+    "DCA-026 audit entry that never carries the raw value",
+)
+def _dca_060(ctx: CheckContext) -> dict:
+    """Store and attempt cross-tenant retrieval of a tenant-private contact point against a disposable
+    DB (manual-test step 2):
+
+      1. Business A records an organization observation carrying a SHARED global platform-org id, a
+         person on it, and that person's PRIVATE email contact point (evidence self_reported);
+      2. Business B records its OWN organization observation against the SAME shared global org id;
+      3. attempt retrieval from B: B resolves the shared id to its OWN org (a different row), and B
+         cannot read A's person, A's contact point, A's people-by-org, or resolve A's private email —
+         there is no global index on the value, so A's private email is never reachable from B;
+      4. A still resolves its own private email (case-insensitively);
+      5. relevant denials that change nothing: a person cannot link to another business's organization
+         (person_org_not_found), and a duplicate contact point within A is refused
+         (duplicate_contact_point); neither stages a row;
+      6. imported values are never promoted: an IMPORTED contact point lives only in A's private tables
+         and creates no prospect/host record; each create staged an atomic DCA-026 audit entry whose
+         references never carry the raw email value.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    Recording a contact point is wired into no acquisition/send path: future capabilities stay disabled.
+    """
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import AuditEvent, ContactPoint, PersonObservation, ProspectCandidate
+    from app.services.contact_point import (
+        AUDIT_ACTION_RECORD_CONTACT_POINT,
+        AUDIT_ACTION_RECORD_PERSON,
+        REASON_DUPLICATE_CONTACT_POINT,
+        REASON_PERSON_ORG_NOT_FOUND,
+        ContactPointError,
+        ContactPointInput,
+        ContactPointStore,
+        PersonInput,
+    )
+    from app.services.org_observation import (
+        ExternalIdInput,
+        ObservationInput,
+        OrgObservationStore,
+    )
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0060", type=ActorType.USER)
+    shared_org_id = "org-9f3c-shared-global"
+    a_email = "priya.sharma@synthetictextiles.example"
+
+    out: dict = {}
+
+    # 1) Business A: org (shared global id) + person + private email contact point.
+    with ctx.session_factory() as session:
+        org_a = OrgObservationStore(session, biz_a).create(
+            ObservationInput(
+                entity_type="legal_entity",
+                display_name="Synthetic Textiles Pvt Ltd",
+                external_ids=[ExternalIdInput("platform_org_id", shared_org_id)],
+            ),
+            actor=actor,
+        )
+        store_a = ContactPointStore(session, biz_a)
+        person = store_a.create_person(
+            PersonInput(display_name="Priya Sharma", org_observation_id=org_a.id, role_title="CPO"),
+            actor=actor,
+        )
+        cp = store_a.add_contact_point(
+            ContactPointInput(person.id, "email", a_email, "self_reported"), actor=actor
+        )
+        session.commit()
+        a_org_id, a_person_id, a_cp_id = org_a.id, person.id, cp.id
+
+    # 2) Business B: its OWN org against the SAME shared global id.
+    with ctx.session_factory() as session:
+        org_b = OrgObservationStore(session, biz_b).create(
+            ObservationInput(
+                entity_type="legal_entity",
+                display_name="B Textiles Pvt Ltd",
+                external_ids=[ExternalIdInput("platform_org_id", shared_org_id)],
+            ),
+            actor=actor,
+        )
+        session.commit()
+        b_org_id = org_b.id
+
+    # 3) attempt retrieval from B.
+    with ctx.session_factory() as session:
+        store_b = ContactPointStore(session, biz_b)
+        b_resolved = OrgObservationStore(session, biz_b).resolve_external(
+            "platform_org_id", shared_org_id
+        )
+        out["retrieval_from_b"] = {
+            "b_resolves_shared_id_to_own_org": b_resolved is not None and b_resolved.id == b_org_id,
+            "shared_id_is_distinct_row_per_business": b_org_id != a_org_id,
+            "b_can_read_a_person": store_b.get_person(a_person_id) is not None,
+            "b_can_read_a_contact_point": store_b.get_contact_point(a_cp_id) is not None,
+            "b_sees_a_people_by_org": len(store_b.persons_of_org(a_org_id)) > 0,
+            "b_can_resolve_a_private_email": store_b.resolve_contact("email", a_email) is not None,
+        }
+
+    # 4) A still resolves its own private email (case-insensitive).
+    with ctx.session_factory() as session:
+        store_a = ContactPointStore(session, biz_a)
+        a_hit = store_a.resolve_contact("email", a_email.upper())
+        out["owner_access"] = {
+            "a_resolves_own_email": a_hit is not None
+            and a_hit.id == a_cp_id
+            and a_hit.business_id == biz_a,
+            "a_contact_points": [c.channel for c in store_a.contact_points_of(a_person_id)],
+        }
+
+    # 5) relevant denials that change nothing.
+    with ctx.session_factory() as session:
+        store_b = ContactPointStore(session, biz_b)
+        cross_tenant_org_code = None
+        try:
+            store_b.create_person(
+                PersonInput(display_name="B on A org", org_observation_id=a_org_id), actor=actor
+            )
+        except ContactPointError as exc:
+            cross_tenant_org_code = exc.code
+        session.rollback()
+
+    with ctx.session_factory() as session:
+        store_a = ContactPointStore(session, biz_a)
+        duplicate_code = None
+        try:
+            store_a.add_contact_point(
+                ContactPointInput(a_person_id, "email", a_email.upper(), "imported"), actor=actor
+            )
+        except ContactPointError as exc:
+            duplicate_code = exc.code
+        session.rollback()
+
+    with ctx.session_factory() as session:
+        out["denials"] = {
+            "cross_tenant_org_link_code": cross_tenant_org_code,
+            "duplicate_contact_point_code": duplicate_code,
+            "business_b_has_no_people": len(ContactPointStore(session, biz_b).persons()) == 0,
+            "contact_points_unchanged": session.query(ContactPoint).count() == 1,
+        }
+
+    # 6) imported values never promoted + no host record + atomic audit without the raw value.
+    with ctx.session_factory() as session:
+        audits = session.query(AuditEvent).all()
+        raw_value_in_any_audit = any(a_email in (repr(a.references) + a.reason) for a in audits)
+        contact_audit_actions = {AUDIT_ACTION_RECORD_PERSON, AUDIT_ACTION_RECORD_CONTACT_POINT}
+        contact_audit_count = sum(1 for a in audits if a.action in contact_audit_actions)
+        out["no_promotion"] = {
+            "person_observations": session.query(PersonObservation).count(),
+            "contact_points": session.query(ContactPoint).count(),
+            "prospect_candidates": session.query(ProspectCandidate).count(),
+            "contact_audit_entries": contact_audit_count,
+            "raw_email_in_any_audit": raw_value_in_any_audit,
+            "contact_point_audit_present": any(
+                a.action == AUDIT_ACTION_RECORD_CONTACT_POINT for a in audits
+            ),
+        }
+
+    print("\n1-3) store A's private email, attempt retrieval from B (shared global org id):")
+    for k, v in out["retrieval_from_b"].items():
+        print(f"     {k:36} = {v}")
+    print("\n4) owner access (A resolves its own private email):")
+    for k, v in out["owner_access"].items():
+        print(f"     {k:36} = {v}")
+    print("\n5) relevant denials that change nothing:")
+    for k, v in out["denials"].items():
+        print(f"     {k:36} = {v}")
+    print("\n6) imported values never promoted + atomic audit without the raw value:")
+    for k, v in out["no_promotion"].items():
+        print(f"     {k:36} = {v}")
+
+    checks = {
+        "b_cannot_read_a_person": out["retrieval_from_b"]["b_can_read_a_person"] is False,
+        "b_cannot_read_a_contact_point": out["retrieval_from_b"]["b_can_read_a_contact_point"]
+        is False,
+        "b_cannot_see_a_people_by_org": out["retrieval_from_b"]["b_sees_a_people_by_org"] is False,
+        "b_cannot_resolve_a_private_email": out["retrieval_from_b"]["b_can_resolve_a_private_email"]
+        is False,
+        "shared_org_id_is_per_business": (
+            out["retrieval_from_b"]["b_resolves_shared_id_to_own_org"] is True
+            and out["retrieval_from_b"]["shared_id_is_distinct_row_per_business"] is True
+        ),
+        "owner_still_resolves_own_email": out["owner_access"]["a_resolves_own_email"] is True,
+        "cross_tenant_org_link_refused_no_change": (
+            out["denials"]["cross_tenant_org_link_code"] == REASON_PERSON_ORG_NOT_FOUND
+            and out["denials"]["business_b_has_no_people"] is True
+            and out["denials"]["contact_points_unchanged"] is True
+        ),
+        "duplicate_contact_point_refused": out["denials"]["duplicate_contact_point_code"]
+        == REASON_DUPLICATE_CONTACT_POINT,
+        "no_host_or_prospect_record": out["no_promotion"]["prospect_candidates"] == 0,
+        "raw_email_never_audited": out["no_promotion"]["raw_email_in_any_audit"] is False,
+        "every_create_audited": out["no_promotion"]["contact_audit_entries"] == 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Contact points are tenant-private: a person "
+        "observation plus a SEPARATE channel+value+evidence table, both scoped to one business. Even "
+        "when two businesses map to the SAME shared global organization id, each resolves only to its "
+        "own org, people and contact points — there is no global index on the value, so A's private "
+        "email can never be reached from B. Imported values are never promoted to shared data and no "
+        "prospect/host record is created; a relevant denial changes nothing, and each create stages an "
+        "atomic audit entry that never carries the raw value. Wired into no acquisition/send path: "
+        "future capabilities stay disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
