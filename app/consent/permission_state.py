@@ -122,6 +122,9 @@ class PermissionEvent:
       ``collected_at`` decides the state, so an out-of-order recording cannot change the outcome.
     - ``recorded_at`` — when the row was written locally (``ConsentReceipt.created_at``). A late, stable
       tiebreak only; it never overrides ``collected_at``.
+    - ``evidence_id`` — the captured proof the backing receipt cites (``ConsentReceipt.evidence_id``),
+      empty when the event cites none (a withdrawal may). It does NOT affect the state projection; it is
+      read by the DCA-077 re-consent gate to require FRESH evidence for a withdrawn→granted transition.
     """
 
     receipt_id: str
@@ -132,6 +135,7 @@ class PermissionEvent:
     action: str
     collected_at: datetime
     recorded_at: datetime | None = None
+    evidence_id: str = ""
 
     @property
     def scope(self) -> ScopeKey:
@@ -345,6 +349,7 @@ def events_from_receipts(receipts: Iterable["ConsentReceipt"]) -> list[Permissio
             action=r.action,
             collected_at=r.collected_at,
             recorded_at=r.created_at,
+            evidence_id=r.evidence_id or "",
         )
         for r in receipts
     ]

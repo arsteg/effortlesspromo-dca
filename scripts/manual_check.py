@@ -9837,6 +9837,625 @@ def _dca_075(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-076",
+    "withdraw ONE permission scope: Business A grants email + SMS permissions and Business B grants an "
+    "independent email permission for the SAME email value; an authenticated A user (then, separately, "
+    "a valid public one-click-unsubscribe TOKEN) withdraws A/email. Inspect A/email (now WITHDRAWN, "
+    "immediately), A/SMS (still GRANTED) and B/email (still GRANTED) — the withdrawal erased no other "
+    "scope and no other tenant's permission. A WITHDRAW receipt + a consent.scope.withdrawn outbox "
+    "event are emitted atomically; the grant is preserved (append-only). Relevant denials "
+    "(unauthorized actor, forged token) change nothing",
+)
+def _dca_076(ctx: CheckContext) -> dict:
+    """Withdraw one permission scope and show the restriction is immediate + tenant-isolated (step 2):
+
+      1. Business A records a GRANT on email (marketing_email) AND SMS (mobile/marketing_sms); Business
+         B records its OWN independent email GRANT for the SAME email value;
+      2. an authorized A user withdraws A/email; the scope projects WITHDRAWN on the next read, while
+         A/SMS and B/email stay GRANTED (no other scope / tenant touched);
+      3. a WITHDRAW receipt + a consent.scope.withdrawn outbox event are emitted atomically; the grant
+         receipt is preserved (append-only);
+      4. the SAME withdrawal is reproduced via a valid PUBLIC one-click-unsubscribe token (signed,
+         scope-bound); and the relevant denials — an unauthorized viewer and a forged token — change
+         nothing (no receipt, no outbox event).
+
+    Local synthetic only (AI disabled, ephemeral DB). Recording a withdrawal authorizes no send:
+    acting on the restriction stays a disabled future capability behind the one send pipeline.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.consent import (
+        PermissionState,
+        derive_permission_state,
+        events_from_receipts,
+        issue_withdrawal_token,
+    )
+    from app.db.models import ConsentReceipt, OutboxMessage
+    from app.services.consent_receipt import ConsentReceiptInput, ConsentReceiptStore
+    from app.services.consent_withdrawal import (
+        OUTBOX_EVENT_SCOPE_WITHDRAWN,
+        REASON_NOT_AUTHORIZED,
+        AuthenticatedWithdrawal,
+        ConsentWithdrawalAuthorizationError,
+        ConsentWithdrawalService,
+        PublicTokenWithdrawal,
+        ScopeRef,
+    )
+    from app.consent.withdrawal_token import REASON_BAD_SIGNATURE
+    from app.services.contact_point import ContactPointInput, ContactPointStore, PersonInput
+    from app.services.evidence_store import EvidenceInput, EvidenceObjectStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0076", type=ActorType.USER)
+    secret = "manual-check-withdrawal-secret"
+    grant_at = datetime(2026, 10, 25, 14, 30, tzinfo=UTC)
+    withdraw_at = datetime(2026, 10, 26, 9, 0, tzinfo=UTC)
+    email = "priya@synthetic.example"
+    mobile = "+919812345670"
+    form_raw = '{"form": "newsletter_optin_v3", "subscribed": true}'
+
+    def _seed_source(session, key="optin_form"):
+        if SourceCatalogStore(session).get(key) is not None:
+            return 1
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="api",
+                name="Synthetic Opt-in Form",
+                india_coverage={"nationwide": True},
+            )
+        )
+        return (
+            SourceTermsStore(session)
+            .add_version(
+                SourceTermsInput(
+                    source_key=key,
+                    operations={"collect": True, "store": True},
+                    purposes=["prospecting"],
+                    retention={"max_days": 3650, "policy": "retain"},
+                    contract_evidence={
+                        "reference": "LIC-1",
+                        "kind": "licence",
+                        "uri": "file://lic",
+                    },
+                )
+            )
+            .version
+        )
+
+    def _capture(session, business_id, person_id):
+        ver = _seed_source(session)
+        return (
+            EvidenceObjectStore(session, business_id)
+            .store(
+                EvidenceInput(
+                    source_key="optin_form",
+                    source_version=ver,
+                    content_kind="optin_record",
+                    content_ref="https://synthetic.example/f/42",
+                    raw_content=form_raw,
+                    captured_at=grant_at,
+                    rights_basis="self_reported_optin",
+                    content_media_type="application/json",
+                    subject_type="person",
+                    subject_id=person_id,
+                ),
+                actor=actor,
+            )
+            .id
+        )
+
+    def _grant(session, business_id, cp_id, ev_id, *, channel, purpose):
+        ConsentReceiptStore(session, business_id).record(
+            ConsentReceiptInput(
+                brand_key="AcmeNewsletter",
+                contact_point_id=cp_id,
+                channel=channel,
+                purpose=purpose,
+                action="grant",
+                notice_version="notice-2026.3",
+                form_version="newsletter_optin_v3",
+                language="en",
+                evidence_id=ev_id,
+                collected_at=grant_at,
+            ),
+            actor=actor,
+        )
+
+    def _state(session, business_id, cp_id, *, channel, purpose):
+        rows = [
+            r
+            for r in ConsentReceiptStore(session, business_id).for_contact_point(cp_id)
+            if r.channel == channel and r.purpose == purpose
+        ]
+        return derive_permission_state(events_from_receipts(rows)).state.value
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b}
+
+    # 1) Seed A (email + SMS) and B (independent email for the SAME value).
+    with ctx.session_factory() as session:
+        cp = ContactPointStore(session, biz_a)
+        person_a = cp.create_person(PersonInput(display_name="Priya Synthetic"), actor=actor)
+        a_email = cp.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person_a.id,
+                channel="email",
+                value=email,
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        a_sms = cp.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person_a.id,
+                channel="mobile",
+                value=mobile,
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        ev_a = _capture(session, biz_a, person_a.id)
+        _grant(session, biz_a, a_email.id, ev_a, channel="email", purpose="marketing_email")
+        _grant(session, biz_a, a_sms.id, ev_a, channel="mobile", purpose="marketing_sms")
+
+        cp_b = ContactPointStore(session, biz_b)
+        person_b = cp_b.create_person(PersonInput(display_name="Priya Synthetic"), actor=actor)
+        b_email = cp_b.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person_b.id,
+                channel="email",
+                value=email,
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        ev_b = _capture(session, biz_b, person_b.id)
+        _grant(session, biz_b, b_email.id, ev_b, channel="email", purpose="marketing_email")
+        session.commit()
+        a_email_id, a_sms_id, b_email_id = a_email.id, a_sms.id, b_email.id
+
+    # 2) Authenticated A user withdraws A/email.
+    with ctx.session_factory() as session:
+        proj = ConsentWithdrawalService(session).withdraw_authenticated(
+            AuthenticatedWithdrawal(business_id=biz_a, actor_id=actor.id, roles=("user",)),
+            ScopeRef(
+                brand_key="AcmeNewsletter",
+                contact_point_id=a_email_id,
+                channel="email",
+                purpose="marketing_email",
+            ),
+            now=withdraw_at,
+        )
+        session.commit()
+        out["authenticated_withdrawal"] = {"returned_state": proj.state.value}
+
+    # 3) Inspect A/email, A/SMS, B/email after the withdrawal (before any propagation).
+    with ctx.session_factory() as session:
+        out["after_withdrawal"] = {
+            "A/email": _state(
+                session, biz_a, a_email_id, channel="email", purpose="marketing_email"
+            ),
+            "A/SMS": _state(session, biz_a, a_sms_id, channel="mobile", purpose="marketing_sms"),
+            "B/email": _state(
+                session, biz_b, b_email_id, channel="email", purpose="marketing_email"
+            ),
+            "A_email_timeline": sorted(
+                r.action for r in ConsentReceiptStore(session, biz_a).for_contact_point(a_email_id)
+            ),
+            "outbox_events": session.query(OutboxMessage)
+            .filter(OutboxMessage.event_type == OUTBOX_EVENT_SCOPE_WITHDRAWN)
+            .count(),
+            "B_withdraw_rows": session.query(ConsentReceipt)
+            .filter(ConsentReceipt.business_id == biz_b)
+            .filter(ConsentReceipt.action == "withdraw")
+            .count(),
+        }
+
+    # 4a) The SAME withdrawal via a valid PUBLIC token (fresh business C-style contact for clarity: reuse
+    #     a second grant on a NEW person in A so the token path is shown end-to-end, not double-counted).
+    with ctx.session_factory() as session:
+        cp = ContactPointStore(session, biz_a)
+        person2 = cp.create_person(PersonInput(display_name="Rahul Synthetic"), actor=actor)
+        cp2 = cp.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person2.id,
+                channel="email",
+                value="rahul@synthetic.example",
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        ev2 = _capture(session, biz_a, person2.id)
+        _grant(session, biz_a, cp2.id, ev2, channel="email", purpose="marketing_email")
+        session.commit()
+        cp2_id = cp2.id
+
+    token = issue_withdrawal_token(
+        secret,
+        business_id=biz_a,
+        contact_point_id=cp2_id,
+        channel="email",
+        purpose="marketing_email",
+        brand_key="AcmeNewsletter",
+        issued_at=withdraw_at,
+        expires_at=withdraw_at + timedelta(days=30),
+    )
+    with ctx.session_factory() as session:
+        proj = ConsentWithdrawalService(session, token_secret=secret).withdraw_with_public_token(
+            PublicTokenWithdrawal(token=token), now=withdraw_at + timedelta(days=1)
+        )
+        session.commit()
+        out["public_token_withdrawal"] = {
+            "returned_state": proj.state.value,
+            "final_state": None,
+        }
+    with ctx.session_factory() as session:
+        out["public_token_withdrawal"]["final_state"] = _state(
+            session, biz_a, cp2_id, channel="email", purpose="marketing_email"
+        )
+
+    # 4b) Relevant denials change nothing: an unauthorized viewer and a forged token.
+    with ctx.session_factory() as session:
+        viewer_refused = False
+        try:
+            ConsentWithdrawalService(session).withdraw_authenticated(
+                AuthenticatedWithdrawal(business_id=biz_a, actor_id=actor.id, roles=("viewer",)),
+                ScopeRef(
+                    brand_key="AcmeNewsletter",
+                    contact_point_id=a_sms_id,
+                    channel="mobile",
+                    purpose="marketing_sms",
+                ),
+                now=withdraw_at,
+            )
+        except ConsentWithdrawalAuthorizationError as exc:
+            viewer_refused = exc.code == REASON_NOT_AUTHORIZED
+        session.rollback()
+
+        forged = issue_withdrawal_token(
+            "attacker-secret",
+            business_id=biz_a,
+            contact_point_id=a_sms_id,
+            channel="mobile",
+            purpose="marketing_sms",
+            brand_key="AcmeNewsletter",
+            issued_at=withdraw_at,
+            expires_at=withdraw_at + timedelta(days=30),
+        )
+        forged_refused = False
+        try:
+            ConsentWithdrawalService(session, token_secret=secret).withdraw_with_public_token(
+                PublicTokenWithdrawal(token=forged), now=withdraw_at
+            )
+        except ConsentWithdrawalAuthorizationError as exc:
+            forged_refused = exc.code == REASON_BAD_SIGNATURE
+        session.rollback()
+        out["denials"] = {"viewer_refused": viewer_refused, "forged_token_refused": forged_refused}
+
+    with ctx.session_factory() as session:
+        out["denials"]["A_sms_still_granted"] = (
+            _state(session, biz_a, a_sms_id, channel="mobile", purpose="marketing_sms")
+            == PermissionState.GRANTED.value
+        )
+
+    print("\n2) authenticated A/email withdrawal returned state:")
+    print(f"     {out['authenticated_withdrawal']['returned_state']}")
+    print("\n3) permission states after withdrawing ONLY A/email (before any propagation):")
+    for k, v in out["after_withdrawal"].items():
+        print(f"     {k:20} = {v}")
+    print("\n4a) SAME restriction via a valid public one-click-unsubscribe TOKEN:")
+    for k, v in out["public_token_withdrawal"].items():
+        print(f"     {k:20} = {v}")
+    print("\n4b) relevant denials change nothing:")
+    for k, v in out["denials"].items():
+        print(f"     {k:24} = {v}")
+
+    a = out["after_withdrawal"]
+    checks = {
+        "A_email_withdrawn_immediately": a["A/email"] == PermissionState.WITHDRAWN.value,
+        "A_sms_untouched": a["A/SMS"] == PermissionState.GRANTED.value,
+        "B_email_untouched": a["B/email"] == PermissionState.GRANTED.value,
+        "grant_preserved_append_only": a["A_email_timeline"] == ["grant", "withdraw"],
+        "one_outbox_event": a["outbox_events"] == 1,
+        "no_cross_tenant_withdraw": a["B_withdraw_rows"] == 0,
+        "public_token_withdrew_its_scope": out["public_token_withdrawal"]["final_state"]
+        == PermissionState.WITHDRAWN.value,
+        "unauthorized_viewer_refused": out["denials"]["viewer_refused"] is True,
+        "forged_token_refused": out["denials"]["forged_token_refused"] is True,
+        "denials_changed_nothing": out["denials"]["A_sms_still_granted"] is True,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Withdrawing ONE scope restricts exactly that "
+        "scope immediately — the next permission projection reports WITHDRAWN — while every other "
+        "scope and every other tenant's independent permission is untouched (append-only; the grant "
+        "is preserved). A consent.scope.withdrawn outbox event is emitted atomically with the receipt "
+        "for a later relay. The subject's own one-click public TOKEN takes the same path with no login; "
+        "an unauthorized actor or a forged token changes nothing. Acting on the restriction stays a "
+        "disabled future capability behind the one send pipeline.)"
+    )
+    return out
+
+
+@register(
+    "DCA-077",
+    "require FRESH evidence for re-consent: Business A grants email permission, then withdraws it "
+    "(scope WITHDRAWN). Try the THREE invalid restoration paths — a replayed original receipt (reuses "
+    "the original opt-in evidence), a stale import (grant collected before the withdrawal), and a "
+    "provider refresh (no fresh evidence) — each is refused and stages NO row (scope stays WITHDRAWN). "
+    "Then submit a NEW valid affirmative receipt citing fresh evidence collected after the withdrawal: "
+    "the scope projects GRANTED and a consent.scope.reconsented outbox event is emitted atomically "
+    "(append-only; the grant+withdraw history is preserved).",
+)
+def _dca_077(ctx: CheckContext) -> dict:
+    """Show that a withdrawn permission is restored ONLY by a fresh affirmative receipt (step 3):
+
+      1. Business A records a GRANT on email (marketing_email), then WITHDRAWS it — the scope is
+         WITHDRAWN;
+      2. the three invalid restoration paths are each refused and change nothing:
+         - replayed original receipt (reuses the original opt-in's captured evidence) -> stale_evidence,
+         - stale import (a grant collected BEFORE the withdrawal)                      -> not_after_withdrawal,
+         - provider refresh (no captured evidence of a fresh opt-in)                   -> missing_evidence;
+      3. a NEW valid affirmative receipt citing FRESH evidence collected after the withdrawal restores
+         the scope to GRANTED, emitting a consent.scope.reconsented outbox event atomically; the full
+         grant/withdraw/re-grant history is preserved (append-only).
+
+    Local synthetic only (AI disabled, ephemeral DB). Recording a re-consent authorizes no send: acting
+    on the restored permission stays a disabled future capability behind the one send pipeline.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.consent import PermissionState, derive_permission_state, events_from_receipts
+    from app.db.models import OutboxMessage
+    from app.services.consent_receipt import ConsentReceiptInput, ConsentReceiptStore
+    from app.services.consent_reconsent import (
+        OUTBOX_EVENT_SCOPE_RECONSENTED,
+        ConsentReconsentError,
+        ConsentReconsentService,
+        ReconsentInput,
+    )
+    from app.services.consent_withdrawal import (
+        AuthenticatedWithdrawal,
+        ConsentWithdrawalService,
+        ScopeRef,
+    )
+    from app.services.contact_point import ContactPointInput, ContactPointStore, PersonInput
+    from app.services.evidence_store import EvidenceInput, EvidenceObjectStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0077", type=ActorType.USER)
+    grant_at = datetime(2026, 10, 25, 14, 30, tzinfo=UTC)
+    withdraw_at = datetime(2026, 10, 26, 9, 0, tzinfo=UTC)
+    reconsent_at = datetime(2026, 10, 27, 10, 0, tzinfo=UTC)
+    brand, purpose = "AcmeNewsletter", "marketing_email"
+
+    def _seed_source(session, key="optin_form"):
+        if SourceCatalogStore(session).get(key) is not None:
+            return 1
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="api",
+                name="Synthetic Opt-in Form",
+                india_coverage={"nationwide": True},
+            )
+        )
+        return (
+            SourceTermsStore(session)
+            .add_version(
+                SourceTermsInput(
+                    source_key=key,
+                    operations={"collect": True, "store": True},
+                    purposes=["prospecting"],
+                    retention={"max_days": 3650, "policy": "retain"},
+                    contract_evidence={
+                        "reference": "LIC-1",
+                        "kind": "licence",
+                        "uri": "file://lic",
+                    },
+                )
+            )
+            .version
+        )
+
+    def _capture(session, person_id, *, ref, at):
+        ver = _seed_source(session)
+        return (
+            EvidenceObjectStore(session, biz_a)
+            .store(
+                EvidenceInput(
+                    source_key="optin_form",
+                    source_version=ver,
+                    content_kind="optin_record",
+                    content_ref=ref,
+                    raw_content='{"form": "newsletter_optin", "subscribed": true}',
+                    captured_at=at,
+                    rights_basis="self_reported_optin",
+                    content_media_type="application/json",
+                    subject_type="person",
+                    subject_id=person_id,
+                ),
+                actor=actor,
+            )
+            .id
+        )
+
+    def _reconsent_input(cp_id, ev_id, *, action="grant", at=reconsent_at):
+        return ReconsentInput(
+            brand_key=brand,
+            contact_point_id=cp_id,
+            channel="email",
+            purpose=purpose,
+            action=action,
+            notice_version="notice-2026.4",
+            form_version="newsletter_optin_v4",
+            language="en",
+            evidence_id=ev_id,
+            collected_at=at,
+        )
+
+    def _state(session, cp_id):
+        rows = [
+            r
+            for r in ConsentReceiptStore(session, biz_a).for_contact_point(cp_id)
+            if r.channel == "email" and r.purpose == purpose
+        ]
+        return derive_permission_state(events_from_receipts(rows)).state.value
+
+    out: dict = {"business_a": biz_a}
+
+    # 1) Grant then withdraw -> scope WITHDRAWN.
+    with ctx.session_factory() as session:
+        cp_store = ContactPointStore(session, biz_a)
+        person = cp_store.create_person(PersonInput(display_name="Priya Synthetic"), actor=actor)
+        cp = cp_store.add_contact_point(
+            ContactPointInput(
+                person_observation_id=person.id,
+                channel="email",
+                value="priya@synthetic.example",
+                evidence="self_reported",
+            ),
+            actor=actor,
+        )
+        ev_orig = _capture(session, person.id, ref="https://synthetic.example/f/1", at=grant_at)
+        ConsentReceiptStore(session, biz_a).record(
+            ConsentReceiptInput(
+                brand_key=brand,
+                contact_point_id=cp.id,
+                channel="email",
+                purpose=purpose,
+                action="grant",
+                notice_version="notice-2026.3",
+                form_version="newsletter_optin_v3",
+                language="en",
+                evidence_id=ev_orig,
+                collected_at=grant_at,
+            ),
+            actor=actor,
+        )
+        ConsentWithdrawalService(session).withdraw_authenticated(
+            AuthenticatedWithdrawal(business_id=biz_a, actor_id=actor.id, roles=("user",)),
+            ScopeRef(brand_key=brand, contact_point_id=cp.id, channel="email", purpose=purpose),
+            now=withdraw_at,
+        )
+        session.commit()
+        cp_id, person_id, orig_ev = cp.id, person.id, ev_orig
+
+    with ctx.session_factory() as session:
+        out["after_withdrawal_state"] = _state(session, cp_id)
+
+    # 2) The three invalid restoration paths each refuse and change nothing.
+    invalid: dict = {}
+    with ctx.session_factory() as session:
+        before = len(ConsentReceiptStore(session, biz_a).for_contact_point(cp_id))
+        try:
+            ConsentReconsentService(session, biz_a).reconsent(
+                _reconsent_input(cp_id, orig_ev), actor=actor, now=reconsent_at
+            )
+            invalid["replayed_original_receipt"] = "NOT REFUSED (bug)"
+        except ConsentReconsentError as exc:
+            invalid["replayed_original_receipt"] = exc.code
+        session.rollback()
+
+        ev_stale = _capture(session, person_id, ref="https://synthetic.example/f/9", at=grant_at)
+        try:
+            ConsentReconsentService(session, biz_a).reconsent(
+                _reconsent_input(cp_id, ev_stale, at=grant_at - timedelta(days=1)),
+                actor=actor,
+                now=reconsent_at,
+            )
+            invalid["stale_import"] = "NOT REFUSED (bug)"
+        except ConsentReconsentError as exc:
+            invalid["stale_import"] = exc.code
+        session.rollback()
+
+        try:
+            ConsentReconsentService(session, biz_a).reconsent(
+                _reconsent_input(cp_id, ""), actor=actor, now=reconsent_at
+            )
+            invalid["provider_refresh_no_evidence"] = "NOT REFUSED (bug)"
+        except ConsentReconsentError as exc:
+            invalid["provider_refresh_no_evidence"] = exc.code
+        session.rollback()
+
+        after = len(ConsentReceiptStore(session, biz_a).for_contact_point(cp_id))
+        invalid["rows_unchanged"] = before == after
+    out["invalid_restoration_paths"] = invalid
+
+    with ctx.session_factory() as session:
+        out["state_after_invalid_attempts"] = _state(session, cp_id)
+
+    # 3) A NEW valid affirmative receipt citing FRESH evidence restores the scope.
+    with ctx.session_factory() as session:
+        ev_fresh = _capture(
+            session, person_id, ref="https://synthetic.example/f/2", at=reconsent_at
+        )
+        proj = ConsentReconsentService(session, biz_a).reconsent(
+            _reconsent_input(cp_id, ev_fresh), actor=actor, now=reconsent_at
+        )
+        session.commit()
+        out["reconsent"] = {"returned_state": proj.state.value}
+
+    with ctx.session_factory() as session:
+        out["reconsent"]["final_state"] = _state(session, cp_id)
+        out["reconsent"]["timeline"] = sorted(
+            r.action for r in ConsentReceiptStore(session, biz_a).for_contact_point(cp_id)
+        )
+        out["reconsent"]["reconsented_outbox_events"] = (
+            session.query(OutboxMessage)
+            .filter(OutboxMessage.event_type == OUTBOX_EVENT_SCOPE_RECONSENTED)
+            .count()
+        )
+
+    print(f"\n1) after grant+withdraw, scope state: {out['after_withdrawal_state']}")
+    print("\n2) the three invalid restoration paths each refuse and change nothing:")
+    for k, v in out["invalid_restoration_paths"].items():
+        print(f"     {k:30} = {v}")
+    print(f"\n   state after invalid attempts: {out['state_after_invalid_attempts']}")
+    print("\n3) a NEW valid affirmative receipt with FRESH evidence restores the scope:")
+    for k, v in out["reconsent"].items():
+        print(f"     {k:28} = {v}")
+
+    checks = {
+        "withdrawn_before_reconsent": out["after_withdrawal_state"]
+        == PermissionState.WITHDRAWN.value,
+        "replayed_receipt_refused": invalid["replayed_original_receipt"]
+        == "reconsent_stale_evidence",
+        "stale_import_refused": invalid["stale_import"] == "reconsent_not_after_withdrawal",
+        "provider_refresh_refused": invalid["provider_refresh_no_evidence"]
+        == "reconsent_missing_evidence",
+        "invalid_attempts_changed_nothing": invalid["rows_unchanged"] is True
+        and out["state_after_invalid_attempts"] == PermissionState.WITHDRAWN.value,
+        "fresh_receipt_restored_granted": out["reconsent"]["final_state"]
+        == PermissionState.GRANTED.value,
+        "history_append_only": out["reconsent"]["timeline"] == ["grant", "grant", "withdraw"],
+        "one_reconsented_outbox_event": out["reconsent"]["reconsented_outbox_events"] == 1,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A withdrawn permission is restored ONLY by a new, "
+        "valid, affirmative receipt citing FRESH captured evidence collected AFTER the withdrawal. A "
+        "replayed original receipt, a stale import and an evidence-less provider refresh are each "
+        "refused and stage no row — the scope stays WITHDRAWN. The restoring grant is append-only; the "
+        "full grant/withdraw/re-grant history is preserved, and a consent.scope.reconsented outbox "
+        "event is emitted atomically. Acting on the restored permission stays a disabled future "
+        "capability behind the one send pipeline.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
