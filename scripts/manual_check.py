@@ -10681,7 +10681,9 @@ def _dca_079(ctx: CheckContext) -> dict:
     suppressed_email = "opted-out@synthetic-a.example"
     clear_email = "prospect@synthetic-a.example"
 
-    def _show(label: str, snap, contact_point: str, channel: str, decision: ActivationDecision) -> dict:
+    def _show(
+        label: str, snap, contact_point: str, channel: str, decision: ActivationDecision
+    ) -> dict:
         print(f"\n{label}")
         print(
             f"  gate input       : business={snap.business_id} contact_point={contact_point} "
@@ -10796,6 +10798,196 @@ def _dca_079(ctx: CheckContext) -> dict:
         "clears only a non-suppressed contact point on a covered channel; an UNAVAILABLE or STALE answer "
         "yields no activation permission. Clearing suppression is NOT recipient consent — the host owns "
         "both. Acting on an activation stays a disabled future capability behind the one send pipeline.)"
+    )
+    return out
+
+
+@register(
+    "DCA-080",
+    "apply platform suppression events: a verified platform event blocks/clears a contact point in the "
+    "tenant's local projection; a STALE event cannot clear a newer block; an exact replay is "
+    "de-duplicated by the inbox guard; a cross-tenant event and a tenant-plane event are each DENIED "
+    "with no state change (a tenant event cannot widen its own authority). Local synthetic, persisted "
+    "to the ephemeral DB; no AI/paid action.",
+)
+def _dca_080(ctx: CheckContext) -> dict:
+    """Deliver duplicate, delayed and incorrectly-scoped fixture suppression events for synthetic
+    Businesses A/B and show the resulting local restriction after each step. Every event is minted in
+    the verified DCA-029 envelope shape (in production an event is consumed only after DCA-030 transport
+    auth); the consumer applies it under the DCA-028 inbox guard and the DCA-031 revision guard, scoped
+    to the verified tenant context.
+
+    The projection mirrors the host's authoritative suppression decisions; it authorizes no send and is
+    not recipient consent — acting on suppression stays a disabled future capability behind the one send
+    pipeline. Payloads carry OPAQUE contact handles only (a hashed ``contact_ref``, never a raw address).
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.db.models import InboxReceipt, RevisionProjection
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.identity.tenant_context import TenantContext
+    from app.integration.envelope import new_envelope
+    from app.suppression import (
+        SUPPRESSION_AGGREGATE_TYPE,
+        SUPPRESSION_EVENT_TYPE,
+        PlatformSuppressionProjector,
+        SuppressionState,
+        SuppressionSyncDecision,
+    )
+
+    contact_ref = "cref-7f3a9c21"  # opaque host handle, NOT a raw contact point
+    channel = "email"
+    occurred = datetime(2026, 6, 1, tzinfo=UTC)
+
+    def ctx_for(business_id: str) -> TenantContext:
+        return TenantContext(
+            subject="00000000-0000-4000-9000-0000000a11ce",
+            business_id=business_id,
+            roles=("owner",),
+            membership_version="fake-identity-v1",
+        )
+
+    def event(
+        *,
+        business_id=BUSINESS_A,
+        version,
+        state=SuppressionState.BLOCKED.value,
+        plane="platform",
+        event_type=SUPPRESSION_EVENT_TYPE,
+        event_id=None,
+        reason="unsubscribe",
+    ):
+        return new_envelope(
+            event_id=event_id or f"supp-{business_id[-1]}-{version}-{state}",
+            business_id=business_id,
+            event_type=event_type,
+            aggregate_version=version,
+            occurred_at=occurred,
+            payload={
+                "authority_plane": plane,
+                "state": state,
+                "channel": channel,
+                "contact_ref": contact_ref,
+                "reason": reason,
+            },
+        )
+
+    def apply(business_id, envelope) -> SuppressionSyncDecision:
+        with ctx.session_factory() as session:
+            outcome = PlatformSuppressionProjector.for_context(session, ctx_for(business_id)).apply(
+                envelope
+            )
+            session.commit()
+            return outcome
+
+    def state_of(business_id) -> str:
+        with ctx.session_factory() as session:
+            st = PlatformSuppressionProjector.for_context(session, ctx_for(business_id)).current(
+                contact_ref=contact_ref, channel=channel
+            )
+            return st.value if st is not None else "none"
+
+    def show(label, outcome, business_id):
+        after = state_of(business_id)
+        print(f"\n{label}")
+        print(f"  outcome        : {outcome.decision.value} ({outcome.reason})")
+        print(
+            f"  versions       : incoming={outcome.incoming_version} "
+            f"applied={outcome.applied_version} changed_state={outcome.changed_state}"
+        )
+        print(f"  local restriction (business {business_id[-1]}, {channel}) -> {after}")
+        return {
+            "decision": outcome.decision.value,
+            "reason": outcome.reason,
+            "projection": after,
+        }
+
+    out: dict = {}
+
+    # 1) first verified platform BLOCK at revision 1 -> applied; contact point is now blocked.
+    out["block_v1"] = show(
+        "1) platform block (revision 1)", apply(BUSINESS_A, event(version=1)), BUSINESS_A
+    )
+
+    # 2) a delayed (STALE) CLEAR at revision 1 again -> rejected; the newer block is preserved.
+    #    (Deliver a newer block at revision 2 first so revision 1 is genuinely stale.)
+    apply(BUSINESS_A, event(version=2, reason="complaint"))
+    out["stale_clear"] = show(
+        "2) delayed STALE clear (revision 1, after block revision 2)",
+        apply(BUSINESS_A, event(version=1, state=SuppressionState.CLEARED.value)),
+        BUSINESS_A,
+    )
+
+    # 3) an exact re-delivery of a prior event id -> de-duplicated by the inbox guard (no-op).
+    fixed = event(version=1, event_id="supp-fixed-dup")
+    apply(BUSINESS_A, fixed)  # first delivery (stale vs the revision-2 block, but recorded)
+    out["duplicate"] = show(
+        "3) exact re-delivery (same event id)",
+        apply(
+            BUSINESS_A,
+            event(version=1, state=SuppressionState.CLEARED.value, event_id="supp-fixed-dup"),
+        ),
+        BUSINESS_A,
+    )
+
+    # 4) a CROSS-TENANT event (scoped to B) applied under A's context -> DENIED, no state change.
+    out["cross_tenant"] = show(
+        "4) cross-tenant event (B's event under A's context)",
+        apply(BUSINESS_A, event(business_id=BUSINESS_B, version=1)),
+        BUSINESS_A,
+    )
+
+    # 5) a TENANT-PLANE event -> DENIED: suppression is host-owned; a tenant cannot assert it.
+    out["tenant_plane"] = show(
+        "5) tenant-plane event (authority_plane=business)",
+        apply(BUSINESS_A, event(version=3, state=SuppressionState.CLEARED.value, plane="business")),
+        BUSINESS_A,
+    )
+
+    # Show the persisted rows so a human can eyeball the scoped local projection + inbox receipts.
+    with ctx.session_factory() as session:
+        projs = session.scalars(
+            select(RevisionProjection).where(
+                RevisionProjection.aggregate_type == SUPPRESSION_AGGREGATE_TYPE
+            )
+        ).all()
+        receipts = session.scalars(select(InboxReceipt)).all()
+    print("\nprojection rows (scoped local suppression state):")
+    for p in projs:
+        print(
+            f"  business={p.business_id[-1]} applied_version={p.applied_version} "
+            f"state={p.state.get('state')} status={p.status}"
+        )
+    print(f"inbox receipts recorded: {len(receipts)}")
+
+    checks = {
+        "block_v1_applied": out["block_v1"]["decision"] == SuppressionSyncDecision.APPLIED.value
+        and out["block_v1"]["projection"] == SuppressionState.BLOCKED.value,
+        "stale_clear_preserves_block": out["stale_clear"]["decision"]
+        == SuppressionSyncDecision.STALE.value
+        and out["stale_clear"]["projection"] == SuppressionState.BLOCKED.value,
+        "duplicate_is_noop": out["duplicate"]["decision"] == SuppressionSyncDecision.DUPLICATE.value
+        and out["duplicate"]["projection"] == SuppressionState.BLOCKED.value,
+        "cross_tenant_denied": out["cross_tenant"]["decision"]
+        == SuppressionSyncDecision.DENIED.value
+        and out["cross_tenant"]["reason"] == "scope_mismatch"
+        and out["cross_tenant"]["projection"] == SuppressionState.BLOCKED.value,
+        "tenant_plane_denied": out["tenant_plane"]["decision"]
+        == SuppressionSyncDecision.DENIED.value
+        and out["tenant_plane"]["reason"] == "authority_not_platform"
+        and out["tenant_plane"]["projection"] == SuppressionState.BLOCKED.value,
+        "no_projection_for_b": state_of(BUSINESS_B) == "none",
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. The projection MIRRORS the host's authoritative "
+        "suppression decisions under the inbox + revision guards — a stale event cannot clear a newer "
+        "block, a replay is a no-op, and a tenant event cannot widen its authority (cross-tenant or "
+        "tenant-plane -> DENIED, no change). It is not recipient consent and authorizes no send; acting "
+        "on suppression stays a disabled future capability behind the one send pipeline.)"
     )
     return out
 

@@ -27,18 +27,34 @@ from app.suppression.fake import (
     SuppressionContractDisabled,
     build_platform_suppression_client,
 )
+from app.suppression.sync import (
+    SUPPRESSION_AGGREGATE_TYPE,
+    SUPPRESSION_EVENT_SOURCE,
+    SUPPRESSION_EVENT_TYPE,
+    PlatformSuppressionProjector,
+    SuppressionState,
+    SuppressionSyncDecision,
+    SuppressionSyncOutcome,
+)
 
 __all__ = [
     "DEFAULT_COVERED_CHANNELS",
     "DEFAULT_MAX_SUPPRESSION_AGE",
+    "SUPPRESSION_AGGREGATE_TYPE",
+    "SUPPRESSION_EVENT_SOURCE",
+    "SUPPRESSION_EVENT_TYPE",
     "ActivationDecision",
     "FakePlatformSuppressionClient",
     "PlatformSuppressionClient",
+    "PlatformSuppressionProjector",
     "SuppressionAvailability",
     "SuppressionContractDisabled",
     "SuppressionEntry",
     "SuppressionLookupRequest",
     "SuppressionSnapshot",
+    "SuppressionState",
+    "SuppressionSyncDecision",
+    "SuppressionSyncOutcome",
     "authorize_activation",
     "build_platform_suppression_client",
 ]
