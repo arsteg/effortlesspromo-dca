@@ -11317,6 +11317,168 @@ def _dca_082(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-083",
+    "resolve a privacy request's affected scope: with the SAME synthetic subject present in Business A "
+    "AND B (both acquired from one platform source), resolve a LOCAL grievance for A (selects ONLY A's "
+    "record, names A the data fiduciary, identifies the category action WITHOUT executing it, and flags "
+    "the platform-controlled scope it cannot resolve as needs-review) vs the PLATFORM-SOURCE removal "
+    "(spans BOTH tenants); show a read-only viewer is denied with no state read. Local synthetic; no "
+    "AI/paid action; no deletion/execution.",
+)
+def _dca_083(ctx: CheckContext) -> dict:
+    """Resolve a local grievance's scope and a platform-source removal's scope, and compare the sets.
+
+    Resolution is READ-ONLY: it identifies the affected records, the controllers/fiduciaries and the
+    permissible actions, and executes NOTHING (no deletion). A one-tenant request never selects another
+    tenant's records, and platform-controlled scope a local operator cannot resolve is surfaced as
+    needs-review rather than auto-selected.
+    """
+    from app.db.models import (
+        PlatformSourceRestriction,
+        ProspectCandidate,
+        RestrictionAuthorityPlane,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.grievance_intake import GrievanceIntakeInput, PrivacyGrievanceStore
+    from app.services.privacy_scope import (
+        GrievanceScopePrincipal,
+        PlatformScopePrincipal,
+        PrivacyScopeAuthorizationError,
+        PrivacyScopeResolver,
+    )
+
+    subject = "aggrieved.person.a@synthetic.example"  # synthetic; compared only as a one-way digest
+    source_key = "synthetic.mca"
+    owner_a = GrievanceScopePrincipal(subject="op-owner-a", roles=("owner",))
+    viewer_a = GrievanceScopePrincipal(subject="op-viewer-a", roles=("viewer",))
+    operator = PlatformScopePrincipal(subject="platform-op", roles=("platform_operator",))
+
+    def _add(session, business_id, org, contact):
+        session.add(
+            ProspectCandidate(
+                business_id=business_id,
+                run_id="run-synthetic",
+                org_name="Synthetic Co",
+                org_identifier=org,
+                contact=contact,
+                source_key=source_key,
+                source_ref=f"synthetic://mca/{org}",
+                trust_tier="official_registry",
+                match_score=1.0,
+                status="suggested",
+            )
+        )
+
+    # Seed: the SAME subject in A and B (both from one platform source) + an unrelated A record; record
+    # an A grievance (access) and a platform-wide removal of the source.
+    with ctx.session_factory() as session:
+        _add(session, BUSINESS_A, "a-subject", {"email": subject})
+        _add(session, BUSINESS_A, "a-other", {"email": "someone.else@synthetic.example"})
+        _add(session, BUSINESS_B, "b-subject", {"email": subject})
+        issued = PrivacyGrievanceStore(session, BUSINESS_A).record(
+            GrievanceIntakeInput(category="access", contact=subject, channel="email"),
+            response_deadline_days=ctx.settings.grievance_response_days,
+        )
+        session.add(
+            PlatformSourceRestriction(
+                id="plat-removal-1",
+                source_key=source_key,
+                version=1,
+                authority_plane=RestrictionAuthorityPlane.PLATFORM.value,
+                authority_scope="platform.source.restrict",
+                authorized_by=operator.subject,
+                justification="synthetic removal",
+            )
+        )
+        session.commit()
+        gid = issued.grievance.id
+
+    out: dict = {}
+
+    # 1) LOCAL grievance resolution (Business A operator) → only A's matching record.
+    with ctx.session_factory() as session:
+        grievance = PrivacyGrievanceStore(session, BUSINESS_A).get(gid)
+        assert grievance is not None  # seeded above
+        local = PrivacyScopeResolver(session).resolve_local(grievance, owner_a)
+    local_view = {
+        "requestKind": local.request_kind,
+        "affectedBusinessIds": local.affected_business_ids,
+        "recordCount": local.record_count,
+        "controllers": [(c.role, c.business_id or c.source_key) for c in local.controllers],
+        "permissibleActions": local.permissible_actions,
+        "actionsExecutable": local.actions_executable,
+        "needsReview": local.needs_review,
+        "unresolvedAuthority": local.unresolved_authority,
+    }
+    print(f"\n1) LOCAL grievance scope (Business A) -> {local_view}")
+    out["local"] = local_view
+
+    # 2) PLATFORM-SOURCE removal resolution (platform operator) → spans BOTH tenants.
+    with ctx.session_factory() as session:
+        restriction = session.get(PlatformSourceRestriction, "plat-removal-1")
+        platform = PrivacyScopeResolver(session).resolve_platform_source(restriction, operator)
+    platform_view = {
+        "requestKind": platform.request_kind,
+        "sourceKey": platform.source_key,
+        "affectedBusinessIds": platform.affected_business_ids,
+        "recordCount": platform.record_count,
+        "controllers": [(c.role, c.business_id or c.source_key) for c in platform.controllers],
+        "permissibleActions": platform.permissible_actions,
+        "actionsExecutable": platform.actions_executable,
+        "needsReview": platform.needs_review,
+    }
+    print(f"\n2) PLATFORM-SOURCE removal scope -> {platform_view}")
+    out["platform"] = platform_view
+
+    # 3) A read-only viewer is DENIED locally (relevant denial) — nothing read, nothing changed.
+    with ctx.session_factory() as session:
+        grievance = PrivacyGrievanceStore(session, BUSINESS_A).get(gid)
+        assert grievance is not None  # seeded above
+        try:
+            PrivacyScopeResolver(session).resolve_local(grievance, viewer_a)
+            denied_code = None
+        except PrivacyScopeAuthorizationError as exc:
+            denied_code = exc.code
+    print(
+        f"\n3) viewer resolving A's scope -> denied code={denied_code!r} (read-only, no state touched)"
+    )
+    out["viewer_denied"] = {"code": denied_code}
+
+    # 4) No unintended state change: every seeded record still present and unchanged (no deletion).
+    with ctx.session_factory() as session:
+        states = {c.org_identifier: c.status for c in session.query(ProspectCandidate).all()}
+    print(f"\n4) records after resolution -> {states} (unchanged; resolution executes nothing)")
+    out["records_after"] = states
+
+    checks = {
+        "local_only_its_tenant": local.affected_business_ids == [BUSINESS_A]
+        and local.record_count == 1,
+        "local_action_identified_not_executed": local.permissible_actions
+        == ["provide_access_summary"]
+        and local.actions_executable is False,
+        "local_platform_scope_needs_review": local.needs_review is True
+        and any("platform_source_scope" in u for u in local.unresolved_authority),
+        # A source removal is SOURCE-scoped (not subject-scoped): it spans every tenant's copy from that
+        # source — here all 3 seeded records (2 in A + 1 in B), unlike the subject-scoped local request.
+        "platform_spans_both_tenants": platform.affected_business_ids
+        == sorted([BUSINESS_A, BUSINESS_B])
+        and platform.record_count == 3,
+        "viewer_denied": denied_code == "privacy_scope_not_authorized",
+        "nothing_deleted": len(states) == 3 and set(states.values()) == {"suggested"},
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action and NO deletion/execution. A one-tenant request "
+        "selects only that tenant's records — never every tenant's relationship — and the "
+        "platform-controlled scope it cannot resolve is flagged needs-review; the platform-source "
+        "removal spans every affected tenant. Acting on the resolved scope stays a disabled future "
+        "capability.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
