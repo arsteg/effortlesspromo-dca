@@ -10992,6 +10992,331 @@ def _dca_080(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-081",
+    "invalidate affected recommendations on restriction: a LOCAL block revokes only the restricting "
+    "business's affected suggestions (another tenant is untouched) and records ONE propagation "
+    "acknowledgment; a PLATFORM-WIDE source removal reaches every affected tenant's platform-controlled "
+    "copies and records one acknowledgment per tenant; a DENIED fanout (read-only viewer locally / "
+    "non-operator for a platform-wide removal) changes nothing. Local synthetic, persisted to the "
+    "ephemeral DB; no AI/paid action.",
+)
+def _dca_081(ctx: CheckContext) -> dict:
+    """Seed synthetic suggestions for Businesses A/B, then apply each restriction type and show the
+    resulting candidate statuses and the per-tenant propagation acknowledgments (work receipts).
+
+    Revoking a suggestion only ever makes processing MORE restrictive; it grants and sends nothing
+    (acceptance is a DCA-local status, not recipient consent — acting on a suggestion stays a disabled
+    future capability behind the one send pipeline). References recorded are OPAQUE row ids only.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import (
+        PlatformSourceRestriction,
+        ProcessingRestriction,
+        ProspectCandidate,
+        RestrictionAuthorityPlane,
+        RestrictionPropagation,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.processing_restriction import (
+        PlatformRestrictionPrincipal,
+        RestrictionPrincipal,
+    )
+    from app.services.restriction_fanout import (
+        REASON_NOT_AUTHORIZED,
+        REASON_NOT_PLATFORM_OPERATOR,
+        REVOKED_STATUS,
+        RestrictionFanout,
+        RestrictionFanoutAuthorizationError,
+    )
+
+    owner_a = RestrictionPrincipal(subject="00000000-0000-4000-9000-0000000a0081", roles=("owner",))
+    viewer_a = RestrictionPrincipal(
+        subject="00000000-0000-4000-9000-0000000a0082", roles=("viewer",)
+    )
+    operator = PlatformRestrictionPrincipal(
+        subject="00000000-0000-4000-9000-0000000a0083", roles=("platform_operator",)
+    )
+    tenant_admin = PlatformRestrictionPrincipal(
+        subject="00000000-0000-4000-9000-0000000a0084", roles=("admin",)
+    )
+
+    def add_candidate(session, business_id, org, source_key):
+        session.add(
+            ProspectCandidate(
+                business_id=business_id,
+                run_id="run-synthetic",
+                org_name="Synthetic Co",
+                org_identifier=org,
+                contact={"email": f"{org}@synthetic.example"},
+                source_key=source_key,
+                source_ref=f"synthetic://{source_key}/{org}",
+                trust_tier="official_registry",
+                match_score=1.0,
+            )
+        )
+
+    # Seed: A and B each have a suggestion from a shared source "src.shared"; A also has one from a
+    # tenant-local source "src.a-only".
+    with ctx.session_factory() as session:
+        add_candidate(session, BUSINESS_A, "a-shared", "src.shared")
+        add_candidate(session, BUSINESS_A, "a-only", "src.a-only")
+        add_candidate(session, BUSINESS_B, "b-shared", "src.shared")
+        local = ProcessingRestriction(
+            id="mc-local-a",
+            business_id=BUSINESS_A,
+            scope_brand="",
+            scope_channel="",
+            scope_purpose="",
+            version=1,
+            authority_plane=RestrictionAuthorityPlane.BUSINESS.value,
+            authority_scope="processing.restrict",
+            authorized_by=owner_a.subject,
+        )
+        platform = PlatformSourceRestriction(
+            id="mc-plat-shared",
+            source_key="src.shared",
+            version=1,
+            authority_plane=RestrictionAuthorityPlane.PLATFORM.value,
+            authority_scope="platform.source.restrict",
+            authorized_by=operator.subject,
+            justification="synthetic platform-wide removal",
+        )
+        session.add_all([local, platform])
+        session.commit()
+
+    def statuses():
+        with ctx.session_factory() as session:
+            return {
+                (c.business_id[-1], c.org_identifier): c.status
+                for c in session.scalars(select(ProspectCandidate)).all()
+            }
+
+    def acks():
+        with ctx.session_factory() as session:
+            return [
+                {
+                    "business": p.business_id[-1],
+                    "plane": p.authority_plane,
+                    "source_key": p.source_key,
+                    "revoked_count": p.revoked_count,
+                }
+                for p in session.scalars(
+                    select(RestrictionPropagation).order_by(RestrictionPropagation.business_id)
+                ).all()
+            ]
+
+    out: dict = {}
+    print(f"\ninitial candidate statuses: {statuses()}")
+
+    # 1) DENIED local fanout by a read-only viewer -> refused, nothing changes.
+    with ctx.session_factory() as session:
+        restriction = session.get(ProcessingRestriction, "mc-local-a")
+        denied_code = None
+        try:
+            RestrictionFanout(session).fanout_local(restriction, viewer_a)
+        except RestrictionFanoutAuthorizationError as exc:
+            denied_code = exc.code
+        session.commit()
+    print(
+        f"\n1) local fanout by VIEWER -> denied code={denied_code}; statuses unchanged: {statuses()}"
+    )
+    out["viewer_denied"] = {
+        "code": denied_code,
+        "statuses": {str(k): v for k, v in statuses().items()},
+    }
+
+    # 2) LOCAL fanout by the owner -> revokes ONLY Business A's live suggestions; B untouched.
+    with ctx.session_factory() as session:
+        restriction = session.get(ProcessingRestriction, "mc-local-a")
+        result = RestrictionFanout(session).fanout_local(restriction, owner_a)
+        session.commit()
+        local_count = result.revoked_count
+    print(f"\n2) local fanout by OWNER -> revoked={local_count}; statuses: {statuses()}")
+    print(f"   acknowledgments: {acks()}")
+    out["local_fanout"] = {
+        "revoked": local_count,
+        "statuses": {str(k): v for k, v in statuses().items()},
+        "acks": acks(),
+    }
+
+    # 3) DENIED platform fanout by a tenant admin -> refused, nothing changes.
+    with ctx.session_factory() as session:
+        restriction = session.get(PlatformSourceRestriction, "mc-plat-shared")
+        plat_denied = None
+        try:
+            RestrictionFanout(session).fanout_platform_source(restriction, tenant_admin)
+        except RestrictionFanoutAuthorizationError as exc:
+            plat_denied = exc.code
+        session.commit()
+    print(
+        f"\n3) platform fanout by TENANT ADMIN -> denied code={plat_denied}; statuses: {statuses()}"
+    )
+    out["tenant_admin_denied"] = {"code": plat_denied}
+
+    # 4) PLATFORM-WIDE fanout by the operator -> reaches B's copy from the removed shared source.
+    with ctx.session_factory() as session:
+        restriction = session.get(PlatformSourceRestriction, "mc-plat-shared")
+        result = RestrictionFanout(session).fanout_platform_source(restriction, operator)
+        session.commit()
+        plat_count = result.revoked_count
+        plat_businesses = sorted(b[-1] for b in result.affected_businesses)
+    print(
+        f"\n4) platform fanout by OPERATOR -> revoked={plat_count} across businesses {plat_businesses}; "
+        f"statuses: {statuses()}"
+    )
+    print(f"   acknowledgments: {acks()}")
+    out["platform_fanout"] = {
+        "revoked": plat_count,
+        "affected_businesses": plat_businesses,
+        "statuses": {str(k): v for k, v in statuses().items()},
+        "acks": acks(),
+    }
+
+    final = statuses()
+    checks = {
+        "viewer_denied": denied_code == REASON_NOT_AUTHORIZED,
+        "local_revoked_only_A": local_count == 2
+        and final[("a", "a-shared")] == REVOKED_STATUS
+        and final[("a", "a-only")] == REVOKED_STATUS,
+        "tenant_admin_denied": plat_denied == REASON_NOT_PLATFORM_OPERATOR,
+        # B's copy from the shared source was revoked ONLY by the platform-wide removal.
+        "platform_reached_B": plat_count == 1
+        and plat_businesses == ["b"]
+        and final[("b", "b-shared")] == REVOKED_STATUS,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A LOCAL block affects only the restricting "
+        "business's scope; a PLATFORM-WIDE approved removal reaches all affected platform-controlled "
+        "copies. Each revocation is status-only and records a per-tenant propagation acknowledgment; a "
+        "denied fanout changes nothing. Revoking grants and sends nothing — acting on a suggestion stays "
+        "a disabled future capability behind the one send pipeline.)"
+    )
+    return out
+
+
+@register(
+    "DCA-082",
+    "record an India privacy grievance: submit a synthetic grievance for Business A (proportionate "
+    "verification level derived from the category, reviewed response deadline pinned), then inspect its "
+    "status with the VALID claim token (safe status, no contact) vs an UNRELATED identity (wrong token "
+    "→ not-found, so no enumeration) and a cross-tenant id (Business B → not-found); show the authorized "
+    "operator list carries metadata only. Local synthetic, persisted to the ephemeral DB; no AI/paid "
+    "action; no erasure.",
+)
+def _dca_082(ctx: CheckContext) -> dict:
+    """Seed one synthetic grievance per tenant, then show the recorded state and the safe/denied reads.
+
+    Recording a grievance performs NO erasure, sends nothing and calls no model — it only logs the
+    request with its proportionate verification requirement and its reviewed deadline. The requester's
+    contact is stored only as a one-way digest (never the raw value); status is visible only to the
+    holder of the claim token or an authorized operator, and a wrong token / cross-tenant id reads
+    exactly like not-found (no contact enumeration).
+    """
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.grievance_intake import (
+        GrievanceIntakeInput,
+        PrivacyGrievanceStore,
+    )
+
+    contact_a = "aggrieved.person.a@synthetic.example"  # synthetic; stored only as a one-way digest
+    deadline_days = ctx.settings.grievance_response_days
+
+    # Submit one grievance for A (category 'access' → ELEVATED verification) and one for B (isolation).
+    with ctx.session_factory() as session:
+        issued_a = PrivacyGrievanceStore(session, BUSINESS_A).record(
+            GrievanceIntakeInput(
+                category="access", contact=contact_a, channel="email", detail="please show my data"
+            ),
+            response_deadline_days=deadline_days,
+        )
+        PrivacyGrievanceStore(session, BUSINESS_B).record(
+            GrievanceIntakeInput(
+                category="processing_complaint", contact="other@synthetic.example"
+            ),
+            response_deadline_days=deadline_days,
+        )
+        session.commit()
+        gid_a, token_a = issued_a.grievance.id, issued_a.access_token
+        g = issued_a.grievance
+        recorded = {
+            "grievanceId": gid_a,
+            "category": g.category,
+            "verificationLevelRequired": g.verification_level_required,
+            "verificationState": g.verification_state,
+            "status": g.status,
+            "responseDeadlineDays": g.response_deadline_days,
+            "respondBy": g.respond_by.isoformat(),
+            "contactDigestIsHash": contact_a not in g.requester_contact_digest,
+        }
+
+    print(f"\nrecorded grievance (Business A): {recorded}")
+    out: dict = {"recorded": recorded}
+
+    # 1) VALID identity (right claim token) → safe status, no contact.
+    with ctx.session_factory() as session:
+        found = PrivacyGrievanceStore(session, BUSINESS_A).get_for_requester(gid_a, token_a)
+        valid_ok = found is not None and found.id == gid_a
+    print(
+        f"\n1) status with VALID claim token -> found={valid_ok} (safe status, no contact exposed)"
+    )
+    out["valid_identity"] = {"found": valid_ok}
+
+    # 2) UNRELATED identity (wrong token) → not-found (no enumeration, no existence oracle).
+    with ctx.session_factory() as session:
+        wrong = PrivacyGrievanceStore(session, BUSINESS_A).get_for_requester(gid_a, "wrong-token")
+    print(
+        f"\n2) status with WRONG token -> found={wrong is not None} (reads exactly like not-found)"
+    )
+    out["wrong_identity"] = {"found": wrong is not None}
+
+    # 3) CROSS-TENANT id (Business B reading A's grievance) → not-found.
+    with ctx.session_factory() as session:
+        cross = PrivacyGrievanceStore(session, BUSINESS_B).get(gid_a)
+        cross_token = PrivacyGrievanceStore(session, BUSINESS_B).get_for_requester(gid_a, token_a)
+    print(
+        f"\n3) Business B reading A's grievance -> by-id={cross is not None}, "
+        f"with-token={cross_token is not None} (cross-tenant reads as not-found)"
+    )
+    out["cross_tenant"] = {"by_id": cross is not None, "with_token": cross_token is not None}
+
+    # 4) Authorized operator list for A → metadata only (no contact digest / token hash surfaced here).
+    with ctx.session_factory() as session:
+        a_list = PrivacyGrievanceStore(session, BUSINESS_A).grievances()
+        b_list = PrivacyGrievanceStore(session, BUSINESS_B).grievances()
+    print(
+        f"\n4) operator ledger sizes -> A={len(a_list)} grievance(s), B={len(b_list)} grievance(s) "
+        "(each tenant sees only its own)"
+    )
+    out["operator_ledger"] = {"a": len(a_list), "b": len(b_list)}
+
+    checks = {
+        "elevated_for_access": recorded["verificationLevelRequired"] == "elevated",
+        "unverified_received": recorded["verificationState"] == "unverified"
+        and recorded["status"] == "received",
+        "deadline_pinned": recorded["responseDeadlineDays"] == deadline_days,
+        "contact_is_digest_only": recorded["contactDigestIsHash"],
+        "valid_token_reads": valid_ok,
+        "wrong_token_not_found": wrong is None,
+        "cross_tenant_not_found": cross is None and cross_token is None,
+        "ledger_isolated": len(a_list) == 1 and len(b_list) == 1,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action and NO erasure. The grievance is recorded with a "
+        "proportionate verification requirement and a reviewed, configurable deadline; its status is "
+        "visible only to the claim-token holder or an authorized operator, the requester's contact is "
+        "stored only as a one-way digest, and a wrong token / cross-tenant id reads exactly like "
+        "not-found — so nothing enumerates contacts. Acting on a grievance stays a disabled future "
+        "capability.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

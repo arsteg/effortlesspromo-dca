@@ -117,6 +117,21 @@ class Settings(BaseSettings):
     webhook_previous_key_id: str = "previous"
     webhook_timestamp_tolerance_seconds: int = 300  # ±5 min replay/skew window
 
+    # --- public one-click withdrawal token (DCA-076) — OFF by default ---
+    # The signing secret for the subject-facing one-click unsubscribe token (app.consent.withdrawal_
+    # token). It is a DISTINCT secret from every auth/service/webhook secret above: a withdrawal token
+    # authorizes exactly one thing (restrict one permission scope) and must never double as an
+    # authentication or service credential. Unset => the PUBLIC withdrawal path is disabled
+    # (fail-closed — a subject must then be served by an authenticated business user); the
+    # authenticated withdrawal path is unaffected. The VALUE arrives out-of-band (env/secret manager);
+    # config carries only a reference (``*_secret_ref``), never the value in code.
+    consent_withdrawal_token_secret: str | None = None
+    consent_withdrawal_token_secret_ref: str | None = None
+    # Default validity window a freshly-minted unsubscribe link is good for (30 days). A link older
+    # than this is refused; the subject can always be re-served a fresh one or use the authenticated
+    # path. Must be positive.
+    consent_withdrawal_token_ttl_seconds: int = 2592000
+
     # --- outbound: existing effortlesspromo-ai gateway (all model execution goes there) ---
     ai_base_url: str | None = None  # empty => AI-dependent features disabled
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
@@ -178,6 +193,14 @@ class Settings(BaseSettings):
     allowed_countries: list[str] = ["IN"]  # India-only build (DCA story boundary)
     candidate_ttl_days: int = 30
 
+    # --- privacy grievances (DCA-082) — the REVIEWED, configurable response deadline ---
+    # The number of days a recorded India privacy grievance must be responded to within. It is the
+    # reviewed redressal-SLA policy (not a hardcode): the value is pinned onto each grievance at intake
+    # so the deadline is reproducible even if the policy later changes. Validated at boot to a sane,
+    # reviewed window (1..90 days — the India DPDP statutory ceiling for grievance redressal), so a
+    # misconfiguration fails fast rather than recording an impossible or unbounded deadline.
+    grievance_response_days: int = 30
+
     # --- schema management (no Alembic yet; see README) ---
     auto_create_schema: bool = True  # dev/test convenience; set false once migrations exist
 
@@ -209,6 +232,13 @@ class Settings(BaseSettings):
         return self.platform_transport_configured and bool(
             (self.platform_outbox_publish_path or "").strip()
         )
+
+    @property
+    def public_withdrawal_configured(self) -> bool:
+        """The DCA-076 PUBLIC (token) withdrawal path is active only when its signing secret is set.
+        Unset => disabled (fail-closed): the subject is served by an authenticated business user
+        instead. The authenticated withdrawal path does not depend on this."""
+        return bool((self.consent_withdrawal_token_secret or "").strip())
 
     @property
     def end_user_auth_configured(self) -> bool:
@@ -390,6 +420,22 @@ def validate_required(settings: Settings) -> None:
             "(EFFORTLESSPROMO_DCA_WEBHOOK_SIGNING_SECRET): a rotation overlap needs the current key"
         )
 
+    # DCA-076: the public one-click withdrawal token. Its validity window must be positive so a minted
+    # link is never already-expired (which would silently disable the public path for every subject).
+    if settings.consent_withdrawal_token_ttl_seconds <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_CONSENT_WITHDRAWAL_TOKEN_TTL_SECONDS must be positive"
+        )
+
+    # DCA-082: the reviewed privacy-grievance response deadline must be a sane, reviewed window. 0/negative
+    # would record an already-lapsed deadline; beyond 90 days exceeds the India DPDP grievance-redressal
+    # statutory ceiling. Fail fast either way rather than pinning an impossible deadline onto a grievance.
+    if not 1 <= settings.grievance_response_days <= 90:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_GRIEVANCE_RESPONSE_DAYS must be between 1 and 90 (the reviewed India "
+            "DPDP grievance-redressal window)"
+        )
+
     # A non-env secret source must name where each configured secret lives, or boot fails rather than
     # silently reading the value from the environment.
     if settings.secret_source is not SecretSource.ENV:
@@ -426,6 +472,11 @@ def validate_required(settings: Settings) -> None:
             and not (settings.webhook_previous_signing_secret_ref or "").strip()
         ):
             missing_refs.append("EFFORTLESSPROMO_DCA_WEBHOOK_PREVIOUS_SIGNING_SECRET_REF")
+        if (
+            settings.public_withdrawal_configured
+            and not (settings.consent_withdrawal_token_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_CONSENT_WITHDRAWAL_TOKEN_SECRET_REF")
         if missing_refs:
             raise RuntimeError(
                 f"secret source '{settings.secret_source.value}' requires secret references: "

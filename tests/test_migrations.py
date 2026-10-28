@@ -54,6 +54,12 @@ DCA_TABLES = {
     "contact_points",
     "field_observations",
     "evidence_objects",
+    "field_corrections",
+    "consent_receipts",
+    "processing_restrictions",
+    "platform_source_restrictions",
+    "restriction_propagations",
+    "privacy_grievances",
 }
 
 
@@ -1139,6 +1145,152 @@ def test_0027_creates_evidence_objects_table_on_a_preexisting_database(clean_sch
         }
     eng.dispose()
     assert policies == {"evidence_objects"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0028_creates_field_corrections_table_on_a_preexisting_database(clean_schema):
+    """DCA-070 — the 0028 create branch (for a DB migrated before the field-correction table existed).
+
+    ``field_corrections`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0028 is a no-op there. To exercise 0028's real job, upgrade to head, drop the
+    table, stamp history back to 0027, then upgrade to head again — 0028 must recreate the table (with
+    its per-(business, subject, field) version constraint) and add its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "field_corrections" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0027_evidence_objects")  # pretend we predate the field-correction table
+    command.upgrade(cfg, "head")  # 0028 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "field_corrections" in tables
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("field_corrections", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'field_corrections' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_field_correction_version" in uniques  # one version per (tenant, subject, field)
+    assert policies == {"field_corrections"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0030_creates_restriction_tables_on_a_preexisting_database(clean_schema):
+    """DCA-078 — the 0030 create branch (for a DB migrated before the restriction tables existed).
+
+    0030 adds two tables: ``processing_restrictions`` (tenant-owned → RLS policy + version constraint)
+    and ``platform_source_restrictions`` (platform control-plane → NO RLS policy, like ``sources``).
+    A fresh DB gets both from the metadata baseline (0001), with RLS for only the tenant-owned one from
+    0002, so 0030 is a no-op there. To exercise 0030's real job, upgrade to head, drop both tables,
+    stamp history back to 0029, then upgrade to head again — 0030 must recreate both (with their version
+    constraints) and add the tenant-isolation RLS policy to ONLY the tenant-owned table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "processing_restrictions" CASCADE'))
+        conn.execute(text('DROP TABLE IF EXISTS "platform_source_restrictions" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0029_consent_receipts")  # pretend we predate the restriction tables
+    command.upgrade(cfg, "head")  # 0030 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "processing_restrictions" in tables
+    assert "platform_source_restrictions" in tables
+    local_uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("processing_restrictions", schema=clean_schema)
+    }
+    platform_uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("platform_source_restrictions", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename IN ('processing_restrictions', 'platform_source_restrictions') "
+                    "AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_processing_restriction_version" in local_uniques
+    assert "uq_platform_source_restriction_version" in platform_uniques
+    # Only the tenant-owned table is RLS-protected; the platform control-plane table is deliberately not.
+    assert policies == {"processing_restrictions"}
+
+
+@requires_pg
+def test_0032_creates_privacy_grievances_table_on_a_preexisting_database(clean_schema):
+    """DCA-082 — the 0032 create branch (for a DB migrated before the grievance table existed).
+
+    ``privacy_grievances`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0032 is a no-op there. To exercise 0032's real job, upgrade to head, drop the
+    table, stamp history back to 0031, then upgrade to head again — 0032 must recreate the table and add
+    its tenant-isolation RLS policy, so a grievance is protected exactly like every other tenant table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "privacy_grievances" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0031_restriction_propagations")  # pretend we predate the grievance table
+    command.upgrade(cfg, "head")  # 0032 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "privacy_grievances" in tables
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'privacy_grievances' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert policies == {"privacy_grievances"}  # tenant-owned: RLS applied
 
 
 @requires_pg

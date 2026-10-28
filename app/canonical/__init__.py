@@ -17,6 +17,19 @@ Public surface:
 
 from __future__ import annotations
 
+from app.canonical.correction_overlay import (
+    ORIGIN_NONE,
+    ORIGIN_PROVIDER_SELECTION,
+    ORIGIN_USER_CORRECTION,
+    REASON_CORRECTION_NOT_PROTECTED,
+    REASON_NO_USER_CORRECTION,
+    REASON_REFRESH_DID_NOT_OVERWRITE,
+    REASON_USER_CORRECTION_PROTECTED,
+    CanonicalOutcome,
+    UserCorrection,
+    apply_user_correction,
+    correction_from_row,
+)
 from app.canonical.field_selection import (
     DENIAL_NO_RIGHTS_BASIS,
     DENIAL_RETENTION_LAPSED,
@@ -38,6 +51,17 @@ from app.canonical.field_selection import (
 )
 
 __all__ = [
+    "ORIGIN_NONE",
+    "ORIGIN_PROVIDER_SELECTION",
+    "ORIGIN_USER_CORRECTION",
+    "REASON_CORRECTION_NOT_PROTECTED",
+    "REASON_NO_USER_CORRECTION",
+    "REASON_REFRESH_DID_NOT_OVERWRITE",
+    "REASON_USER_CORRECTION_PROTECTED",
+    "CanonicalOutcome",
+    "UserCorrection",
+    "apply_user_correction",
+    "correction_from_row",
     "DENIAL_NO_RIGHTS_BASIS",
     "DENIAL_RETENTION_LAPSED",
     "DENIAL_SOURCE_RIGHTS_NOT_IN_FORCE",

@@ -29,6 +29,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     false as sa_false,
+    true as sa_true,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -1988,4 +1989,583 @@ class EvidenceObject(TenantOwned, Base):
         DateTime(timezone=True), nullable=True, default=None
     )
     # When this evidence row was recorded in the service (distinct from captured_at at the source).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class FieldCorrection(TenantOwned, Base):
+    """DCA-070 — an authorized user's correction of a field value, VERSIONED (tenant-owned, RLS).
+
+    One row is ONE version of a business user's correction of ONE field (``field_key``) about one
+    subject — an :class:`OrgObservation` or :class:`PersonObservation` within this business. It is the
+    tenant's own authoritative override that sits ON TOP of the DCA-061 provider-observation history
+    and the DCA-069 canonical selection: when a *protected* correction exists, it is what the business
+    treats as canonical for that field, so a later provider refresh does NOT silently overwrite the
+    user's verified value.
+
+    The load-bearing guarantees (the DCA-070 acceptance criteria):
+
+    - **A refresh does not overwrite a protected correction.** The correction is a separate record, not
+      an edit of any observation — recording a newer provider observation stages a NEW
+      :class:`FieldObservation` row and never touches a correction. The DCA-069 overlay
+      (:mod:`app.canonical.correction_overlay`) keeps the protected correction's value canonical over
+      the fresher provider value. ``protected_from_refresh`` defaults to ``True`` (the "default refresh
+      protection"): a correction is protected unless the user explicitly records an unprotected version.
+
+    - **A correction stays business-private.** The row is owned by exactly one ``business_id`` and read
+      only within it (DCA-017/018): a by-id read of another business's correction resolves to not-found,
+      and the overlay for a different business (which has no such correction) simply returns the provider
+      selection — so the same subject/field can show the corrected value in Business A and the provider
+      value in Business B.
+
+    **Versioned, insert-only history.** Each correction of a (subject, field_key) inserts a NEW version
+    at ``max(version) + 1`` for that field; prior versions are preserved and never mutated/deleted, so
+    the correction history (including who changed it, when, and whether it was protected) is fully
+    reviewable. The ACTIVE correction for a field is its highest version. A user re-protects or
+    un-protects a field by recording a new version; nothing is edited in place.
+
+    **Authorized + attributed.** A correction may only be recorded by a business user whose membership
+    roles grant :attr:`~app.identity.permissions.Scope.FIELD_CORRECT` (a read-only viewer, a non-member,
+    and a platform operator all lack it); the single sanctioned writer
+    (:class:`~app.services.field_correction.FieldCorrectionStore`) refuses an unauthorized attempt
+    BEFORE the session is mutated, so a denial stages no row. ``actor_id`` / ``actor_type`` record WHO
+    corrected the field (an opaque subject id, never a name/email), screened by the audit sink in the
+    SAME unit of work as the row.
+
+    Recording a correction promotes nothing to any shared/host record and sends nothing — acting on the
+    canonical value stays a disabled future capability. The ``corrected_value`` is treated as potentially
+    personal/business data: RLS-protected here and NEVER written to the audit trail (only opaque
+    references are audited).
+    """
+
+    __tablename__ = "field_corrections"
+    # A version is unique PER (business, subject, field): the same ordinal recurs across tenants/fields
+    # but never within one field of one tenant, so a new version can never overwrite an existing one.
+    __table_args__ = (
+        tenant_unique(
+            "subject_type", "subject_id", "field_key", "version", name="uq_field_correction_version"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # organization | person — the kind of subject the corrected field is about (within this business).
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    # The subject the field is about: an OrgObservation.id or PersonObservation.id in THIS business.
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The corrected field name, normalized (trimmed + lower-cased) by the store. Required.
+    field_key: Mapped[str] = mapped_column(String(100), index=True)
+    # The user-supplied corrected value. Potentially personal/business data — RLS-protected, never
+    # audited. The business-private authoritative value the overlay keeps canonical when protected.
+    corrected_value: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 1-based version ordinal within (business, subject, field); a new correction is max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # DEFAULT refresh protection: a correction is protected from being overwritten by a later provider
+    # refresh unless the user explicitly records an UNprotected version. True by default.
+    protected_from_refresh: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=sa_true()
+    )
+    # A short opaque reason/justification for the correction (e.g. "verified_by_customer"); never
+    # free-form contact data — screened by the audit sink. Optional.
+    reason: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # WHO corrected the field — an opaque subject id (never a name/email) plus its kind, screened by the
+    # audit sink in the SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    # When this correction row was recorded in the service.
+    corrected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ConsentAction(str, Enum):
+    """DCA-074 — the permission action a consent receipt records (controlled vocabulary).
+
+    A receipt is an evidenced record of ONE permission event; the action names what the subject did,
+    never a free-text label:
+
+    - ``GRANT`` — the subject gave permission (opted in) to be contacted on this channel for this
+      purpose, under the cited notice/form version.
+    - ``CONFIRM`` — a confirmation of a prior grant (e.g. a double opt-in / verified click), recorded
+      as its own evidenced event rather than mutating the grant.
+    - ``WITHDRAW`` — the subject withdrew a previously granted permission (opted out). Recorded as a
+      new receipt, never by deleting the grant, so the permission history stays reviewable.
+    - ``DECLINE`` — the subject was offered and declined permission.
+
+    An unrecognized action is refused by the store. Recording a receipt is NOT a send authorization —
+    acting on a permission stays a disabled future capability behind the one send pipeline.
+    """
+
+    GRANT = "grant"
+    CONFIRM = "confirm"
+    WITHDRAW = "withdraw"
+    DECLINE = "decline"
+
+
+class ConsentReceipt(TenantOwned, Base):
+    """DCA-074 — a scoped, evidenced permission receipt (tenant-owned, RLS-protected).
+
+    One row is ONE evidenced permission event this business captured for one brand it runs — the
+    durable record that a specific subject took a specific permission :class:`ConsentAction` on a
+    specific reachable :class:`ContactPoint` / channel, for a stated purpose, under a specific
+    notice/form version, in a stated language, at a stated time. A permission is therefore a *scoped
+    receipt*, never a boolean attribute hung on a contact.
+
+    The load-bearing guarantee (the DCA-074 acceptance criterion):
+
+    - **An imported "subscribed" flag without evidence does not create a valid receipt.** The single
+      sanctioned writer (:class:`~app.services.consent_receipt.ConsentReceiptStore`) requires the
+      receipt to cite a real, same-business :class:`EvidenceObject` (DCA-062) — the captured proof of
+      the permission event (the form submission, the opt-in record). A flag-only import that carries a
+      bare ``subscribed = true`` with no evidence is refused BEFORE the session is mutated, so it
+      stages no receipt. Permissions are not global contact attributes: a receipt lives only for the
+      business + brand + subject/contact point + channel + purpose + notice/form version + action +
+      language + time it names.
+
+    The supporting guarantees:
+
+    - **Scoped, never globally visible.** The receipt is owned by exactly one ``business_id`` and read
+      only within it (DCA-017/018). A by-id read of another business's receipt resolves to not-found,
+      and the SAME contact value recorded by two businesses yields TWO independent receipts (or none) —
+      one tenant's permission can never be read by, or asserted for, another.
+
+    - **Grounded in this business's own identities.** The ``contact_point_id`` must name a
+      :class:`ContactPoint` in this business; the ``channel`` must match it; the person subject is the
+      contact point's owning :class:`PersonObservation`. The cited ``evidence_id`` must resolve within
+      this business, and — when that evidence is itself subject-linked — its subject must match.
+
+    - **Append-only history.** A receipt is never edited or deleted; a later confirmation or withdrawal
+      is a NEW row, so the full permission timeline for a contact point stays reviewable.
+
+    Each successful record stages an atomic DCA-026 audit entry in the SAME unit of work (SEC-001/
+    BR-122). References stay OPAQUE — ids / brand / channel / purpose / action / notice+form version /
+    language — and never the raw contact value (that lives RLS-protected on the contact point).
+    """
+
+    __tablename__ = "consent_receipts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The brand (within this business) the permission was given to — a business may run several brands,
+    # so a permission is scoped to one of them, never business-wide. Normalized by the store. Required.
+    brand_key: Mapped[str] = mapped_column(String(100), index=True)
+    # The subject the permission is about: a PersonObservation.id in THIS business (derived from the
+    # cited contact point's owner). organization | person — person for a contact-point receipt.
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The specific reachable value the permission covers — a ContactPoint.id in THIS business. A
+    # permission is per contact point, never a global contact attribute. Required.
+    contact_point_id: Mapped[str] = mapped_column(String(36), index=True)
+    # email | mobile | landline | whatsapp — the channel the permission covers; must match the cited
+    # contact point's channel (the store rejects a mismatch).
+    channel: Mapped[str] = mapped_column(String(16), index=True)
+    # The stated purpose the permission was given for (e.g. "marketing_email"), normalized by the
+    # store. A permission is scoped to one purpose. Required.
+    purpose: Mapped[str] = mapped_column(String(100), index=True)
+    # grant | confirm | withdraw | decline — the permission action the subject took.
+    action: Mapped[str] = mapped_column(String(16), index=True)
+    # The notice/privacy-notice version shown when the permission was collected. Required — a receipt
+    # with no notice version cannot be reviewed, so it is refused.
+    notice_version: Mapped[str] = mapped_column(String(64))
+    # The collection form/flow version the permission was collected through. Required.
+    form_version: Mapped[str] = mapped_column(String(64))
+    # The language the notice/form was presented in (a normalized BCP-47-ish code, e.g. "en", "hi").
+    # Required — the language the subject actually consented in is part of the evidence.
+    language: Mapped[str] = mapped_column(String(16), index=True)
+    # The captured proof of the permission event — an EvidenceObject.id in THIS business (DCA-062).
+    # REQUIRED: a flag-only import with no evidence is refused and stages no receipt.
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    # When the subject actually took the permission action (distinct from created_at here). Required.
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # When this receipt row was recorded in the service.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class RestrictionRetentionMode(str, Enum):
+    """DCA-078 — how long a processing restriction is retained in the ledger.
+
+    A restriction is a durable, append-only ledger entry (never edited in place), so its retention is
+    the window the *restriction itself* must be honoured/kept, NOT a data-retention window on any
+    prospect:
+
+    - ``UNTIL_LIFTED`` — the restriction stands indefinitely until a later, explicit lift records a new
+      ledger version (lifting stays a DISABLED future capability). ``retain_until`` is left ``NULL``.
+    - ``UNTIL_DATE`` — the restriction is effective until a stated ``retain_until`` moment, after which a
+      future sweep may treat it as lapsed. ``retain_until`` is REQUIRED when this mode is chosen.
+    """
+
+    UNTIL_LIFTED = "until_lifted"
+    UNTIL_DATE = "until_date"
+
+
+class RestrictionAuthorityPlane(str, Enum):
+    """DCA-078 — which authority plane authorized a restriction (recorded on the ledger row).
+
+    The two planes are disjoint (see :mod:`app.identity.permissions`): a LOCAL (tenant) restriction is
+    authorized on the BUSINESS plane; a platform-wide source removal is authorized on the PLATFORM
+    plane. Recording the plane on the row makes a restriction's authority auditable at a glance and lets
+    local and platform-wide restrictions be told apart even when read together.
+    """
+
+    BUSINESS = "business"
+    PLATFORM = "platform"
+
+
+class ProcessingRestriction(TenantOwned, Base):
+    """DCA-078 — a LOCAL (tenant) scoped processing restriction, VERSIONED (tenant-owned, RLS).
+
+    One row is ONE version of a restriction a business placed on the agent's processing for a scope it
+    owns — any combination of a brand it runs, a channel and a purpose (an empty dimension means "all"
+    for that dimension, so a fully-empty scope is a tenant-wide restriction). It is the tenant's own
+    durable "do not process this scope" instruction, recorded in an append-only ledger with its
+    authority, version and retention metadata.
+
+    The load-bearing guarantees (the DCA-078 acceptance criteria):
+
+    - **Local and platform-wide restrictions are distinguishable and require appropriate authority.**
+      This row is the LOCAL kind: it is tenant-owned (scoped to one ``business_id``), stamps
+      ``authority_plane = business`` and may only be written by a business user whose membership roles
+      grant :attr:`~app.identity.permissions.Scope.PROCESSING_RESTRICT` (a read-only viewer and a
+      platform operator both lack it). A platform-wide source removal is the separate
+      :class:`PlatformSourceRestriction` kind — control-plane, platform-plane authority, carrying a
+      required justification — so the two are never confused and neither authority reaches the other.
+
+    - **A denial changes nothing.** The single sanctioned writer
+      (:class:`~app.services.processing_restriction.ProcessingRestrictionStore`) checks authority FIRST
+      and validates the scope/retention BEFORE the session is mutated, so a refused restriction stages
+      no row.
+
+    **Versioned, insert-only history.** Each restriction of a (brand, channel, purpose) scope inserts a
+    NEW version at ``max(version) + 1`` for that scope; prior versions are preserved and never
+    mutated/deleted, so the restriction history (who, when, which retention) stays fully reviewable. A
+    restriction authorizes nothing and sends nothing — it only ever makes processing MORE restrictive,
+    and acting on it stays a disabled future capability behind the one send pipeline.
+
+    Each successful record stages an atomic DCA-026 audit entry in the SAME unit of work (SEC-001/
+    BR-122). References stay OPAQUE — ids / brand / channel / purpose / version / plane — never a raw
+    contact value.
+    """
+
+    __tablename__ = "processing_restrictions"
+    # A version is unique PER (business, brand, channel, purpose): the same ordinal recurs across
+    # tenants/scopes but never within one scope of one tenant, so a new version can never overwrite one.
+    __table_args__ = (
+        tenant_unique(
+            "scope_brand",
+            "scope_channel",
+            "scope_purpose",
+            "version",
+            name="uq_processing_restriction_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The brand (within this business) the restriction covers; "" means ALL brands of the business.
+    scope_brand: Mapped[str] = mapped_column(String(100), default="", server_default="", index=True)
+    # email | mobile | landline | whatsapp — the channel restricted; "" means ALL channels.
+    scope_channel: Mapped[str] = mapped_column(
+        String(16), default="", server_default="", index=True
+    )
+    # The purpose restricted (e.g. "marketing_email"), normalized; "" means ALL purposes.
+    scope_purpose: Mapped[str] = mapped_column(
+        String(100), default="", server_default="", index=True
+    )
+    # 1-based version ordinal within (business, brand, channel, purpose); a new restriction is max+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # Which authority plane authorized this restriction — always 'business' for a local restriction.
+    authority_plane: Mapped[str] = mapped_column(
+        String(16), default=RestrictionAuthorityPlane.BUSINESS.value, server_default="business"
+    )
+    # The explicit permission scope the authorizing principal held (e.g. "processing.restrict").
+    authority_scope: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHO authorized the restriction — an opaque subject id (never a name/email) plus its kind.
+    authorized_by: Mapped[str] = mapped_column(String(128))
+    authorized_by_type: Mapped[str] = mapped_column(
+        String(32), default="user", server_default="user"
+    )
+    # A short opaque reason/justification for the restriction (e.g. "subject_request"); optional.
+    reason: Mapped[str] = mapped_column(String(300), default="", server_default="")
+    # until_lifted | until_date — how long this restriction is retained/effective.
+    retention_mode: Mapped[str] = mapped_column(
+        String(16),
+        default=RestrictionRetentionMode.UNTIL_LIFTED.value,
+        server_default=RestrictionRetentionMode.UNTIL_LIFTED.value,
+    )
+    # When the restriction lapses, when retention_mode is until_date; NULL for until_lifted.
+    retain_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When this restriction row was recorded in the service.
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PlatformSourceRestriction(Base):
+    """DCA-078 — a justified, platform-wide SOURCE removal, VERSIONED (control-plane, NOT tenant-owned).
+
+    One row is ONE version of a platform operator's decision to remove a catalogued :class:`Source`
+    across the WHOLE platform — a restriction that applies to every tenant, not one business. It is the
+    platform-plane counterpart of the tenant-owned :class:`ProcessingRestriction`: recorded in the same
+    append-only restriction ledger, with authority, version and retention metadata, but on the platform
+    control plane.
+
+    The load-bearing guarantees (the DCA-078 acceptance criteria):
+
+    - **Local and platform-wide restrictions are distinguishable and require appropriate authority.**
+      This row is the PLATFORM kind: it is control-plane data (NOT tenant-owned, carries no
+      ``business_id`` and is OUTSIDE tenant RLS, like the DCA-044 source catalog), stamps
+      ``authority_plane = platform`` and may only be written by a platform operator holding
+      :attr:`~app.identity.permissions.Scope.PLATFORM_SOURCE_RESTRICT`. A tenant administrator holds
+      only business-plane scopes, so their roles never authorize a platform-wide removal — it is refused
+      before any state is touched. A ``justification`` is REQUIRED (the "justified" in the story): a
+      removal that affects every tenant must record WHY.
+
+    - **A denial changes nothing.** The single sanctioned writer
+      (:class:`~app.services.processing_restriction.PlatformSourceRestrictionStore`) checks authority
+      FIRST, requires a non-empty justification and validates the source exists BEFORE the session is
+      mutated, so a refused removal stages no row.
+
+    **Versioned, insert-only history.** Each removal of a ``source_key`` inserts a NEW version at
+    ``max(version) + 1`` for that source; prior versions are preserved. The row itself is the durable
+    who/when/why record (like the DCA-050 revocation approval), so there is no separate tenant audit
+    entry (the audit sink is tenant-scoped and a platform-wide action has no single business scope).
+
+    A restriction only ever makes processing MORE restrictive and authorizes nothing; this story enables
+    no source and ships no live adapter. It holds only opaque control-plane metadata — no prospect
+    contact data and no secrets.
+    """
+
+    __tablename__ = "platform_source_restrictions"
+    # A version is unique per source_key across the platform catalog.
+    __table_args__ = (
+        UniqueConstraint("source_key", "version", name="uq_platform_source_restriction_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The catalogued Source.key removed platform-wide (validated to exist in the catalog).
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # 1-based version ordinal within source_key; a new removal is max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # Always 'platform' for a platform-wide removal — the authority plane recorded on the row.
+    authority_plane: Mapped[str] = mapped_column(
+        String(16), default=RestrictionAuthorityPlane.PLATFORM.value, server_default="platform"
+    )
+    # The explicit platform scope the operator held (e.g. "platform.source.restrict").
+    authority_scope: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHO authorized the removal — an opaque operator subject id (never a name/email).
+    authorized_by: Mapped[str] = mapped_column(String(128))
+    # REQUIRED justification: a platform-wide removal affects every tenant, so it must record WHY.
+    justification: Mapped[str] = mapped_column(String(500))
+    # until_lifted | until_date — how long this removal is retained/effective.
+    retention_mode: Mapped[str] = mapped_column(
+        String(16),
+        default=RestrictionRetentionMode.UNTIL_LIFTED.value,
+        server_default=RestrictionRetentionMode.UNTIL_LIFTED.value,
+    )
+    retain_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class RestrictionPropagation(TenantOwned, Base):
+    """DCA-081 — an append-only *propagation acknowledgment* (work receipt) for a restriction fanout.
+
+    One row records that a recorded restriction (DCA-078) was fanned out INTO one tenant's affected
+    recommendations: the restriction it answers, the authority plane it came from, the scope honoured,
+    HOW MANY of that tenant's suggestions were revoked and their opaque ids, WHO triggered the
+    propagation and WHEN. It is the durable acknowledgment that the invalidation reached that tenant.
+
+    The load-bearing guarantees (the DCA-081 acceptance criteria):
+
+    - **A local block affects only its scope; a platform-wide removal reaches every affected tenant.**
+      This row is always scoped to ONE ``business_id`` (it is :class:`TenantOwned`, RLS-protected), so a
+      tenant only ever sees the acknowledgments for its OWN revoked suggestions. A LOCAL restriction
+      fanout writes exactly one row — for the restricting business. A PLATFORM-WIDE source removal writes
+      one row PER affected tenant (each scoped to that tenant), so the platform decision reaches every
+      platform-controlled copy while a tenant with no affected copy is never touched (no row for it).
+
+    - **The acknowledgment is a propagation receipt, never a grant.** Recording it changes nothing about
+      what may be sent — it only records that affected suggestions were REVOKED (made more restrictive).
+      A restriction only ever restricts; acting on a suggestion stays a disabled future capability behind
+      the one send pipeline.
+
+    Insert-only: a fanout that revokes ≥1 suggestion for a tenant stages one acknowledgment; a fanout
+    that affects nothing for a tenant (a no-op / an idempotent re-run) stages NO row, so re-running a
+    fanout leaves no unintended state. ``revoked_candidate_ids`` holds OPAQUE row ids only — never org
+    names or contact data. Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018
+    RLS policy like every other tenant data table.
+    """
+
+    __tablename__ = "restriction_propagations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The restriction this acknowledgment answers — a ProcessingRestriction.id (local) or a
+    # PlatformSourceRestriction.id (platform-wide). Opaque row key, never free text.
+    restriction_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The version ordinal of that restriction (so an acknowledgment pins the exact ledger version).
+    restriction_version: Mapped[int] = mapped_column(Integer, default=1)
+    # Which authority plane the restriction came from — business (local) or platform (platform-wide).
+    authority_plane: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # The platform-source key whose removal drove a platform-wide fanout; "" for a local fanout.
+    source_key: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The scope dimensions of a LOCAL restriction, echoed for traceability ("" = all for that
+    # dimension). A platform-wide source fanout leaves these empty (it is keyed on the source).
+    scope_brand: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    scope_channel: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    scope_purpose: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    # HOW MANY of this tenant's suggestions this fanout revoked, and their opaque row ids.
+    revoked_count: Mapped[int] = mapped_column(Integer, default=0)
+    revoked_candidate_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # WHO triggered the propagation — an opaque subject id (never a name/email) plus its kind.
+    acknowledged_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    acknowledged_by_type: Mapped[str] = mapped_column(
+        String(32), default="system", server_default="system"
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class GrievanceCategory(str, Enum):
+    """DCA-082 — the kind of India privacy grievance a data principal raises (controlled vocabulary).
+
+    A grievance names which obligation it concerns so the fiduciary can route and verify it
+    proportionately. These mirror the India DPDP data-principal rights/complaint surface:
+
+    - ``ACCESS`` — a request for a summary of the personal data processed about the principal.
+    - ``CORRECTION`` — a request to correct/complete/update inaccurate personal data.
+    - ``ERASURE`` — a request to erase personal data (the erasure LOGIC itself is a disabled future
+      capability; this story only RECORDS the request).
+    - ``CONSENT_WITHDRAWAL`` — a request to withdraw a previously-given consent.
+    - ``NOMINATION`` — a nomination of another individual to exercise rights (e.g. on death/incapacity).
+    - ``PROCESSING_COMPLAINT`` — a complaint about how the fiduciary is processing personal data.
+    - ``OTHER`` — any other grievance not in the controlled set above.
+
+    An unrecognized category is refused by the store. Recording a grievance performs NO erasure and
+    authorizes nothing — acting on it stays a disabled future capability.
+    """
+
+    ACCESS = "access"
+    CORRECTION = "correction"
+    ERASURE = "erasure"
+    CONSENT_WITHDRAWAL = "consent_withdrawal"
+    NOMINATION = "nomination"
+    PROCESSING_COMPLAINT = "processing_complaint"
+    OTHER = "other"
+
+
+class GrievanceVerificationLevel(str, Enum):
+    """DCA-082 — the PROPORTIONATE identity-verification level a grievance requires before action.
+
+    Verification is proportionate to the sensitivity of the request, not one-size-fits-all:
+
+    - ``ELEVATED`` — categories that expose or alter personal data (access / correction / erasure)
+      demand stronger proof of identity, because acting on a mistaken/forged request would itself be a
+      personal-data incident.
+    - ``STANDARD`` — the remaining categories (consent withdrawal / nomination / complaint / other)
+      need ordinary proof.
+
+    The level is DERIVED deterministically from the category by the store (never a free-text input),
+    so a reviewer can see WHY a given grievance needs the proof it does.
+    """
+
+    STANDARD = "standard"
+    ELEVATED = "elevated"
+
+
+class GrievanceVerificationState(str, Enum):
+    """DCA-082 — where a grievance sits on the proportionate-verification path.
+
+    ``UNVERIFIED`` — the requester's identity has not yet been verified to the required level. Every
+    grievance is recorded ``UNVERIFIED``; actually verifying a requester (and anything gated on it) is
+    a DISABLED future capability, so no path in this story writes ``VERIFIED`` — recording a grievance
+    can never, on its own, mark a requester as proven.
+    """
+
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+
+
+class GrievanceStatus(str, Enum):
+    """DCA-082 — lifecycle state of a recorded grievance.
+
+    ``RECEIVED`` — intake is complete and the grievance is logged with its proportionate verification
+    requirement and its reviewed response deadline. The downstream lifecycle (acknowledge / review /
+    resolve / reject, and the erasure logic for an erasure request) is a DISABLED future capability, so
+    every row written here is ``RECEIVED``; nothing advances it yet.
+    """
+
+    RECEIVED = "received"
+
+
+class PrivacyGrievance(TenantOwned, Base):
+    """DCA-082 — a scoped India privacy grievance intake/status record (tenant-owned, RLS-protected).
+
+    One row is ONE grievance a data principal raised with a business (the data fiduciary): what it is
+    about (:class:`GrievanceCategory`), the proportionate verification it requires
+    (:class:`GrievanceVerificationLevel` + :class:`GrievanceVerificationState`), the reviewed response
+    deadline it must be answered by, and the opaque claim-check the requester uses to look up its
+    status — never the requester's raw contact.
+
+    The load-bearing guarantees (the DCA-082 acceptance criteria):
+
+    - **No contact enumeration; visible only to the authorized requester or operators.** The row stores
+      the requester's contact ONLY as a one-way :attr:`requester_contact_digest` (never the raw value),
+      and the service exposes NO lookup-by-contact path, so no caller can enumerate or confirm who has
+      filed. A grievance's status is readable two ways and no other: by the REQUESTER presenting the
+      single-use-issued claim token whose hash is stored in :attr:`access_token_hash` (a wrong/absent
+      token reads exactly like not-found — never an existence oracle), or by an authorized business
+      OPERATOR holding the ``grievance.read`` scope for THIS business (a platform operator, who holds no
+      membership, cannot; delegated client support is a separate scoped/expiring grant). Operator views
+      carry grievance metadata only — never the contact digest or token hash — so authority to handle a
+      grievance is never authority to harvest contacts.
+
+    - **Recording a grievance changes nothing else and does no later-story work.** Intake is append-only
+      and performs NO erasure, no send and no model call; it only logs the request. Acting on a
+      grievance (acknowledge/resolve/erase) stays a DISABLED future capability, so a grievance is always
+      recorded ``RECEIVED`` / ``UNVERIFIED``.
+
+    The ``response_deadline_days`` / ``respond_by`` are the CONFIGURABLE, REVIEWED deadline pinned onto
+    the row at intake (from the reviewed ``grievance_response_days`` setting), so the deadline is
+    reproducible even if the configured policy changes later. Tenant-owned: it inherits the DCA-017
+    ``business_id`` column and the DCA-018 RLS policy like every other tenant data table, so one tenant
+    can never read another's grievances.
+    """
+
+    __tablename__ = "privacy_grievances"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # What the grievance is about (controlled GrievanceCategory); drives the proportionate verification.
+    category: Mapped[str] = mapped_column(String(32), index=True)
+    # The channel the requester gave a contact on (email | mobile | landline | whatsapp), or "" if none
+    # was supplied. Descriptive context for proportionate verification — NOT the contact value itself.
+    channel: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # A ONE-WAY digest of the requester's normalized contact — never the raw value, and never exposed in
+    # any response. Present so a duplicate submission is recognizable without enabling contact lookup.
+    requester_contact_digest: Mapped[str] = mapped_column(
+        String(64), default="", server_default="", index=True
+    )
+    # The requester's own description of the grievance (their words). Tenant-owned, RLS-protected; shown
+    # only to an authorized operator and never in a status/list projection. Optional.
+    detail: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # The PROPORTIONATE verification level required before the grievance may be actioned — derived
+    # deterministically from the category by the store (standard | elevated).
+    verification_level_required: Mapped[str] = mapped_column(
+        String(16),
+        default=GrievanceVerificationLevel.STANDARD.value,
+        server_default=GrievanceVerificationLevel.STANDARD.value,
+    )
+    # Where the grievance sits on the verification path — always 'unverified' at intake (verifying a
+    # requester is a disabled future capability).
+    verification_state: Mapped[str] = mapped_column(
+        String(16),
+        default=GrievanceVerificationState.UNVERIFIED.value,
+        server_default=GrievanceVerificationState.UNVERIFIED.value,
+        index=True,
+    )
+    # Lifecycle state — always 'received' here (advancing it is a disabled future capability).
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=GrievanceStatus.RECEIVED.value,
+        server_default=GrievanceStatus.RECEIVED.value,
+        index=True,
+    )
+    # The CONFIGURABLE, REVIEWED response-deadline policy (in days) pinned onto the row at intake, and
+    # the concrete deadline it yields — so the deadline is reproducible even if the policy later changes.
+    response_deadline_days: Mapped[int] = mapped_column(Integer)
+    respond_by: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The SHA-256 hash of the claim token issued (once) to the requester at intake. The plaintext token
+    # is returned to the requester a single time and never stored; status lookup compares a presented
+    # token's hash against this, constant-time. Never exposed in any response.
+    access_token_hash: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

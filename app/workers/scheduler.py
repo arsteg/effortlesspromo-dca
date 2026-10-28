@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.db.models import TenantAgent
 from app.services.discovery import DiscoveryError, run_discovery
+from app.services.restriction_fanout import run_restriction_fanout
 from app.services.source_expiry import ExpirySweepResult, run_expiry_sweep
 from app.services.source_revocation import run_revocation_invalidation
 
@@ -51,6 +52,19 @@ def tick_maintenance(
             "source-revocation invalidation: marked %d observation(s) stale from %d revoked source(s)",
             invalidation.invalidated,
             len(invalidation.revoked_source_keys),
+        )
+
+    # DCA-081 — fan out every in-force platform-wide source removal across all tenants: revoke the
+    # affected suggestions and record a per-tenant propagation acknowledgment. Also control-plane
+    # housekeeping (keyed on the removed-source ledger, not one business); only ever more restrictive,
+    # so it is not gated behind any feature/source flag and a failure here must not stop the loop.
+    fanouts = run_restriction_fanout(session_factory, settings)
+    revoked = sum(f.revoked_count for f in fanouts)
+    if revoked:
+        log.info(
+            "restriction fanout: revoked %d suggestion(s) across %d platform-wide source removal(s)",
+            revoked,
+            len(fanouts),
         )
     return result
 

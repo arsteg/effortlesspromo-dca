@@ -32,6 +32,33 @@ class Scope(str, Enum):
 
     # --- business plane (granted via business membership roles only) ---
     CANDIDATE_READ = "candidate.read"  # ordinary business user: view suggestions
+    # correct/override a field value the agent recorded about one of this business's subjects
+    # (DCA-070). A WRITE scope: an ordinary acting business user holds it, a read-only viewer does
+    # NOT — correcting a value is an edit, not a view. It is a business-plane scope, so a platform
+    # operator (holding no membership) can never correct a client's field; delegated client-support
+    # correction would be a separate, scoped, expiring grant (a later story), never an operator right.
+    FIELD_CORRECT = "field.correct"
+    # withdraw (restrict) ONE permission scope the agent holds for one of this business's contact
+    # points (DCA-076). A WRITE scope: an ordinary acting business user holds it (honouring an opt-out
+    # is a normal operating action, never admin-only), a read-only viewer does NOT. It is a
+    # business-plane scope, so a platform operator (holding no membership) can never withdraw a
+    # client's permission with their global rights alone; the subject's OWN one-click withdrawal takes
+    # the separate public-token path, which carries its own authority and needs no business role.
+    CONSENT_WITHDRAW = "consent.withdraw"
+    # place a LOCAL (tenant) processing restriction on a scope this business owns — a brand/channel/
+    # purpose, or the whole tenant (DCA-078). A WRITE scope: an ordinary acting business user holds it
+    # (restricting the agent's own processing for a scope is a normal operating action, never admin-
+    # only), a read-only viewer does NOT. It is a business-plane scope, so a platform operator (holding
+    # no membership) can never place a client's restriction with their global rights alone; a
+    # platform-WIDE source removal is the separate platform scope below, never this one.
+    PROCESSING_RESTRICT = "processing.restrict"
+    # read the privacy grievances (DCA-082) raised with THIS business, and look up one's status as an
+    # authorized handler/operator. A READ scope held by an acting business user and an administrator
+    # (handling grievances is a normal operating action for a designated handler), NOT a read-only
+    # viewer. It is a business-plane scope, so a platform operator (holding no membership) can never
+    # read a client's grievances with their global rights alone; the REQUESTER's own status lookup takes
+    # the separate claim-token path, which carries its own authority and needs no business role.
+    GRIEVANCE_READ = "grievance.read"
     SOURCE_APPROVE = "source.approve"  # administrator: approve a data source
     POLICY_APPROVE = "policy.approve"  # administrator: approve a compliance policy
     BUDGET_MANAGE = "budget.manage"  # administrator: change spend budgets
@@ -54,18 +81,45 @@ class Scope(str, Enum):
     # precisely so a business administrator (the ``policy.approve`` business scope above is a
     # business-local intent, not authority over the shared policy registry) can never perform it.
     POLICY_RULEPACK_APPROVE = "platform.policy.rulepack.approve"
+    # operator: remove a catalogued source PLATFORM-WIDE (across every tenant) with a justification
+    # (DCA-078). A PLATFORM action, NOT a business one: a source is shared control-plane data, so a
+    # platform-wide removal is never a tenant-admin right. Kept on the platform plane precisely so a
+    # business administrator can never perform it — a tenant may only place a LOCAL restriction
+    # (the ``processing.restrict`` business scope above), never a platform-wide one.
+    PLATFORM_SOURCE_RESTRICT = "platform.source.restrict"
 
 
 # Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
 # that is granted the sensitive scopes, NOT a bypass of the check. Unknown roles grant nothing.
 _ADMIN_SCOPES = frozenset(
-    {Scope.CANDIDATE_READ, Scope.SOURCE_APPROVE, Scope.POLICY_APPROVE, Scope.BUDGET_MANAGE}
+    {
+        Scope.CANDIDATE_READ,
+        Scope.FIELD_CORRECT,
+        Scope.CONSENT_WITHDRAW,
+        Scope.PROCESSING_RESTRICT,
+        Scope.GRIEVANCE_READ,
+        Scope.SOURCE_APPROVE,
+        Scope.POLICY_APPROVE,
+        Scope.BUDGET_MANAGE,
+    }
+)
+# The scopes an ordinary acting (non-admin, non-viewer) business user holds.
+_ACTING_USER_SCOPES = frozenset(
+    {
+        Scope.CANDIDATE_READ,
+        Scope.FIELD_CORRECT,
+        Scope.CONSENT_WITHDRAW,
+        Scope.PROCESSING_RESTRICT,
+        Scope.GRIEVANCE_READ,
+    }
 )
 BUSINESS_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
-    # ordinary business users
+    # read-only business user — may view suggestions but NOT edit/correct/restrict.
     "viewer": frozenset({Scope.CANDIDATE_READ}),
-    "user": frozenset({Scope.CANDIDATE_READ}),
-    "member": frozenset({Scope.CANDIDATE_READ}),
+    # ordinary acting business users — may view, correct a field, withdraw a permission scope AND
+    # place a local processing restriction about their own subjects (all normal acting-user actions).
+    "user": _ACTING_USER_SCOPES,
+    "member": _ACTING_USER_SCOPES,
     # business administrators
     "admin": _ADMIN_SCOPES,
     "owner": _ADMIN_SCOPES,
@@ -81,6 +135,7 @@ PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
             Scope.SOURCE_TERMS_APPROVE,
             Scope.SOURCE_TERMS_REVOKE,
             Scope.POLICY_RULEPACK_APPROVE,
+            Scope.PLATFORM_SOURCE_RESTRICT,
         }
     ),
 }

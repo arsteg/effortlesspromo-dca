@@ -63,6 +63,11 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "contact_points",
         "field_observations",
         "evidence_objects",
+        "field_corrections",
+        "consent_receipts",
+        "processing_restrictions",
+        "restriction_propagations",
+        "privacy_grievances",
     }
 
 
@@ -80,6 +85,8 @@ def test_platform_catalog_tables_are_excluded():
     assert "compliance_policy_rulepacks" not in tenant_owned_tables()
     # The DCA-053 compliance policy approvals are platform control-plane data, also outside tenant RLS.
     assert "compliance_policy_approvals" not in tenant_owned_tables()
+    # The DCA-078 platform-wide source removals are platform control-plane data, also outside tenant RLS.
+    assert "platform_source_restrictions" not in tenant_owned_tables()
 
 
 # --- Postgres-backed RLS behaviour ----------------------------------------------------------------
@@ -235,6 +242,107 @@ def test_write_with_matching_owner_is_allowed(rls_db):
         conn.execute(_SEED, (A, "running"))
         assert _counts(conn) == {A: 3}  # the new A row is visible within the A scope
         conn.rollback()  # don't pollute the shared seed for other tests
+    finally:
+        conn.close()
+
+
+_SEED_PROPAGATION = (
+    "INSERT INTO restriction_propagations "
+    "(id, business_id, restriction_id, restriction_version, authority_plane, source_key, "
+    "scope_brand, scope_channel, scope_purpose, revoked_count, revoked_candidate_ids, "
+    "acknowledged_by, acknowledged_by_type, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 'rstr-1', 1, 'platform', 'src_x', '', '', '', "
+    "1, '[]', 'op-1', 'user', now())"
+)
+
+
+@requires_pg
+def test_restriction_propagation_is_tenant_isolated(rls_db):
+    """DCA-081 — a propagation acknowledgment is tenant-owned: a platform-wide fanout writes one row per
+    tenant, and each tenant can read only its OWN acknowledgments (RLS, exercised on real Postgres)."""
+    conn = _app_conn()
+    try:
+        # A platform-wide source removal acknowledged for BOTH tenants (one row each), written under each
+        # tenant's own scope — exactly how the fanout stages a per-tenant acknowledgment.
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_PROPAGATION, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_PROPAGATION, (B,))
+        conn.commit()
+
+        # Each tenant sees ONLY its own acknowledgment row.
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM restriction_propagations").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM restriction_propagations").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_restriction_propagation_write_check_rejects_foreign_owner(rls_db):
+    """An acknowledgment can never be stamped for another tenant: writing a B-owned row while scoped to
+    A violates the WITH CHECK clause (defence-in-depth beneath the fanout's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_PROPAGATION, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_GRIEVANCE = (
+    "INSERT INTO privacy_grievances "
+    "(id, business_id, category, channel, requester_contact_digest, detail, "
+    "verification_level_required, verification_state, status, response_deadline_days, "
+    "respond_by, access_token_hash, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 'access', 'email', 'digest-x', '', "
+    "'elevated', 'unverified', 'received', 30, now() + interval '30 days', 'hash-x', now())"
+)
+
+
+@requires_pg
+def test_privacy_grievance_is_tenant_isolated(rls_db):
+    """DCA-082 — a grievance is tenant-owned: each tenant can read only its OWN grievances (RLS on
+    real Postgres), so one business can never enumerate another's privacy grievances."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_GRIEVANCE, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_GRIEVANCE, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM privacy_grievances").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM privacy_grievances").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_privacy_grievance_write_check_rejects_foreign_owner(rls_db):
+    """A grievance can never be stamped for another tenant: writing a B-owned row while scoped to A
+    violates the WITH CHECK clause (defence-in-depth beneath the store's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_GRIEVANCE, (B,))
+        conn.rollback()
     finally:
         conn.close()
 
