@@ -12262,6 +12262,164 @@ def _dca_087(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-088",
+    "validate Indian SMS sender prerequisites: in isolated synthetic Businesses A/B, run the ONE "
+    "composed DLT sender-readiness decision — (1) a fully-registered, ACTIVE, bound, category-matched "
+    "sender on the PROMOTIONAL route is READY; (2) removing the registered HEADER denies the route "
+    "'header_not_registered'; (3) a PROMOTIONAL header/template run on the TRANSACTIONAL route is "
+    "denied 'route_category_mismatch' (mismatched setup); (4) a missing CONSENT template on the "
+    "promotional route is denied 'consent_template_not_registered'. READY is SENDER readiness only — it "
+    "never authorizes a recipient (recipient consent is recorded but not consulted), and Business B's "
+    "own registered sender is unaffected (tenant-isolated inputs). The decision reads nothing and writes "
+    "nothing. Local synthetic; no AI/paid action; sender readiness, not recipient permission.",
+)
+def _dca_088(ctx: CheckContext) -> dict:
+    """Show the composed SMS sender-readiness decision: missing/mismatched DLT setup denies the route,
+    and READY confirms only the sender's registration — never recipient permission — all pure, no state."""
+    from datetime import UTC, datetime
+
+    from app.compliance.sms_sender_prerequisites import (
+        REASON_CONSENT_TEMPLATE_NOT_REGISTERED,
+        REASON_HEADER_NOT_REGISTERED,
+        REASON_OK,
+        REASON_ROUTE_CATEGORY_MISMATCH,
+        ConsentTemplate,
+        ContentTemplate,
+        DeliveryChain,
+        DltRegistrationStatus,
+        Header,
+        PrincipalEntity,
+        SmsRoute,
+        SmsSenderReadiness,
+        SmsSenderReadinessRequest,
+        decide_sms_sender_readiness,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    active = DltRegistrationStatus.ACTIVE.value
+    promo = SmsRoute.PROMOTIONAL.value
+    txn = SmsRoute.TRANSACTIONAL.value
+
+    # Business A's fully-registered synthetic DLT sender on the promotional route.
+    entity_a = "PE-ACME-SYNTH"
+    header_a = "ACMEIN"
+    pe_a = PrincipalEntity(entity_id=entity_a, status=active)
+    hdr_a = Header(header_id=header_a, category=promo, status=active, bound_entity_id=entity_a)
+    content_a = ContentTemplate(
+        template_id="CT-A", category=promo, status=active, bound_header_id=header_a
+    )
+    consent_a = ConsentTemplate(template_id="CN-A", category=promo, status=active)
+    chain_a = DeliveryChain(telemarketer_id="TM-A", status=active, bound_entity_id=entity_a)
+
+    def _request(**overrides) -> SmsSenderReadinessRequest:
+        base = dict(
+            route=promo,
+            principal_entity=pe_a,
+            header=hdr_a,
+            content_template=content_a,
+            delivery_chain=chain_a,
+            consent_template=consent_a,
+        )
+        base.update(overrides)
+        return SmsSenderReadinessRequest(**base)  # type: ignore[arg-type]
+
+    # 1) Fully registered -> READY.
+    ready = decide_sms_sender_readiness(_request(), now=now)
+    print(
+        f"\n1) fully-registered promotional sender -> {ready.decision.value} reasons={ready.reasons}"
+    )
+
+    # 2) Remove the registered header -> route denied.
+    no_header = decide_sms_sender_readiness(
+        _request(header=Header(header_id="", category=promo)), now=now
+    )
+    print(
+        f"\n2) header removed -> {no_header.decision.value} reasons={no_header.reasons} "
+        f"decisive={no_header.decisive.gate!r}"
+    )
+
+    # 3) Promotional header/template run on the transactional route -> category mismatch.
+    mismatch = decide_sms_sender_readiness(_request(route=txn, consent_template=None), now=now)
+    decisive_mismatch = next(
+        (b for b in mismatch.blockers if b.reason == REASON_ROUTE_CATEGORY_MISMATCH), None
+    )
+    print(
+        f"\n3) promotional setup on transactional route -> {mismatch.decision.value} "
+        f"reasons={mismatch.reasons} detail={decisive_mismatch.detail if decisive_mismatch else '-'!r}"
+    )
+
+    # 4) Missing consent template on the promotional (consent-based) route -> denied.
+    no_consent = decide_sms_sender_readiness(_request(consent_template=None), now=now)
+    print(
+        f"\n4) missing consent template on promotional route -> {no_consent.decision.value} "
+        f"reasons={no_consent.reasons}"
+    )
+
+    # 5) Business B's own registered sender is unaffected (tenant-isolated inputs).
+    entity_b = "PE-GLOBEX-SYNTH"
+    header_b = "GLBXIN"
+    tenant_b = decide_sms_sender_readiness(
+        SmsSenderReadinessRequest(
+            route=promo,
+            principal_entity=PrincipalEntity(entity_id=entity_b, status=active),
+            header=Header(
+                header_id=header_b, category=promo, status=active, bound_entity_id=entity_b
+            ),
+            content_template=ContentTemplate(
+                template_id="CT-B", category=promo, status=active, bound_header_id=header_b
+            ),
+            delivery_chain=DeliveryChain(
+                telemarketer_id="TM-B", status=active, bound_entity_id=entity_b
+            ),
+            consent_template=ConsentTemplate(template_id="CN-B", category=promo, status=active),
+            # Recipient consent recorded for audit — but it is NEVER consulted by sender readiness.
+            recipient_consent_present=True,
+        ),
+        now=now,
+    )
+    print(
+        f"\n5) business B registered sender -> {tenant_b.decision.value} reasons={tenant_b.reasons} "
+        f"(recipient_consent_present={tenant_b.recipient_consent_present}, "
+        f"authorizes_recipient={tenant_b.authorizes_recipient})"
+    )
+
+    out = {
+        "ready": {"decision": ready.decision.value, "reasons": list(ready.reasons)},
+        "no_header": {"decision": no_header.decision.value, "reasons": list(no_header.reasons)},
+        "route_mismatch": {"decision": mismatch.decision.value, "reasons": list(mismatch.reasons)},
+        "no_consent": {"decision": no_consent.decision.value, "reasons": list(no_consent.reasons)},
+        "tenant_b": {"decision": tenant_b.decision.value, "reasons": list(tenant_b.reasons)},
+    }
+    checks = {
+        "ready_when_all_present": ready.decision is SmsSenderReadiness.READY
+        and ready.reasons == (REASON_OK,),
+        "missing_header_denies_route": no_header.decision is SmsSenderReadiness.BLOCKED
+        and REASON_HEADER_NOT_REGISTERED in no_header.reasons,
+        "route_category_mismatch_denies": mismatch.decision is SmsSenderReadiness.BLOCKED
+        and REASON_ROUTE_CATEGORY_MISMATCH in mismatch.reasons,
+        "missing_consent_template_denies": no_consent.decision is SmsSenderReadiness.BLOCKED
+        and no_consent.reasons == (REASON_CONSENT_TEMPLATE_NOT_REGISTERED,),
+        "ready_never_authorizes_recipient": tenant_b.decision is SmsSenderReadiness.READY
+        and tenant_b.recipient_consent_present is True
+        and tenant_b.authorizes_recipient is False
+        and tenant_b.grants_consent is False,
+        "tenant_b_unaffected": tenant_b.decision is SmsSenderReadiness.READY,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The ONE composed SMS "
+        "sender-readiness decision confirms the Indian DLT prerequisites — principal entity, header, "
+        "content/consent templates, route/category match and the delivery chain. Missing or mismatched "
+        "setup DENIES the route. READY is SENDER readiness only: it is NOT recipient consent and NOT a "
+        "send authorization — the actual SMS send stays a disabled future capability behind the host's "
+        "one send pipeline, which re-gates recipient consent and suppression. The decision reads nothing "
+        "and writes nothing.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
