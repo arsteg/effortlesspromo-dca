@@ -8498,6 +8498,171 @@ def _dca_066(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-067",
+    "match organizations using STRONG evidence: run exact-ID, shared-domain and similar-name fixtures "
+    "through the pure deterministic matcher and show, side by side, each pair's OUTCOME "
+    "(match/no_match/review/insufficient), confidence and contributing signals. Prove a compatible "
+    "typed registration identifier (same CIN/LLPIN => same legal entity; same GSTIN => same "
+    "establishment) is the ONLY thing that confirms a MATCH; that a CONFLICTING legal-entity identifier "
+    "refutes a match even when name AND domain agree; that a shared name/domain ALONE is only a REVIEW "
+    "candidate (never collapsed); that two different GSTINs of one group stay DISTINCT establishments; "
+    "that location only corroborates/contradicts; and that the result + the relevant denial are "
+    "reproducible with no state change (the matcher is pure and merges nothing)",
+)
+def _dca_067(ctx: CheckContext) -> dict:
+    """Exercise the DCA-067 organization matcher (manual-test step 2) on local synthetic fixtures only.
+
+    Pure, deterministic, network-free Python — no model, no DB write, no HTTP, no registry lookup. Only
+    a compatible typed registration identifier confirms identity; a shared name/domain is a weak REVIEW
+    candidate that never collapses different branches/groups; a conflicting legal-entity identifier
+    refutes a match; location corroborates/contradicts but never decides. A MATCH is a conclusion, never
+    an automatic merge (auto_merged stays False), and every result/denial is reproducible with no state.
+    """
+    from app.geography.evidence import EvidenceKind, LocationEvidence
+    from app.matching import MatchOutcome, build_subject, match_organizations
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+
+    out: dict = {}
+    # The matcher is pure and tenant-agnostic: it compares two evidence bundles and records/merges
+    # NOTHING against either tenant. Within the product it is a WITHIN-business candidate-resolution aid
+    # (acting on a conclusion — merging observations — stays a disabled future capability).
+    out["tenant_agnostic"] = {"business_a": biz_a, "business_b": biz_b, "records_nothing": True}
+
+    # Checksum-valid synthetic GSTINs: one PAN (AAPFU0939F), two states => two establishments.
+    gstin_mh = "27AAPFU0939F1ZV"
+    gstin_ka = "29AAPFU0939F1ZR"
+    cin_acme = "U72200MH2010PTC123456"
+    cin_other = "U72200KA2011PTC654321"
+    mh = [LocationEvidence(EvidenceKind.STATE_UT, value="MH")]
+    ka = [LocationEvidence(EvidenceKind.STATE_UT, value="KA")]
+
+    def _pair(label: str, a, b) -> dict:
+        r = match_organizations(a, b)
+        return {
+            "label": label,
+            "outcome": r.outcome.value,
+            "confidence": r.confidence.value,
+            "auto_merged": r.auto_merged,
+            "signals": [
+                f"{s.kind.value}:{s.strength.value}:{s.relation.value}" for s in r.signals
+            ],
+        }
+
+    # 2) exact-ID / shared-domain / similar-name fixtures (manual-test step 2).
+    cases = [
+        _pair(
+            "exact_cin_same_legal_entity",
+            build_subject(name="Acme Pvt Ltd", identifiers=[("cin", cin_acme)]),
+            build_subject(name="ACME PRIVATE LIMITED", identifiers=[("cin", cin_acme.lower())]),
+        ),
+        _pair(
+            "exact_gstin_same_establishment",
+            build_subject(name="Acme", identifiers=[("gstin", gstin_mh)]),
+            build_subject(name="Acme Mumbai", identifiers=[("gstin", gstin_mh)]),
+        ),
+        _pair(
+            "conflicting_cin_overrides_name_and_domain",
+            build_subject(name="Acme Ltd", domains=["acme.in"], identifiers=[("cin", cin_acme)]),
+            build_subject(name="Acme Ltd", domains=["acme.in"], identifiers=[("cin", cin_other)]),
+        ),
+        _pair(
+            "shared_domain_alone_is_review",
+            build_subject(name="Acme North", domains=["acme.in"]),
+            build_subject(name="Acme South", domains=["acme.in"]),
+        ),
+        _pair(
+            "similar_name_alone_is_review",
+            build_subject(name="Acme Technologies"),
+            build_subject(name="acme technologies"),
+        ),
+        _pair(
+            "distinct_gstins_same_name_and_domain_not_collapsed",
+            build_subject(name="Acme", domains=["acme.in"], identifiers=[("gstin", gstin_mh)]),
+            build_subject(name="Acme", domains=["acme.in"], identifiers=[("gstin", gstin_ka)]),
+        ),
+        _pair(
+            "name_plus_location_corroboration",
+            build_subject(name="Acme", location=mh),
+            build_subject(name="Acme", location=mh),
+        ),
+        _pair(
+            "name_and_domain_with_location_conflict",
+            build_subject(name="Acme", domains=["acme.in"], location=mh),
+            build_subject(name="Acme", domains=["acme.in"], location=ka),
+        ),
+        _pair(
+            "no_shared_evidence_insufficient",
+            build_subject(name="Alpha", domains=["alpha.in"], identifiers=[("cin", cin_acme)]),
+            build_subject(name="Beta", domains=["beta.in"], identifiers=[("gstin", gstin_ka)]),
+        ),
+    ]
+    out["cases"] = cases
+
+    # 3) The relevant DENIAL (refusing to confirm a match) is reproducible with no state change.
+    conflict_a = build_subject(name="Acme", domains=["acme.in"], identifiers=[("cin", cin_acme)])
+    conflict_b = build_subject(name="Acme", domains=["acme.in"], identifiers=[("cin", cin_other)])
+    repeated = [match_organizations(conflict_a, conflict_b).outcome.value for _ in range(2)]
+    out["denial_reproducible"] = repeated
+
+    print("\n2) exact-ID / shared-domain / similar-name fixtures (outcome + confidence + signals):")
+    for row in cases:
+        print(f"\n   [{row['label']}]")
+        print(f"     outcome      = {row['outcome']}")
+        print(f"     confidence   = {row['confidence']}")
+        print(f"     auto_merged  = {row['auto_merged']}")
+        print(f"     signals      = {row['signals']}")
+    print(f"\n3) conflicting-identifier denial reproduced twice: {repeated}")
+
+    by_label = {c["label"]: c for c in cases}
+    checks = {
+        "exact_cin_is_match": by_label["exact_cin_same_legal_entity"]["outcome"]
+        == MatchOutcome.MATCH.value,
+        "exact_gstin_is_match": by_label["exact_gstin_same_establishment"]["outcome"]
+        == MatchOutcome.MATCH.value,
+        "conflicting_cin_is_no_match": by_label["conflicting_cin_overrides_name_and_domain"][
+            "outcome"
+        ]
+        == MatchOutcome.NO_MATCH.value,
+        "shared_domain_alone_is_review": by_label["shared_domain_alone_is_review"]["outcome"]
+        == MatchOutcome.REVIEW.value,
+        "similar_name_alone_is_review": by_label["similar_name_alone_is_review"]["outcome"]
+        == MatchOutcome.REVIEW.value,
+        "distinct_gstins_not_collapsed": by_label[
+            "distinct_gstins_same_name_and_domain_not_collapsed"
+        ]["outcome"]
+        == MatchOutcome.REVIEW.value,
+        "location_corroboration_bumps_to_medium": by_label["name_plus_location_corroboration"][
+            "confidence"
+        ]
+        == "medium",
+        "location_conflict_stays_low": by_label["name_and_domain_with_location_conflict"][
+            "confidence"
+        ]
+        == "low",
+        "no_evidence_is_insufficient": by_label["no_shared_evidence_insufficient"]["outcome"]
+        == MatchOutcome.INSUFFICIENT.value,
+        "never_auto_merges": all(c["auto_merged"] is False for c in cases),
+        "denial_reproducible": repeated == [MatchOutcome.NO_MATCH.value] * 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no DB write, no network, no registry lookup. "
+        "Matching is pure and deterministic: ONLY a compatible typed registration identifier confirms "
+        "a MATCH (same CIN/LLPIN => same legal entity; same GSTIN => same establishment); a conflicting "
+        "legal-entity identifier yields NO_MATCH even when name AND domain agree; a shared name/domain "
+        "alone is only a REVIEW candidate — different branches/groups are never collapsed, and two "
+        "different GSTINs of one group stay DISTINCT establishments; location only corroborates or "
+        "contradicts and never decides on its own. A MATCH is a conclusion, NEVER an automatic merge "
+        "(auto_merged stays False) — acting on it, and acquisition/consent, stay disabled future "
+        "capabilities. The result and the relevant denial are reproducible with no state to change.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
