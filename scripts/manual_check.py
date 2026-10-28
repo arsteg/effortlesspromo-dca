@@ -6962,7 +6962,8 @@ def _dca_059(ctx: CheckContext) -> dict:
         out["denials"] = {
             "cross_tenant_parent_code": cross_tenant_code,
             "duplicate_external_id_code": duplicate_code,
-            "business_b_created_nothing": len(OrgObservationStore(session, biz_b).observations()) == 0,
+            "business_b_created_nothing": len(OrgObservationStore(session, biz_b).observations())
+            == 0,
             "business_a_unchanged": session.query(OrgObservation).count() == 3,
             "mappings_unchanged": session.query(OrgExternalId).count() == 3,
         }
@@ -7262,6 +7263,260 @@ def _dca_060(ctx: CheckContext) -> dict:
         "prospect/host record is created; a relevant denial changes nothing, and each create stages an "
         "atomic audit entry that never carries the raw value. Wired into no acquisition/send path: "
         "future capabilities stay disabled.)"
+    )
+    return out
+
+
+@register(
+    "DCA-061",
+    "require provenance on observed fields: record a COMPLETE observed field (source_key + "
+    "source_version pointing at a catalogued source/terms version, the actual retrieval reference, "
+    "observed timestamp, India-only collection scope, inference label and rights/retention metadata) "
+    "against Business A's organization observation — it persists with its full provenance; then submit "
+    "the SAME field with NO source reference — it is REJECTED (missing_source_reference) rather than "
+    "silently canonicalized, staging no row; an inferred field persists without a source but still "
+    "carries a derivation reference/scope/rights basis and is labelled inferred; a cross-tenant subject "
+    "(Business B writing against A's organization) reads as not-found and stages nothing; observations "
+    "are append-only history (not deduplicated); each create stages an atomic DCA-026 audit entry whose "
+    "references never carry the raw field value; no prospect/host record is created",
+)
+def _dca_061(ctx: CheckContext) -> dict:
+    """Record and reject a provenanced field observation against a disposable DB (manual-test step 2):
+
+      1. Business A catalogues a synthetic source + one terms version, records an organization
+         observation, then records a COMPLETE observed field (annual_revenue_inr) carrying its full
+         provenance — it persists with source_key/version, retrieval reference, observed_at, scope,
+         inference label and rights/retention metadata;
+      2. the SAME field submitted with NO source reference is REJECTED (missing_source_reference) and
+         stages no row — an unprovenanced agent-written value is never silently canonicalized;
+      3. an INFERRED field persists WITHOUT a source but with its derivation reference, scope and rights
+         basis, labelled inferred so it is never mistaken for an observed fact;
+      4. a cross-tenant subject (Business B writing against A's organization) reads as not-found and
+         stages nothing; B cannot read A's field observation;
+      5. observations are append-only history (the same field observed twice is two evidence rows);
+      6. each create staged an atomic DCA-026 audit entry whose references never carry the raw field
+         value, and no prospect/host record was created.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    Recording a field observation is wired into no acquisition/send path: future capabilities stay
+    disabled.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import AuditEvent, FieldObservation, ProspectCandidate
+    from app.services.field_observation import (
+        AUDIT_ACTION_RECORD_FIELD,
+        REASON_MISSING_SOURCE_REFERENCE,
+        REASON_SUBJECT_NOT_FOUND,
+        FieldObservationError,
+        FieldObservationInput,
+        FieldObservationStore,
+    )
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0061", type=ActorType.USER)
+    observed_at = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+    secret_value = "₹12,34,56,789 confidential"
+
+    def _complete(subject_id, src, ver, **over):
+        base = dict(
+            subject_type="organization",
+            subject_id=subject_id,
+            field_key="annual_revenue_inr",
+            field_value=secret_value,
+            inference_label="observed",
+            source_key=src,
+            source_version=ver,
+            provenance_ref="https://synthetic.registry.example/mca/record/42#revenue",
+            observed_at=observed_at,
+            scope="nationwide",
+            rights_basis="source_terms:collect+store;purpose=prospecting",
+            retention_until=observed_at + timedelta(days=365),
+        )
+        base.update(over)
+        return FieldObservationInput(**base)
+
+    out: dict = {}
+
+    # 1) A: catalogue a source + terms version, record an org, record a COMPLETE observed field.
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key="mca_master_data",
+                kind="official",
+                access_method="api",
+                name="MCA Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        terms = SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key="mca_master_data",
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "LIC-1", "kind": "licence", "uri": "file://lic"},
+            )
+        )
+        src, ver = "mca_master_data", terms.version
+        org = OrgObservationStore(session, biz_a).create(
+            ObservationInput(entity_type="legal_entity", display_name="Synthetic Textiles Pvt Ltd"),
+            actor=actor,
+        )
+        obs = FieldObservationStore(session, biz_a).record(_complete(org.id, src, ver), actor=actor)
+        session.commit()
+        a_org_id, a_obs_id = org.id, obs.id
+
+    with ctx.session_factory() as session:
+        row = FieldObservationStore(session, biz_a).get(a_obs_id)
+        out["complete_observed"] = {
+            "persisted": row is not None,
+            "field_key": None if row is None else row.field_key,
+            "source_key": None if row is None else row.source_key,
+            "source_version": None if row is None else row.source_version,
+            "has_retrieval_ref": bool(row and row.provenance_ref),
+            "scope": None if row is None else row.scope,
+            "inference_label": None if row is None else row.inference_label,
+            "has_rights_basis": bool(row and row.rights_basis),
+            "has_retention_until": bool(row and row.retention_until),
+        }
+
+    # 2) the SAME field with NO source reference is rejected and stages nothing.
+    with ctx.session_factory() as session:
+        store = FieldObservationStore(session, biz_a)
+        missing_source_code = None
+        try:
+            store.record(
+                _complete(a_org_id, src, ver, source_key="", source_version=None), actor=actor
+            )
+        except FieldObservationError as exc:
+            missing_source_code = exc.code
+        session.rollback()
+
+    # 3) an INFERRED field persists without a source but with its derivation provenance.
+    with ctx.session_factory() as session:
+        inferred = FieldObservationStore(session, biz_a).record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=a_org_id,
+                field_key="segment",
+                field_value="mid_market",
+                inference_label="inferred",
+                source_key="",
+                source_version=None,
+                provenance_ref="derived_from:annual_revenue_inr+employee_count (rule v3)",
+                observed_at=observed_at,
+                scope="KA",
+                rights_basis="derived;purpose=scoring",
+            ),
+            actor=actor,
+        )
+        session.commit()
+        inferred_label = inferred.inference_label
+        inferred_has_source = bool(inferred.source_key)
+
+    # 4) a cross-tenant subject reads as not-found and stages nothing; B cannot read A's observation.
+    with ctx.session_factory() as session:
+        store_b = FieldObservationStore(session, biz_b)
+        cross_tenant_code = None
+        try:
+            store_b.record(_complete(a_org_id, src, ver), actor=actor)
+        except FieldObservationError as exc:
+            cross_tenant_code = exc.code
+        session.rollback()
+        b_can_read_a_obs = store_b.get(a_obs_id) is not None
+
+    # 5) append-only history: the same field observed twice is two evidence rows.
+    with ctx.session_factory() as session:
+        store = FieldObservationStore(session, biz_a)
+        store.record(
+            _complete(
+                a_org_id,
+                src,
+                ver,
+                provenance_ref="later-fetch",
+                observed_at=observed_at + timedelta(days=30),
+            ),
+            actor=actor,
+        )
+        session.commit()
+        revenue_history = [
+            o
+            for o in store.for_subject("organization", a_org_id)
+            if o.field_key == "annual_revenue_inr"
+        ]
+        history_count = len(revenue_history)
+
+    # 6) atomic audit without the raw value + no prospect/host record.
+    with ctx.session_factory() as session:
+        audits = (
+            session.query(AuditEvent).filter(AuditEvent.action == AUDIT_ACTION_RECORD_FIELD).all()
+        )
+        raw_in_any_audit = any(secret_value in (repr(a.references) + a.reason) for a in audits)
+        out["denials"] = {
+            "missing_source_reference_code": missing_source_code,
+            "cross_tenant_subject_code": cross_tenant_code,
+            "b_can_read_a_field_observation": b_can_read_a_obs,
+        }
+        out["inferred"] = {"label": inferred_label, "has_source": inferred_has_source}
+        out["history"] = {"annual_revenue_observations": history_count}
+        out["audit_and_promotion"] = {
+            "field_audit_entries": len(audits),
+            "raw_value_in_any_audit": raw_in_any_audit,
+            "field_observation_rows": session.query(FieldObservation).count(),
+            "prospect_candidates": session.query(ProspectCandidate).count(),
+        }
+
+    print("\n1) a complete OBSERVED field persists with its full provenance:")
+    for k, v in out["complete_observed"].items():
+        print(f"     {k:28} = {v}")
+    print("\n2-4) denials that change nothing (unprovenanced / cross-tenant):")
+    for k, v in out["denials"].items():
+        print(f"     {k:34} = {v}")
+    print("\n3) an inferred field persists without a source but is labelled inferred:")
+    for k, v in out["inferred"].items():
+        print(f"     {k:28} = {v}")
+    print("\n5) append-only provenance history:")
+    for k, v in out["history"].items():
+        print(f"     {k:34} = {v}")
+    print("\n6) atomic audit without the raw value + no prospect/host record:")
+    for k, v in out["audit_and_promotion"].items():
+        print(f"     {k:34} = {v}")
+
+    checks = {
+        "complete_observed_persisted": out["complete_observed"]["persisted"] is True
+        and out["complete_observed"]["source_key"] == "mca_master_data"
+        and out["complete_observed"]["has_retrieval_ref"] is True
+        and out["complete_observed"]["scope"] == "nationwide"
+        and out["complete_observed"]["has_rights_basis"] is True,
+        "unprovenanced_field_rejected": out["denials"]["missing_source_reference_code"]
+        == REASON_MISSING_SOURCE_REFERENCE,
+        "cross_tenant_subject_rejected": out["denials"]["cross_tenant_subject_code"]
+        == REASON_SUBJECT_NOT_FOUND,
+        "b_cannot_read_a_field": out["denials"]["b_can_read_a_field_observation"] is False,
+        "inferred_persisted_without_source": out["inferred"]["label"] == "inferred"
+        and out["inferred"]["has_source"] is False,
+        "append_only_history": out["history"]["annual_revenue_observations"] == 2,
+        "raw_value_never_audited": out["audit_and_promotion"]["raw_value_in_any_audit"] is False,
+        "no_prospect_or_host_record": out["audit_and_promotion"]["prospect_candidates"] == 0,
+        # 1 complete observed + 1 inferred + 1 later observed = 3; the two rejections staged nothing.
+        "only_provenanced_rows_persisted": out["audit_and_promotion"]["field_observation_rows"]
+        == 3,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A field observation is persisted ONLY with its "
+        "required provenance — source_key/version pointing at a catalogued source, the actual "
+        "retrieval reference, observed timestamp, India-only scope, inference label and rights/retention "
+        "metadata. An agent-written field missing its source reference is REJECTED, not silently "
+        "canonicalized; a cross-tenant subject reads as not-found; observations are append-only history; "
+        "each create stages an atomic audit entry that never carries the raw value; and no prospect/host "
+        "record is created. Wired into no acquisition/send path: future capabilities stay disabled.)"
     )
     return out
 

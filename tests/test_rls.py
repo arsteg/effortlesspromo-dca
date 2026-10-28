@@ -61,6 +61,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "org_external_ids",
         "person_observations",
         "contact_points",
+        "field_observations",
     }
 
 

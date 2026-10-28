@@ -52,6 +52,7 @@ DCA_TABLES = {
     "org_external_ids",
     "person_observations",
     "contact_points",
+    "field_observations",
 }
 
 
@@ -1053,6 +1054,48 @@ def test_0025_creates_contact_point_tables_on_a_preexisting_database(clean_schem
     eng.dispose()
     assert "uq_contact_point" in cp_uniques  # one (channel, value) per business; never reused
     assert policies == {"person_observations", "contact_points"}  # both tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0026_creates_field_observation_table_on_a_preexisting_database(clean_schema):
+    """DCA-061 — the 0026 create branch (for a DB migrated before the field-observation table existed).
+
+    ``field_observations`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001)
+    with RLS from 0002, and 0026 is a no-op there. To exercise 0026's real job, upgrade to head, drop
+    the table, stamp history back to 0025, then upgrade to head again — 0026 must recreate the table
+    and add its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "field_observations" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0025_contact_points")  # pretend we predate the field-observation table
+    command.upgrade(cfg, "head")  # 0026 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "field_observations" in tables
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'field_observations' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert policies == {"field_observations"}  # tenant-owned: RLS applied
 
 
 @requires_pg

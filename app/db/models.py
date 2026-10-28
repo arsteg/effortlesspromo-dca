@@ -1778,3 +1778,110 @@ class ContactPoint(TenantOwned, Base):
     # self_reported | public_listing | imported | verified | inferred — the identity-evidence class.
     evidence: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class FieldSubjectType(str, Enum):
+    """DCA-061 — what an observed field is ABOUT (controlled vocabulary).
+
+    A field observation always hangs off exactly one subject in THIS business, so the subject kind is
+    never an ambiguous bare id:
+
+    - ``ORGANIZATION`` — one of this business's :class:`OrgObservation` rows (a legal entity or
+      establishment).
+    - ``PERSON`` — one of this business's :class:`PersonObservation` rows.
+
+    An unrecognized subject type is refused by the store, and the subject id is always resolved WITHIN
+    this business (a cross-tenant / unknown subject reads as not-found), so a field can never be
+    attached to another tenant's identity.
+    """
+
+    ORGANIZATION = "organization"
+    PERSON = "person"
+
+
+class FieldInferenceLabel(str, Enum):
+    """DCA-061 — whether an observed field was DIRECTLY observed or INFERRED (controlled vocabulary).
+
+    The label is load-bearing provenance: an inferred value must never be passed off as a directly
+    observed fact, so the two are recorded distinctly and carry different required provenance:
+
+    - ``OBSERVED`` — the value was retrieved directly from a catalogued source. It MUST name that
+      source (``source_key``) and the specific terms ``source_version`` it came under, plus the
+      ACTUAL retrieval reference (``provenance_ref``) that locates the specific fetch — a bare value
+      with no source reference is refused rather than silently canonicalized.
+    - ``INFERRED`` — the value was DERIVED by the agent from other evidence. It carries no direct
+      source fetch, so it must instead name the derivation basis it was computed from
+      (``provenance_ref``); it is always labelled ``INFERRED`` so it is never mistaken for an
+      observed fact.
+
+    An unrecognized label is refused by the store.
+    """
+
+    OBSERVED = "observed"
+    INFERRED = "inferred"
+
+
+class FieldObservation(TenantOwned, Base):
+    """DCA-061 — a single observed field about a subject, with REQUIRED provenance (tenant-owned, RLS).
+
+    One row is ONE observation of ONE field (``field_key`` → ``field_value``) about one subject — an
+    :class:`OrgObservation` or :class:`PersonObservation` within this business — stamped with the
+    provenance that makes it reviewable: the ``source_key`` + ``source_version`` it came from, the
+    ACTUAL retrieval/derivation reference (``provenance_ref``), the ``observed_at`` timestamp, the
+    collection ``scope`` (India-only: ``nationwide`` or a recognized state/UT), the
+    :class:`FieldInferenceLabel` (observed vs inferred), and the rights/retention metadata
+    (``rights_basis`` + optional ``retention_until``) under which it was recorded.
+
+    **Provenance is required — an unprovenanced field is rejected, never silently canonicalized.** The
+    single sanctioned writer (:class:`~app.services.field_observation.FieldObservationStore`) refuses a
+    create that is missing any required provenance BEFORE the session is mutated, so a bare agent-written
+    value with no source reference stages no row and is never promoted into the canonical field set.
+
+    **Scoped, never globally visible; append-only history.** The observation is owned by exactly one
+    ``business_id`` and read only within it (DCA-017/018). It is NOT deduplicated on ``field_key`` —
+    the same field observed again (a later fetch, a different source, an inference) is a NEW evidence
+    row, so the provenance history of a field is preserved rather than overwritten. Recording a field
+    observation creates no prospect / host record and grants nothing; acquisition and canonicalization
+    stay disabled future capabilities.
+
+    This records only the observed field metadata; the ``field_value`` is treated as potentially
+    personal/business data and is NEVER written to the audit trail (only opaque references are audited).
+    """
+
+    __tablename__ = "field_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # organization | person — the kind of subject the field is about (resolved within this business).
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    # The subject this field is about: an OrgObservation.id or PersonObservation.id in THIS business.
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The observed field name, normalized (trimmed + lower-cased) by the store. Required.
+    field_key: Mapped[str] = mapped_column(String(100), index=True)
+    # The observed value as recorded. Potentially personal/business data — RLS-protected, never audited.
+    field_value: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # observed | inferred — load-bearing provenance: an inferred value is never passed off as observed.
+    inference_label: Mapped[str] = mapped_column(String(16), index=True)
+    # The catalogued Source.key the field came from (required for an OBSERVED field; "" for inferred
+    # when no originating source applies). Validated to exist in the platform catalog when supplied.
+    source_key: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
+    # The SourceTerms version the field came under (required for an OBSERVED field; NULL otherwise).
+    source_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    # The ACTUAL retrieval reference (an OBSERVED field) or derivation basis (an INFERRED field) —
+    # an opaque pointer to the specific fetch/computation. Required; a bare value with none is refused.
+    provenance_ref: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    # When the field was observed at the source / inferred. Required.
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The collection scope the field was observed under. India-only: "nationwide" or a recognized
+    # Indian state/UT code (ISO 3166-2:IN). Required and validated by the store.
+    scope: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # The rights basis recorded for the field (e.g. the purpose / permitted-operation basis the agent
+    # asserts it was collected under). Required, non-empty. This is RECORDED provenance, not an
+    # authorization — it grants no acquisition/send right (those gates live elsewhere).
+    rights_basis: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # The retention deadline recorded for the field; NULL means no stated limit. Part of the
+    # rights/retention metadata the observation carries.
+    retention_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    # When this observation row was recorded in the service (distinct from observed_at at the source).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
