@@ -9040,6 +9040,177 @@ def _dca_069(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-073",
+    "expose SEPARATE quality dimensions: record synthetic field observations for one subject in "
+    "Business A (a fresh value + a 400-day-stale value), build the freshness/completeness evidence "
+    "from the real rows, then grade the five quality dimensions (identity confidence, freshness, "
+    "completeness, deliverability, business fit) while carrying the DCA-055 permission decision through "
+    "on a SEPARATE eligibility axis. Prove the acceptance on a HIGH-fit + BLOCKED fixture: the top "
+    "business-fit grade does NOT change the blocked permission outcome, and a catch-all mail domain "
+    "stays UNCERTAIN (never 'deliverable'); the summary is reproducible with no state change",
+)
+def _dca_073(ctx: CheckContext) -> dict:
+    """Exercise the DCA-073 quality summarizer (manual-test step 2) on local synthetic fixtures only.
+
+    Writes real field observations into an ephemeral synthetic DB (the harness cleans it up), builds
+    the freshness/completeness evidence from those rows via the read-only adapters, and runs the PURE
+    summarizer. Identity / deliverability / business-fit / eligibility signals are explicit synthetic
+    fixtures (deliverability/fit/eligibility come from other layers, not stored here). The summarizer
+    reads only what it is handed and records/mutates/deletes nothing — the observation rows are
+    untouched. No AI/paid/network path.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.compliance.policy_engine import PolicyDecision
+    from app.db.models import FieldObservation
+    from app.matching.org_match import Confidence, MatchOutcome
+    from app.quality import (
+        BusinessFitSignal,
+        Deliverability,
+        DeliverabilitySignal,
+        Eligibility,
+        EligibilityInput,
+        IdentitySignal,
+        QualityEvidence,
+        QualityLevel,
+        completeness_from_observations,
+        freshness_from_observations,
+        summarize_quality,
+    )
+    from app.services.field_observation import FieldObservationInput, FieldObservationStore
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0073", type=ActorType.USER)
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    expected_fields = {"legal_name", "state", "industry", "website"}
+
+    out: dict = {"business_a": biz_a, "business_b_scoped_out": biz_b}
+
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key="mca_master_data",
+                kind="official",
+                access_method="api",
+                name="MCA Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        terms = SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key="mca_master_data",
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "LIC-1", "kind": "licence", "uri": "file://lic"},
+            )
+        )
+        ver = terms.version
+        subject = (
+            OrgObservationStore(session, biz_a)
+            .create(
+                ObservationInput(
+                    entity_type="legal_entity", display_name="Synthetic Textiles Pvt Ltd"
+                ),
+                actor=actor,
+            )
+            .id
+        )
+        store = FieldObservationStore(session, biz_a)
+
+        def _record(field_key, value, observed_at):
+            store.record(
+                FieldObservationInput(
+                    subject_type="organization",
+                    subject_id=subject,
+                    field_key=field_key,
+                    field_value=value,
+                    inference_label="observed",
+                    source_key="mca_master_data",
+                    source_version=ver,
+                    provenance_ref="https://synthetic.registry.example/mca/record/42",
+                    observed_at=observed_at,
+                    scope="nationwide",
+                    rights_basis="source_terms:collect+store;purpose=prospecting",
+                ),
+                actor=actor,
+            )
+
+        # Two of four expected fields present; the oldest is 400 days stale.
+        _record("legal_name", "Synthetic Textiles Pvt Ltd", now - timedelta(days=10))
+        _record("state", "KA", now - timedelta(days=400))
+        session.commit()
+
+    with ctx.session_factory() as session:
+        store = FieldObservationStore(session, biz_a)
+        observations = store.for_subject("organization", subject)
+        freshness = freshness_from_observations(observations)
+        completeness = completeness_from_observations(observations, expected_fields=expected_fields)
+        # A HIGH-fit + BLOCKED fixture: the top fit grade must NOT unblock the permission outcome, and
+        # a catch-all mail domain must stay UNCERTAIN (never 'deliverable').
+        evidence = QualityEvidence(
+            identity=IdentitySignal(outcome=MatchOutcome.MATCH, confidence=Confidence.HIGH),
+            freshness=freshness,
+            completeness=completeness,
+            deliverability=(DeliverabilitySignal(verified=True, catch_all=True),),
+            business_fit=BusinessFitSignal(score=0.99),
+            eligibility=EligibilityInput(decision=PolicyDecision.DENY, reason="denied_by_rule"),
+        )
+        summary = summarize_quality(evidence, now=now)
+        # Reproduce it — a pure function yields the identical summary with nothing to mutate.
+        repeat = summarize_quality(evidence, now=now)
+        total_rows = len(session.scalars(select(FieldObservation)).all())
+
+    print(
+        "\n2) quality summary over synthetic fixtures (five dimensions, eligibility kept separate):"
+    )
+    for dim in summary.dimensions():
+        print(f"   - {dim.dimension.value:<20} rating={dim.rating:<12} reason={dim.reason}")
+    print(
+        f"\n   ELIGIBILITY (separate axis) = {summary.eligibility.eligibility.value}  "
+        f"(reason={summary.eligibility.reason})"
+    )
+
+    checks = {
+        "business_fit_is_high": summary.business_fit.rating == QualityLevel.HIGH.value,
+        "high_fit_does_not_unblock_eligibility": (
+            summary.eligibility.eligibility is Eligibility.BLOCKED
+        ),
+        "catch_all_deliverability_is_uncertain": (
+            summary.deliverability.rating == Deliverability.UNCERTAIN.value
+        ),
+        "catch_all_is_not_deliverable": (
+            summary.deliverability.rating != Deliverability.DELIVERABLE.value
+        ),
+        "freshness_reflects_stalest_field": summary.freshness.rating == QualityLevel.LOW.value,
+        "completeness_is_partial": summary.completeness.rating == QualityLevel.MEDIUM.value,
+        "reproducible": summary.to_dict() == repeat.to_dict(),
+        "nothing_deleted": total_rows == 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["dimensions"] = {
+        d.dimension.value: {"rating": d.rating, "reason": d.reason} for d in summary.dimensions()
+    }
+    out["eligibility"] = summary.eligibility.to_dict()
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network. The summary is PURE and read-only: it "
+        "grades five SEPARATE quality dimensions and carries the permission decision on a SEPARATE "
+        "eligibility axis. A HIGH business-fit grade does NOT change the BLOCKED permission outcome "
+        "(fit grants nothing), and a catch-all mail domain stays UNCERTAIN (never 'deliverable'). The "
+        "result is reproducible with no state to change; the observation rows are untouched. Acting on "
+        "a summary stays a disabled future capability.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
