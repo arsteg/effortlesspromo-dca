@@ -8266,7 +8266,10 @@ def _dca_065(ctx: CheckContext) -> dict:
     cases = {
         "malformed_cin": ("cin", "U72200MH2010PTC12345"),  # too short
         "bad_gstin_check_digit": ("gstin", "27AAPFU0939F1ZA"),  # wrong final digit
-        "gstin_declared_as_cin": ("cin", "27AAPFU0939F1ZV"),  # establishment id under legal-entity type
+        "gstin_declared_as_cin": (
+            "cin",
+            "27AAPFU0939F1ZV",
+        ),  # establishment id under legal-entity type
         "unknown_scheme": ("pan", "AAPFU0939F"),  # not a supported typed scheme here
     }
     for label, (scheme, value) in cases.items():
@@ -8327,6 +8330,170 @@ def _dca_065(ctx: CheckContext) -> dict:
         "GSTIN is NEVER extracted, and a malformed / bad-checksum / mis-typed value is refused "
         "reproducibly with no state change. Mapping an id onto a stored observation and acquisition "
         "stay disabled future capabilities.)"
+    )
+    return out
+
+
+@register(
+    "DCA-066",
+    "normalize contact phone observations to E.164: run explicit-country, missing-country and invalid "
+    "fixture numbers through the pure normalizer and show, side by side, the ORIGINAL (preserved), the "
+    "status (normalized vs unresolved), the derived E.164 / country / NSN, and the named uncertainty. "
+    "Prove E.164 is produced ONLY with supported country evidence (+91 or declared IN); that an "
+    "ambiguous number (national with no country, or an unsupported country code) stays UNRESOLVED with "
+    "the raw preserved; that +91 is a FORMATTING fact and never proves jurisdiction/consent "
+    "(jurisdiction_proof stays False); and that a malformed +91/declared-IN value is refused "
+    "reproducibly with no state change",
+)
+def _dca_066(ctx: CheckContext) -> dict:
+    """Exercise the DCA-066 phone normalizer (manual-test step 2) on local synthetic fixtures only.
+
+    Pure, deterministic, network-free Python — no model, no DB write, no HTTP, no number lookup. E.164
+    is derived ONLY when supported country evidence is available; an ambiguous number stays UNRESOLVED
+    with the original preserved and the uncertainty named; a +91 form is a formatting fact that proves
+    NO jurisdiction or consent; and every denial is reproducible and leaves no state behind (there is
+    none). Acceptance of a prospect is never recipient consent, and this module contacts no one.
+    """
+    from app.normalization import (
+        NormalizationError,
+        normalize_phone,
+        share_e164,
+    )
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+
+    out: dict = {}
+    # The normalizer is pure and tenant-agnostic: Businesses A/B would each normalize the same value
+    # identically, yet it records/merges nothing against either tenant and places nothing into any
+    # audience (recipient consent and acquisition stay disabled future capabilities).
+    out["tenant_agnostic"] = {"business_a": biz_a, "business_b": biz_b, "records_nothing": True}
+
+    def _row(label: str, raw: str, country: str | None = None) -> dict:
+        try:
+            r = normalize_phone(raw, country=country)
+            return {
+                "input": raw,
+                "declared_country": country,
+                "status": r.status,
+                "e164": r.e164,
+                "country": r.country,
+                "national_number": r.national_number,
+                "uncertainty": r.uncertainty,
+                "jurisdiction_proof": r.jurisdiction_proof,
+                "original_preserved": r.original == raw,
+            }
+        except NormalizationError as exc:
+            return {
+                "input": raw,
+                "declared_country": country,
+                "status": "refused",
+                "denial_code": exc.code,
+            }
+
+    # 2) Explicit-country, missing-country and invalid fixtures (manual-test step 2).
+    out["cases"] = {
+        # explicit country evidence -> E.164
+        "explicit_plus91": _row("explicit_plus91", "+91 98765 43210"),
+        "declared_in_national": _row("declared_in_national", "098765 43210", "IN"),
+        # missing / ambiguous country evidence -> UNRESOLVED (raw preserved, no denial)
+        "missing_country_national": _row("missing_country_national", "98765 43210"),
+        "international_unsupported": _row("international_unsupported", "+1 415 555 2671"),
+        # supported country evidence present but malformed -> reproducible DENIAL
+        "invalid_plus91": _row("invalid_plus91", "+91 12345"),
+        "invalid_declared_in": _row("invalid_declared_in", "98765 4321", "IN"),
+        # no dialable digits at all -> DENIAL
+        "no_digits": _row("no_digits", "call me"),
+    }
+
+    # 3) +91 is a FORMATTING fact only — it never establishes jurisdiction or consent.
+    plus = normalize_phone("+91 98765 43210")
+    out["plus91_is_not_jurisdiction_or_consent"] = {
+        "status": plus.status,
+        "e164": plus.e164,
+        "jurisdiction_proof": plus.jurisdiction_proof,  # ALWAYS False
+    }
+
+    # 4) share_e164 is a search HINT (same reachable number across spellings), never a merge/consent.
+    national = normalize_phone("098765 43210", country="IN")
+    other = normalize_phone("+91 91234 56780")
+    out["share_e164_hint"] = {
+        "same_number_two_spellings": share_e164(plus, national),
+        "different_numbers": share_e164(plus, other),
+        "merges_nothing": plus.jurisdiction_proof is False,
+    }
+
+    # 5) Denials are reproducible and change no state (the module is pure).
+    denials: dict[str, list[str | None]] = {}
+    for label, (raw, country) in {
+        "invalid_plus91": ("+91 12345", None),
+        "invalid_declared_in": ("98765 4321", "IN"),
+        "empty": ("   ", None),
+        "no_digits": ("call me", None),
+    }.items():
+        codes: list[str | None] = []
+        for _ in range(2):
+            try:
+                normalize_phone(raw, country=country)
+                codes.append(None)
+            except NormalizationError as exc:
+                codes.append(exc.code)
+        denials[label] = codes
+    out["denials"] = denials
+
+    print("\n2) explicit-country / missing-country / invalid fixtures (status + derived E.164):")
+    for label, row in out["cases"].items():
+        print(f"\n   [{label}]")
+        for k, v in row.items():
+            print(f"     {k:20} = {v!r}")
+    print("\n3) +91 is a FORMATTING fact only (jurisdiction_proof stays False):")
+    for k, v in out["plus91_is_not_jurisdiction_or_consent"].items():
+        print(f"     {k:20} = {v!r}")
+    print("\n4) share_e164 is a search HINT (same number across spellings), never a merge/consent:")
+    for k, v in out["share_e164_hint"].items():
+        print(f"     {k:28} = {v}")
+    print("\n5) malformed / blank / no-digit denials are reproducible with no state change:")
+    for label, codes in out["denials"].items():
+        print(f"     {label:20} = {codes} (reproducible={codes[0] == codes[1] and codes[0]})")
+
+    cases = out["cases"]
+    checks = {
+        "explicit_country_normalizes_to_e164": cases["explicit_plus91"]["e164"] == "+919876543210"
+        and cases["declared_in_national"]["e164"] == "+919876543210",
+        "missing_country_is_unresolved_not_denied": cases["missing_country_national"]["status"]
+        == "unresolved"
+        and cases["missing_country_national"]["uncertainty"] == "no_country_evidence"
+        and cases["missing_country_national"]["e164"] is None
+        and cases["missing_country_national"]["original_preserved"] is True,
+        "unsupported_country_is_unresolved": cases["international_unsupported"]["status"]
+        == "unresolved"
+        and cases["international_unsupported"]["uncertainty"] == "unsupported_country",
+        "invalid_is_refused": cases["invalid_plus91"]["denial_code"] == "invalid_phone"
+        and cases["invalid_declared_in"]["denial_code"] == "invalid_phone",
+        "no_digits_refused": cases["no_digits"]["denial_code"] == "unparseable_phone",
+        "plus91_proves_no_jurisdiction_or_consent": out["plus91_is_not_jurisdiction_or_consent"][
+            "jurisdiction_proof"
+        ]
+        is False,
+        "share_e164_is_a_hint": out["share_e164_hint"]["same_number_two_spellings"] is True
+        and out["share_e164_hint"]["different_numbers"] is False,
+        "denials_reproducible": denials["invalid_plus91"] == ["invalid_phone"] * 2
+        and denials["invalid_declared_in"] == ["invalid_phone"] * 2
+        and denials["empty"] == ["empty_phone"] * 2
+        and denials["no_digits"] == ["unparseable_phone"] * 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no DB write, no network, no number lookup. "
+        "Normalization is pure and deterministic: E.164 is derived ONLY with supported country "
+        "evidence (+91 or a declared IN country); an ambiguous number — national with no country, or "
+        "an unsupported country calling code — stays UNRESOLVED with the raw value preserved and the "
+        "uncertainty named, NOT refused. A +91 form is a FORMATTING fact that establishes NO recipient "
+        "jurisdiction or consent (jurisdiction_proof stays False); acceptance of a prospect is never "
+        "recipient consent and this module contacts no one. A malformed +91/declared-IN value, a "
+        "blank, or a no-digit value is refused reproducibly with no state change. Mapping a normalized "
+        "number onto a stored observation and acquisition stay disabled future capabilities.)"
     )
     return out
 

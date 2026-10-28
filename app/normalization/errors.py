@@ -31,6 +31,17 @@ REASON_MALFORMED_IDENTIFIER = "malformed_identifier"
 # The value is structurally shaped like the scheme but fails the scheme's built-in check digit (GSTIN).
 REASON_IDENTIFIER_CHECKSUM_FAILED = "identifier_checksum_failed"
 
+# -- DCA-066 contact phone normalization (E.164, India-only supported plan) -------------------------
+# A phone observation supplied with no usable content after trimming.
+REASON_EMPTY_PHONE = "empty_phone"
+# A phone value that holds no dialable digit at all (letters / punctuation only) — nothing to parse.
+REASON_UNPARSEABLE_PHONE = "unparseable_phone"
+# The value carried supported country evidence (an explicit ``+91`` prefix or a declared ``IN``
+# country) yet does not form a valid number for that supported numbering plan (wrong length / shape).
+# A denial here is reproducible and changes nothing; an ambiguous number with NO country evidence is
+# NOT refused — it is returned UNRESOLVED (see :mod:`app.normalization.phones`).
+REASON_INVALID_PHONE = "invalid_phone"
+
 
 class NormalizationError(Exception):
     """A normalization request was refused with a stable code. Pure — raising it mutates no state, so
