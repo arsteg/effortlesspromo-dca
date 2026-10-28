@@ -12225,7 +12225,9 @@ def _dca_087(ctx: CheckContext) -> dict:
         provider=provider_ok,
         now=now,
     )
-    print(f"\n4) business B consented address -> {tenant_b.decision.value} reasons={tenant_b.reasons}")
+    print(
+        f"\n4) business B consented address -> {tenant_b.decision.value} reasons={tenant_b.reasons}"
+    )
 
     out = {
         "consented": {"decision": consented.decision.value, "reasons": list(consented.reasons)},
@@ -12474,7 +12476,9 @@ def _dca_089(ctx: CheckContext) -> dict:
         ]
         return next(iter(project_permission_states(events, now=now).values()))
 
-    available = FakePreferenceScreeningClient(now=now)  # SMS-only, Business-A fixture has DND entries
+    available = FakePreferenceScreeningClient(
+        now=now
+    )  # SMS-only, Business-A fixture has DND entries
     unavailable = FakePreferenceScreeningClient(available=False, now=now)
 
     # 1) Consented + registry clears (Business B recipient is not registered) -> ELIGIBLE.
@@ -12578,6 +12582,216 @@ def _dca_089(ctx: CheckContext) -> dict:
         "or WhatsApp. ELIGIBLE is NOT recipient consent authority and NOT a send authorization — the "
         "actual SMS send stays a disabled future capability behind the host's one send pipeline. The "
         "decision reads nothing and writes nothing.)"
+    )
+    return out
+
+
+@register(
+    "DCA-090",
+    "evaluate WhatsApp eligibility: in isolated synthetic Businesses A/B, run the ONE composed "
+    "WhatsApp-marketing decision — (1) a properly OPTED-IN recipient with an approved marketing template "
+    "is ELIGIBLE; (2) a PUBLIC PHONE alone is BLOCKED 'contact_origin_not_opt_in'/'opt_in_not_in_force' "
+    "even though an approved template makes delivery possible; (3) an INBOUND SERVICE INQUIRY opens the "
+    "24h service window (delivery constraint SATISFIED) yet a promotional message is still BLOCKED on the "
+    "marketing-permission family — the window never substitutes for permission; (4) the same opted-in "
+    "recipient OUTSIDE the window with NO approved template is BLOCKED 'approved_template_required' (the "
+    "message-delivery constraint is real and SEPARATE from permission); (5) the opted-in recipient INSIDE "
+    "the window is ELIGIBLE via the session path. Business B is unaffected (tenant-isolated inputs). The "
+    "decision reads nothing and writes nothing. Local synthetic; no AI/paid action; ELIGIBLE is NOT "
+    "recipient consent and NOT a send authorization.",
+)
+def _dca_090(ctx: CheckContext) -> dict:
+    """Show the composed WhatsApp decision: a public phone / inbound inquiry alone cannot authorize a
+    promotional message (even when a delivery mechanism exists), and the approved-template / service-
+    window delivery constraint stays distinct from marketing permission — all pure, changing no state."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.whatsapp_eligibility import (
+        REASON_APPROVED_TEMPLATE_REQUIRED,
+        REASON_CONTACT_ORIGIN_NOT_OPT_IN,
+        REASON_OK,
+        REASON_OPT_IN_NOT_IN_FORCE,
+        ApprovedTemplate,
+        ServiceWindow,
+        TemplateStatus,
+        WhatsAppCategory,
+        WhatsAppContactOrigin,
+        WhatsAppEligibility,
+        evaluate_whatsapp_eligibility,
+    )
+    from app.compliance.whatsapp_eligibility import WHATSAPP_CHANNEL as WA
+    from app.consent.permission_state import PermissionEvent, project_permission_states
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    purpose = "marketing_whatsapp"
+    marketing = WhatsAppCategory.MARKETING.value
+    # Business A's opted-in recipient; Business B's public-phone recipient (tenant-isolated inputs).
+    opted_in_phone = "+919900000001"
+    public_phone = "+919812345678"
+
+    def _granted():
+        events = [
+            PermissionEvent(
+                receipt_id="receipt-1",
+                brand_key="brand",
+                contact_point_id="cp-1",
+                channel=WA,
+                purpose=purpose,
+                action="grant",
+                collected_at=now - timedelta(days=3),
+            )
+        ]
+        return next(iter(project_permission_states(events, now=now).values()))
+
+    approved = ApprovedTemplate(
+        template_id="tmpl-1",
+        category=marketing,
+        status=TemplateStatus.APPROVED.value,
+        language="en",
+    )
+    open_window = ServiceWindow(last_inbound_at=now - timedelta(hours=2))
+    closed_window = ServiceWindow(last_inbound_at=now - timedelta(hours=30))
+
+    # 1) Opted-in + approved marketing template -> ELIGIBLE (Business A).
+    eligible = evaluate_whatsapp_eligibility(
+        contact_point=opted_in_phone,
+        purpose=purpose,
+        permission=_granted(),
+        contact_origin=WhatsAppContactOrigin.EXPLICIT_OPT_IN.value,
+        template=approved,
+        service_window=closed_window,
+        now=now,
+    )
+    print(
+        f"\n1) opted-in + approved template -> {eligible.decision.value} "
+        f"reasons={eligible.reasons} delivery={eligible.delivery_path!r}"
+    )
+
+    # 2) A public phone alone -> BLOCKED on marketing permission, though delivery is possible (B).
+    public = evaluate_whatsapp_eligibility(
+        contact_point=public_phone,
+        purpose=purpose,
+        permission=None,  # no evidenced opt-in
+        contact_origin=WhatsAppContactOrigin.PUBLIC_PHONE.value,
+        template=approved,  # delivery WOULD be possible...
+        service_window=closed_window,
+        now=now,
+    )
+    print(
+        f"\n2) public phone (delivery possible) -> {public.decision.value} reasons={public.reasons} "
+        f"delivery_available={public.message_delivery_available} "
+        f"permission_granted={public.marketing_permission_granted}"
+    )
+
+    # 3) An inbound service inquiry opens the window (delivery OK) but still BLOCKED on permission.
+    inbound = evaluate_whatsapp_eligibility(
+        contact_point=public_phone,
+        purpose=purpose,
+        permission=None,
+        contact_origin=WhatsAppContactOrigin.INBOUND_SERVICE_INQUIRY.value,
+        template=ApprovedTemplate(),  # no approved template...
+        service_window=open_window,  # ...but the inbound inquiry opened the window
+        now=now,
+    )
+    inbound_decisive_family = inbound.decisive.family if inbound.decisive else ""
+    print(
+        f"\n3) inbound inquiry (window OPEN) -> {inbound.decision.value} reasons={inbound.reasons} "
+        f"delivery_available={inbound.message_delivery_available} delivery={inbound.delivery_path!r} "
+        f"decisive_family={inbound_decisive_family!r}"
+    )
+
+    # 4) Opted-in but OUTSIDE the window with NO approved template -> delivery constraint denies.
+    no_template = evaluate_whatsapp_eligibility(
+        contact_point=opted_in_phone,
+        purpose=purpose,
+        permission=_granted(),
+        contact_origin=WhatsAppContactOrigin.EXPLICIT_OPT_IN.value,
+        template=ApprovedTemplate(),
+        service_window=closed_window,
+        now=now,
+    )
+    print(
+        f"\n4) opted-in, window CLOSED, no template -> {no_template.decision.value} "
+        f"reasons={no_template.reasons} permission_granted={no_template.marketing_permission_granted}"
+    )
+
+    # 5) Opted-in INSIDE the window -> ELIGIBLE via the session path (no template required).
+    inside = evaluate_whatsapp_eligibility(
+        contact_point=opted_in_phone,
+        purpose=purpose,
+        permission=_granted(),
+        contact_origin=WhatsAppContactOrigin.EXPLICIT_OPT_IN.value,
+        template=ApprovedTemplate(),
+        service_window=open_window,
+        now=now,
+    )
+    print(
+        f"\n5) opted-in INSIDE window -> {inside.decision.value} reasons={inside.reasons} "
+        f"delivery={inside.delivery_path!r}"
+    )
+
+    out = {
+        "eligible": {"decision": eligible.decision.value, "reasons": list(eligible.reasons)},
+        "public_phone": {
+            "decision": public.decision.value,
+            "reasons": list(public.reasons),
+            "delivery_available": public.message_delivery_available,
+            "permission_granted": public.marketing_permission_granted,
+        },
+        "inbound_inquiry": {
+            "decision": inbound.decision.value,
+            "reasons": list(inbound.reasons),
+            "delivery_available": inbound.message_delivery_available,
+            "delivery_path": inbound.delivery_path,
+        },
+        "outside_window_no_template": {
+            "decision": no_template.decision.value,
+            "reasons": list(no_template.reasons),
+            "permission_granted": no_template.marketing_permission_granted,
+        },
+        "inside_window": {
+            "decision": inside.decision.value,
+            "reasons": list(inside.reasons),
+            "delivery_path": inside.delivery_path,
+        },
+    }
+    checks = {
+        "opted_in_eligible": eligible.decision is WhatsAppEligibility.ELIGIBLE
+        and eligible.reasons == (REASON_OK,),
+        "public_phone_blocks_despite_delivery": public.decision is WhatsAppEligibility.BLOCKED
+        and public.message_delivery_available is True
+        and public.marketing_permission_granted is False
+        and REASON_CONTACT_ORIGIN_NOT_OPT_IN in public.reasons
+        and REASON_OPT_IN_NOT_IN_FORCE in public.reasons,
+        "inbound_window_open_still_blocks_promotion": inbound.decision
+        is WhatsAppEligibility.BLOCKED
+        and inbound.message_delivery_available is True  # window satisfied the DELIVERY constraint
+        and inbound.marketing_permission_granted is False  # but PERMISSION is withheld
+        and inbound_decisive_family == "marketing_permission",
+        "delivery_constraint_is_separate_and_real": no_template.decision
+        is WhatsAppEligibility.BLOCKED
+        and no_template.marketing_permission_granted is True
+        and no_template.reasons == (REASON_APPROVED_TEMPLATE_REQUIRED,),
+        "inside_window_eligible_via_session": inside.decision is WhatsAppEligibility.ELIGIBLE
+        and inside.delivery_path == "service_window",
+        "eligible_is_not_consent": eligible.grants_consent is False,
+        "whatsapp_scoped_only": eligible.permits_channel(WA) is True
+        and eligible.permits_channel("email") is False,
+        "tenant_isolated_inputs": BUSINESS_A != BUSINESS_B,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The ONE composed WhatsApp "
+        "decision combines the marketing-PERMISSION family (consent basis + in-force opt-in + a "
+        "qualifying contact origin) with the SEPARATE message-delivery CONSTRAINT (an approved marketing "
+        "template OR an open 24h service window). A public phone or an inbound service inquiry alone "
+        "cannot authorize a promotional message: the inbound inquiry opens the window (delivery OK) yet "
+        "the message is still BLOCKED on permission — the window never substitutes for opt-in. ELIGIBLE "
+        "is NOT recipient consent and NOT a send authorization — the actual WhatsApp send stays a "
+        "disabled future capability behind the host's one send pipeline. The decision reads nothing and "
+        "writes nothing.)"
     )
     return out
 
