@@ -12796,6 +12796,194 @@ def _dca_090(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-091",
+    "evaluate Google Customer Match eligibility: in isolated synthetic Businesses A/B, run the ONE "
+    "composed audience-upload decision — (1) an all-FIRST-PARTY audience with an eligible account is "
+    "ELIGIBLE; (2) the SAME audience with one PURCHASED (bought) contact added is BLOCKED "
+    "'non_first_party_members' — and the bought contact is rejected EVEN THOUGH it was hashed exactly "
+    "like a first-party one AND the client self-attested the list is fine (attestation recorded, never "
+    "consulted); (3) a DISCOVERED (scraped) contact is likewise rejected after hashing; (4) a fully "
+    "first-party audience is still BLOCKED 'customer_match_policy_not_accepted' when the account "
+    "conditions are unmet (the account-permission family is SEPARATE from member origin). Origin is "
+    "preserved THROUGH hashing — the rejection names only the SHA-256 hash, never the raw identifier. "
+    "Business B is unaffected (tenant-isolated inputs). The decision reads nothing and writes nothing. "
+    "Local synthetic; no AI/paid action; ELIGIBLE is NOT recipient consent and NOT an upload "
+    "authorization.",
+)
+def _dca_091(ctx: CheckContext) -> dict:
+    """Show the composed Customer Match decision: bought/discovered contacts are rejected even when
+    hashed or client-'accepted', because origin travels through the SHA-256 hashing transform unchanged;
+    and the account-permission conditions stay distinct from member origin — all pure, changing no state."""
+    import hashlib
+    from datetime import UTC, datetime
+
+    from app.compliance.customer_match_eligibility import (
+        REASON_NON_FIRST_PARTY_MEMBERS,
+        REASON_OK,
+        REASON_POLICY_NOT_ACCEPTED,
+        CustomerMatchAccount,
+        CustomerMatchEligibility,
+        CustomerMatchOrigin,
+        MemberKeyType,
+        evaluate_customer_match_eligibility,
+    )
+    from app.compliance.customer_match_eligibility import (
+        CUSTOMER_MATCH_CHANNEL as CM,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    purpose = "customer_match_audience_upload"
+    EMAIL = MemberKeyType.EMAIL.value
+    PHONE = MemberKeyType.PHONE.value
+    FIRST = CustomerMatchOrigin.FIRST_PARTY.value
+    eligible_account = CustomerMatchAccount(
+        customer_match_policy_accepted=True,
+        account_in_good_standing=True,
+        terms_accepted=True,
+    )
+
+    # Business A's directly-collected first-party audience; a bought contact is the same raw email but a
+    # PURCHASED origin — proving the ONLY difference the gate sees is provenance, not the hashed value.
+    bought_raw = "bought@list.example"
+
+    # 1) All first-party + eligible account -> ELIGIBLE (Business A).
+    eligible = evaluate_customer_match_eligibility(
+        audience_name="loyal-customers-q4",
+        purpose=purpose,
+        raw_members=[
+            (EMAIL, "alice@acme.example", FIRST),
+            (PHONE, "+919900000001", FIRST),
+        ],
+        account=eligible_account,
+        now=now,
+    )
+    print(
+        f"\n1) all first-party + eligible account -> {eligible.decision.value} "
+        f"reasons={eligible.reasons} members={eligible.member_count} "
+        f"first_party={eligible.first_party_count}"
+    )
+
+    # 2) Same audience + a PURCHASED contact, hashed identically AND client-attested -> still BLOCKED.
+    with_bought = evaluate_customer_match_eligibility(
+        audience_name="loyal-customers-q4",
+        purpose=purpose,
+        raw_members=[
+            (EMAIL, "alice@acme.example", FIRST),
+            (EMAIL, bought_raw, CustomerMatchOrigin.PURCHASED.value),
+        ],
+        account=eligible_account,
+        client_attested_first_party=True,  # client "accepts" it...
+        now=now,
+    )
+    rejected_hash = (
+        with_bought.rejected_members[0].hashed_identifier if with_bought.rejected_members else ""
+    )
+    print(
+        f"\n2) +1 PURCHASED (hashed+client-attested) -> {with_bought.decision.value} "
+        f"reasons={with_bought.reasons} attested={with_bought.client_attested_first_party} "
+        f"rejected={with_bought.first_party_count}/{with_bought.member_count} first-party; "
+        f"rejected_origin={with_bought.rejected_members[0].origin!r}"
+    )
+    print(
+        f"   bought contact rejected by HASH only (raw never surfaces): {rejected_hash}"
+        f"\n   == sha256('{bought_raw}')?            : "
+        f"{rejected_hash == hashlib.sha256(bought_raw.encode()).hexdigest()}"
+    )
+
+    # 3) A DISCOVERED (scraped) contact -> rejected after hashing too (Business B's tainted import).
+    discovered = evaluate_customer_match_eligibility(
+        audience_name="scraped-leads",
+        purpose=purpose,
+        raw_members=[(PHONE, "+91 98123 45678", CustomerMatchOrigin.DISCOVERED.value)],
+        account=eligible_account,
+        now=now,
+    )
+    print(
+        f"\n3) DISCOVERED (scraped) contact -> {discovered.decision.value} "
+        f"reasons={discovered.reasons} rejected_origin={discovered.rejected_members[0].origin!r}"
+    )
+
+    # 4) Fully first-party audience but account policy NOT accepted -> BLOCKED on the account family.
+    policy_denied = evaluate_customer_match_eligibility(
+        audience_name="loyal-customers-q4",
+        purpose=purpose,
+        raw_members=[(EMAIL, "alice@acme.example", FIRST)],
+        account=CustomerMatchAccount(
+            customer_match_policy_accepted=False,
+            account_in_good_standing=True,
+            terms_accepted=True,
+            reason="data-policy-not-signed",
+        ),
+        now=now,
+    )
+    print(
+        f"\n4) first-party audience, policy NOT accepted -> {policy_denied.decision.value} "
+        f"reasons={policy_denied.reasons} data_origin_clear={policy_denied.data_origin_clear} "
+        f"account_conditions_met={policy_denied.account_conditions_met}"
+    )
+
+    out = {
+        "eligible": {
+            "decision": eligible.decision.value,
+            "reasons": list(eligible.reasons),
+            "member_count": eligible.member_count,
+        },
+        "with_bought_contact": {
+            "decision": with_bought.decision.value,
+            "reasons": list(with_bought.reasons),
+            "client_attested": with_bought.client_attested_first_party,
+            "rejected_origin": with_bought.rejected_members[0].origin,
+            "rejected_hash": rejected_hash,
+        },
+        "discovered_contact": {
+            "decision": discovered.decision.value,
+            "reasons": list(discovered.reasons),
+            "rejected_origin": discovered.rejected_members[0].origin,
+        },
+        "policy_not_accepted": {
+            "decision": policy_denied.decision.value,
+            "reasons": list(policy_denied.reasons),
+            "data_origin_clear": policy_denied.data_origin_clear,
+            "account_conditions_met": policy_denied.account_conditions_met,
+        },
+    }
+    checks = {
+        "all_first_party_eligible": eligible.decision is CustomerMatchEligibility.ELIGIBLE
+        and eligible.reasons == (REASON_OK,),
+        "bought_rejected_even_when_hashed_and_attested": with_bought.decision
+        is CustomerMatchEligibility.BLOCKED
+        and with_bought.client_attested_first_party is True  # client "accepted" it...
+        and with_bought.reasons == (REASON_NON_FIRST_PARTY_MEMBERS,)  # ...yet it is rejected
+        and with_bought.rejected_members[0].origin == CustomerMatchOrigin.PURCHASED.value
+        and rejected_hash == hashlib.sha256(bought_raw.encode()).hexdigest(),
+        "discovered_rejected_after_hashing": discovered.decision is CustomerMatchEligibility.BLOCKED
+        and discovered.reasons == (REASON_NON_FIRST_PARTY_MEMBERS,),
+        "account_family_separate_and_real": policy_denied.decision
+        is CustomerMatchEligibility.BLOCKED
+        and policy_denied.data_origin_clear is True
+        and policy_denied.reasons == (REASON_POLICY_NOT_ACCEPTED,),
+        "eligible_is_not_consent": eligible.grants_consent is False,
+        "customer_match_scoped_only": eligible.permits_channel(CM) is True
+        and eligible.permits_channel("email") is False,
+        "tenant_isolated_inputs": BUSINESS_A != BUSINESS_B,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no upload. The ONE composed Google "
+        "Customer Match decision combines the per-member DATA-ORIGIN family (first-party ONLY) with the "
+        "SEPARATE account-permission conditions (Customer Match policy accepted + good standing + terms). "
+        "A bought/discovered contact is rejected EVEN WHEN hashed exactly like a first-party one and even "
+        "when the client self-attests the list — origin travels through the SHA-256 hashing transform "
+        "UNCHANGED, and the client attestation is recorded but never consulted. ELIGIBLE is NOT recipient "
+        "consent and NOT an upload authorization — a real Customer Match upload stays a disabled future "
+        "capability. The decision reads nothing and writes nothing.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
