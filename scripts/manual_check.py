@@ -11520,7 +11520,9 @@ def _dca_084(ctx: CheckContext) -> dict:
     now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
     admin_a = ErasurePrincipal(subject="op-admin-a", roles=("owner",))
     viewer_a = ErasurePrincipal(subject="op-viewer-a", roles=("viewer",))
-    secret_email = "erase.me@synthetic.example"  # synthetic personal data — must be GONE after erasure
+    secret_email = (
+        "erase.me@synthetic.example"  # synthetic personal data — must be GONE after erasure
+    )
     secret_value = "+91 90000 00001"
 
     def _seed(session, business_id, person_id):
@@ -11684,8 +11686,7 @@ def _dca_084(ctx: CheckContext) -> dict:
     checks = {
         "a_data_erased": set(after_a.values()) == {0},
         "b_untouched": after_b == before_a,
-        "journal_records_tombstones": journal.total_deleted == 5
-        and len(audit) == 1,
+        "journal_records_tombstones": journal.total_deleted == 5 and len(audit) == 1,
         "metadata_has_no_pii": no_pii_in_metadata,
         "viewer_denied": denied_code == "data_erasure_not_authorized"
         and viewer_target_after["person"] == 1,
@@ -11700,6 +11701,196 @@ def _dca_084(ctx: CheckContext) -> dict:
         "retain only permitted minimal metadata; another tenant's identical subject is untouched; and a "
         "read-only viewer is denied with nothing deleted. Retained records and acting beyond this scope "
         "stay out of scope / disabled.)"
+    )
+    return out
+
+
+@register(
+    "DCA-085",
+    "propagate deletion to external integrations: seed an erasure journal in Business A AND the same "
+    "in Business B; an A administrator propagates through three synthetic destinations — one that "
+    "ACKNOWLEDGES, one that is explicitly UNSUPPORTED, one that TIMES OUT — and we show the timeout is "
+    "recorded 'pending' (pending reconciliation), NOT a completed deletion; then the timed-out "
+    "destination recovers and a reconcile re-sends the SAME idempotent request and advances it to "
+    "'acknowledged'; show a re-run is an idempotent no-op, B is untouched, and a read-only viewer is "
+    "denied with nothing sent. Local synthetic; no AI/paid action.",
+)
+def _dca_085(ctx: CheckContext) -> dict:
+    """Propagate an erasure to external integrations and show the actual per-destination state.
+
+    The headline acceptance criterion: a destination that times out is recorded PENDING (pending
+    reconciliation), never reported as a completed/acknowledged deletion. A reconcile re-sends the
+    SAME idempotent request and only an acknowledgment advances it. The relevant denial (a read-only
+    viewer) sends nothing and writes nothing.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.db.models import (
+        DataErasureJournal,
+        ExternalDeletionPropagation,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.integration.deletion_fake import FakeDeletionDestinationClient
+    from app.services.data_erasure import ErasurePrincipal
+    from app.services.deletion_propagation import (
+        DeletionPropagationAuthorizationError,
+        DeletionPropagator,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin_a = ErasurePrincipal(subject="op-admin-a", roles=("owner",))
+    viewer_a = ErasurePrincipal(subject="op-viewer-a", roles=("viewer",))
+    dests = ("crm_mirror", "enrichment_cache", "outreach_suppression_feed")
+    behaviours = {
+        "crm_mirror": "ack",
+        "enrichment_cache": "unsupported",
+        "outreach_suppression_feed": "timeout",
+    }
+
+    def _seed_journal(session, business_id, journal_id):
+        session.add(
+            DataErasureJournal(
+                id=journal_id,
+                business_id=business_id,
+                subject_type="person",
+                subject_id="person-x",
+                request_kind="grievance_erasure",
+                request_ref="g-1",
+                justification="grievance_erasure",
+                authority_plane="business",
+                authority_scope="data.erase",
+                executed_by="op-admin-a",
+                executed_by_type="user",
+                total_deleted=5,
+                tombstones={},
+            )
+        )
+
+    def _statuses(session, business_id, journal_id):
+        rows = session.scalars(
+            select(ExternalDeletionPropagation)
+            .where(ExternalDeletionPropagation.business_id == business_id)
+            .where(ExternalDeletionPropagation.erasure_journal_id == journal_id)
+            .order_by(ExternalDeletionPropagation.destination)
+        ).all()
+        return {r.destination: {"status": r.status, "attempts": r.attempts} for r in rows}
+
+    with ctx.session_factory() as session:
+        _seed_journal(session, BUSINESS_A, "journal-a")
+        _seed_journal(session, BUSINESS_B, "journal-b")
+        session.commit()
+
+    out: dict = {}
+    fake = FakeDeletionDestinationClient(behaviours, destinations=dests)
+
+    # 1) The A administrator propagates to the three destinations.
+    with ctx.session_factory() as session:
+        result = DeletionPropagator(session, BUSINESS_A, fake).propagate(
+            session.get(DataErasureJournal, "journal-a"), admin_a, now=now
+        )
+        session.commit()
+    after_propagate = {}
+    with ctx.session_factory() as session:
+        after_propagate = _statuses(session, BUSINESS_A, "journal-a")
+    print(f"\n1) propagate -> per-destination status {after_propagate}")
+    print(
+        f"   counts: acknowledged={result.acknowledged_count} unsupported={result.unsupported_count} "
+        f"pending={result.pending_count} failed={result.failed_count} complete={result.is_complete}"
+    )
+    out["after_propagate"] = after_propagate
+
+    # 2) A SECOND propagate is an idempotent no-op for the two terminal destinations (no re-send).
+    sends_after_first = len(fake.seen)
+    with ctx.session_factory() as session:
+        rerun = DeletionPropagator(session, BUSINESS_A, fake).propagate(
+            session.get(DataErasureJournal, "journal-a"), admin_a, now=now
+        )
+        session.commit()
+    reused = {o.destination: o.reused for o in rerun.outcomes}
+    print(f"\n2) re-run propagate -> reused(terminal, not re-sent)={reused}")
+    print(
+        f"   only the pending destination was re-sent: sends {sends_after_first} -> {len(fake.seen)}"
+    )
+    with ctx.session_factory() as session:
+        row_count = session.query(ExternalDeletionPropagation).count()
+    out["rerun_reused"] = reused
+    out["row_count_after_rerun"] = row_count
+
+    # 3) The timed-out destination recovers; a reconcile re-sends the SAME idempotent request.
+    fake.set_behaviour("outreach_suppression_feed", "ack")
+    with ctx.session_factory() as session:
+        DeletionPropagator(session, BUSINESS_A, fake).reconcile(
+            admin_a, journal_id="journal-a", now=now
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        after_reconcile = _statuses(session, BUSINESS_A, "journal-a")
+        b_rows = (
+            session.query(ExternalDeletionPropagation).filter_by(business_id=BUSINESS_B).count()
+        )
+    print(f"\n3) reconcile -> per-destination status {after_reconcile}")
+    print(f"   Business B propagation rows (untouched by A's work): {b_rows}")
+    out["after_reconcile"] = after_reconcile
+
+    # 4) A read-only viewer is DENIED (relevant denial) — nothing sent, nothing written.
+    with ctx.session_factory() as session:
+        _seed_journal(session, BUSINESS_A, "journal-v")
+        session.commit()
+    sends_before_denial = len(fake.seen)
+    with ctx.session_factory() as session:
+        try:
+            DeletionPropagator(session, BUSINESS_A, fake).propagate(
+                session.get(DataErasureJournal, "journal-v"), viewer_a, now=now
+            )
+            denied_code = None
+        except DeletionPropagationAuthorizationError as exc:
+            denied_code = exc.code
+    with ctx.session_factory() as session:
+        viewer_rows = (
+            session.query(ExternalDeletionPropagation)
+            .filter_by(erasure_journal_id="journal-v")
+            .count()
+        )
+    print(
+        f"\n4) viewer propagating -> denied code={denied_code!r}; rows written={viewer_rows}; "
+        f"requests sent={len(fake.seen) - sends_before_denial} (nothing sent/written)"
+    )
+    out["viewer_denied"] = {"code": denied_code}
+
+    checks = {
+        # The timeout is pending (pending reconciliation), never acknowledged, on first propagate.
+        "timeout_is_pending_not_completed": after_propagate["outreach_suppression_feed"]["status"]
+        == "pending"
+        and result.is_complete is False,
+        "ack_and_unsupported_recorded": after_propagate["crm_mirror"]["status"] == "acknowledged"
+        and after_propagate["enrichment_cache"]["status"] == "unsupported",
+        # Re-run made no duplicate rows and only re-sent the non-terminal (pending) destination.
+        "idempotent_rerun": row_count == 3
+        and reused["crm_mirror"]
+        and reused["enrichment_cache"]
+        and not reused["outreach_suppression_feed"],
+        # Reconcile advanced the recovered destination to acknowledged (2 attempts) and left no pending.
+        # Recovered to acknowledged on a re-send (attempts > 1 — the SAME idempotent request resent).
+        "reconcile_recovers_pending": after_reconcile["outreach_suppression_feed"]["status"]
+        == "acknowledged"
+        and after_reconcile["outreach_suppression_feed"]["attempts"] >= 2,
+        "other_tenant_untouched": b_rows == 0,
+        "viewer_denied": denied_code == "deletion_propagation_not_authorized"
+        and viewer_rows == 0
+        and (len(fake.seen) - sends_before_denial) == 0,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no real provider. Propagation sends an "
+        "idempotent deletion request through each supported destination contract and records an "
+        "acknowledgment / an explicit unsupported state / a pending timeout; a timeout is pending "
+        "reconciliation, NEVER a completed deletion; a reconcile re-sends the SAME idempotent request "
+        "and only an acknowledgment advances it; a re-run is an idempotent no-op; another tenant is "
+        "untouched; and a read-only viewer is denied with nothing sent. The live destination adapter "
+        "stays disabled — production has no client.)"
     )
     return out
 

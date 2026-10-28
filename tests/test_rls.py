@@ -69,6 +69,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "restriction_propagations",
         "privacy_grievances",
         "data_erasure_journals",
+        "external_deletion_propagations",
     }
 
 

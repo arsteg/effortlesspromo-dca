@@ -2637,3 +2637,99 @@ class DataErasureJournal(TenantOwned, Base):
     # Shape: {"observations": {table: [ids]}, "evidence": [ids], "projections": [ids]}. No personal data.
     tombstones: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ExternalDeletionStatus(str, Enum):
+    """DCA-085 — the per-destination outcome of propagating an erasure to an external integration.
+
+    An erasure (DCA-084) removes the DCA's OWN operational data. Some of that data may ALSO live in a
+    supported external platform/provider integration; this story sends an idempotent deletion/removal
+    request through each supported contract and records the outcome here. Four terminal-or-pending
+    states, and only these:
+
+    - ``ACKNOWLEDGED`` — the destination accepted the deletion/removal and returned an acknowledgment
+      reference. This is the only state that means "the external copy is confirmed removed".
+    - ``UNSUPPORTED`` — the destination contract explicitly does NOT support deletion/removal (or does
+      not support it for this subject kind). An honest, recorded "cannot be propagated here" — not a
+      failure and not a silent success.
+    - ``PENDING`` — the request was sent but no acknowledgment was received in time (a timeout). It is
+      **pending reconciliation**, NOT a completed deletion: a later reconciliation re-sends the SAME
+      idempotent request and only an acknowledgment advances it to ``ACKNOWLEDGED``.
+    - ``FAILED`` — the destination explicitly rejected the request (a permanent, non-timeout error).
+      Recorded distinctly from a timeout so a reviewer can tell "never acknowledged" from "refused".
+
+    A timeout is deliberately NEVER folded into ``ACKNOWLEDGED`` — treating "we didn't hear back" as
+    "deleted" is exactly the fail-open this story forbids.
+    """
+
+    ACKNOWLEDGED = "acknowledged"
+    UNSUPPORTED = "unsupported"
+    PENDING = "pending"
+    FAILED = "failed"
+
+
+class ExternalDeletionPropagation(TenantOwned, Base):
+    """DCA-085 — a per-destination deletion-propagation receipt for one erasure (tenant-owned, RLS).
+
+    One row records that a single external integration DESTINATION was asked to delete/remove the data
+    for the subject of one :class:`DataErasureJournal`, and WHAT the destination said: an
+    acknowledgment, an explicit unsupported state, a pending-reconciliation timeout, or a failure. It
+    is the durable, reviewable record that the local erasure (DCA-084) was PROPAGATED outward through
+    the supported platform/provider contracts.
+
+    The load-bearing guarantees (the DCA-085 acceptance criteria):
+
+    - **Idempotent; a re-run makes no unintended change.** Each ``(erasure_journal_id, destination)``
+      is unique within a business, so propagating the same erasure twice reuses the same row. The
+      :attr:`idempotency_key` sent to the external contract is deterministic, so a re-send is
+      de-duplicated end to end. A destination already ``ACKNOWLEDGED`` / ``UNSUPPORTED`` is terminal —
+      a re-run never re-sends to it and never rewrites it.
+
+    - **A timeout is pending reconciliation, never a completed deletion.** A request that times out is
+      recorded ``PENDING`` with its attempt count; it is NOT reported as acknowledged. Reconciliation
+      re-sends the same idempotent request and only an acknowledgment moves it to ``ACKNOWLEDGED``.
+
+    The row carries ONLY opaque references — the journal id, the subject id, an opaque destination key,
+    an opaque acknowledgment reference and reason code, who requested it and when. It never holds a
+    contact value, an org/person name or a field value. Tenant-owned: it inherits the DCA-017
+    ``business_id`` column and the DCA-018 RLS policy like every other tenant data table, so one tenant
+    can never read or drive another's propagations.
+    """
+
+    __tablename__ = "external_deletion_propagations"
+    __table_args__ = (
+        tenant_unique(
+            "erasure_journal_id",
+            "destination",
+            name="uq_external_deletion_journal_destination",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The erasure this propagation answers — a DataErasureJournal.id in THIS business (opaque id).
+    erasure_journal_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The subject the deletion is for — echoed for traceability (opaque ids; mirrors the journal).
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The external integration destination the request was sent to — an opaque, controlled contract
+    # key (e.g. a platform/provider integration id), never a URL/secret/endpoint.
+    destination: Mapped[str] = mapped_column(String(64), index=True)
+    # The DETERMINISTIC idempotency key sent to the external contract, so an exact re-send is
+    # de-duplicated by the destination. Opaque (derived from the journal id + destination).
+    idempotency_key: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # The per-destination outcome (ExternalDeletionStatus).
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    # The opaque acknowledgment reference the destination returned (present only when ACKNOWLEDGED).
+    acknowledgment_ref: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # A stable, opaque reason/detail code for the outcome (e.g. why UNSUPPORTED / FAILED). Never a raw
+    # provider message — a controlled code only.
+    detail_code: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # HOW MANY dispatch attempts have been made (1 on first send; incremented by each reconciliation).
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # WHO requested the propagation — an opaque subject id (never a name/email) plus its kind.
+    requested_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    requested_by_type: Mapped[str] = mapped_column(
+        String(32), default="user", server_default="user"
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

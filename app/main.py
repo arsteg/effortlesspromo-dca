@@ -16,6 +16,7 @@ from app.api.routes import (
     auth,
     authz,
     budget,
+    deletion_propagation,
     grievances,
     health,
     icp,
@@ -42,6 +43,7 @@ from app.identity import IdentityContractDisabled, build_identity_client
 from app.identity.contract import IdentityClient
 from app.identity.service_credentials import build_service_credential_verifier
 from app.identity.tokens import build_token_verifier
+from app.integration.deletion_fake import build_deletion_destination_client
 from app.services.entitlement_gate import default_entitlement_client
 from app.services.profile_importer import default_platform_profile_client
 
@@ -112,6 +114,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # DCA-037: the platform-profile client used to import an authorized profile snapshot into a
     # provenance-bearing draft (None when the contract is disabled — the import then fails closed).
     app.state.platform_profile_client = default_platform_profile_client(settings)
+    # DCA-085: the external-deletion destination client used to propagate an erasure outward (None
+    # when the contract is disabled — production, until the live adapter ships — so propagation fails
+    # closed rather than acknowledging against a synthetic destination).
+    app.state.deletion_destination_client = build_deletion_destination_client(settings)
     # DCA-012: resolve/publish the per-request correlation id (reaches endpoints, handlers, logs).
     app.add_middleware(CorrelationIdMiddleware)
     # DCA-011: one standardized error envelope + correlation id for every error response.
@@ -131,5 +137,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(grievances.router)
     app.include_router(privacy_scope.router)
     app.include_router(privacy_erasure.router)
+    app.include_router(deletion_propagation.router)
     app.include_router(service_integration.router)
     return app
