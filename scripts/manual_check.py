@@ -12090,6 +12090,178 @@ def _dca_086(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-087",
+    "evaluate email marketing eligibility: in isolated synthetic Businesses A/B, run the ONE composed "
+    "email decision over three fixtures with IDENTICAL deliverability (same verified + high-fit address, "
+    "same clear suppression view, same source rights) — (1) a CONSENTED address (an evidenced grant) is "
+    "ELIGIBLE; (2) a FLAG-ONLY import (a bare 'subscribed=true' that produced no evidenced receipt, so "
+    "no permission is in force) stays BLOCKED 'consent_not_in_force' even though it is verified and "
+    "high-fit; (3) a PROVIDER-PROHIBITED address — fully consented and otherwise passing — is BLOCKED "
+    "'provider_restricted', showing the provider gate denies INDEPENDENTLY. Business B's own consented "
+    "address is unaffected (tenant-isolated). The decision reads nothing and writes nothing. Local "
+    "synthetic; no AI/paid action; consent-first, no generic B2B exception.",
+)
+def _dca_087(ctx: CheckContext) -> dict:
+    """Show the composed email-eligibility decision: consent-first, verification/fit never qualify,
+    and a sender-provider rule can deny on its own — all pure, changing no state."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.email_eligibility import (
+        REASON_CONSENT_NOT_IN_FORCE,
+        REASON_OK,
+        REASON_PROVIDER_RESTRICTED,
+        EmailEligibility,
+        ProviderRule,
+        SourceRights,
+        evaluate_email_eligibility,
+    )
+    from app.consent.permission_state import (
+        PermissionEvent,
+        project_permission_states,
+    )
+    from app.suppression.contract import (
+        SuppressionAvailability,
+        SuppressionSnapshot,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    purpose = "marketing_email"
+    biz_a, biz_b = "biz-a", "biz-b"
+    consented_a = "consented@acme-synthetic.example"
+    flag_only_a = "flag-only@acme-synthetic.example"
+    prohibited_a = "prohibited@acme-synthetic.example"
+    consented_b = "consented@globex-synthetic.example"
+
+    # Identical "deliverability" for every fixture: source rights OK + a clear, fresh, in-scope
+    # authoritative suppression view. Only the consent/provider inputs differ between the fixtures.
+    rights_ok = SourceRights(permits_email_contact=True)
+    provider_ok = ProviderRule(allowed=True)
+    provider_deny = ProviderRule(allowed=False, reason="recipient_domain_blocklisted")
+
+    def _clear_snapshot(business_id: str) -> SuppressionSnapshot:
+        return SuppressionSnapshot(
+            business_id=business_id,
+            availability=SuppressionAvailability.AVAILABLE,
+            version="v1",
+            as_of=now,
+            covered_channels=("email",),
+            entries=(),
+            synthetic=True,
+        )
+
+    def _granted_projection(contact_point_id: str):
+        events = [
+            PermissionEvent(
+                receipt_id=f"receipt-{contact_point_id}",
+                brand_key="brand",
+                contact_point_id=contact_point_id,
+                channel="email",
+                purpose=purpose,
+                action="grant",
+                collected_at=now - timedelta(days=7),
+            )
+        ]
+        return next(iter(project_permission_states(events, now=now).values()))
+
+    # 1) Consented, verified, high-fit -> ELIGIBLE.
+    consented = evaluate_email_eligibility(
+        contact_point=consented_a,
+        purpose=purpose,
+        permission=_granted_projection("cp-consented"),
+        source_rights=rights_ok,
+        suppression_snapshot=_clear_snapshot(biz_a),
+        provider=provider_ok,
+        now=now,
+        email_verified=True,
+        fit_band="high",
+    )
+    print(
+        f"\n1) consented+verified+high-fit -> {consented.decision.value} reasons={consented.reasons}"
+    )
+
+    # 2) Flag-only import (no evidenced receipt -> no permission) BUT still verified + high-fit.
+    flag_only = evaluate_email_eligibility(
+        contact_point=flag_only_a,
+        purpose=purpose,
+        permission=None,  # a bare "subscribed=true" produced no DCA-074 receipt => no permission
+        source_rights=rights_ok,
+        suppression_snapshot=_clear_snapshot(biz_a),
+        provider=provider_ok,
+        now=now,
+        email_verified=True,
+        fit_band="high",
+    )
+    print(
+        f"\n2) flag-only import (verified+high-fit, NO consent evidence) -> "
+        f"{flag_only.decision.value} reasons={flag_only.reasons} "
+        f"(verified={flag_only.email_verified}, fit={flag_only.fit_band!r} — recorded, not consulted)"
+    )
+
+    # 3) Provider-prohibited: fully consented + otherwise passing, provider denies on its own.
+    provider_blocked = evaluate_email_eligibility(
+        contact_point=prohibited_a,
+        purpose=purpose,
+        permission=_granted_projection("cp-prohibited"),
+        source_rights=rights_ok,
+        suppression_snapshot=_clear_snapshot(biz_a),
+        provider=provider_deny,
+        now=now,
+        email_verified=True,
+        fit_band="high",
+    )
+    print(
+        f"\n3) consented but provider-prohibited -> {provider_blocked.decision.value} "
+        f"reasons={provider_blocked.reasons} decisive={provider_blocked.decisive.gate!r}"
+    )
+
+    # 4) Business B's own consented address is unaffected (tenant-isolated inputs).
+    tenant_b = evaluate_email_eligibility(
+        contact_point=consented_b,
+        purpose=purpose,
+        permission=_granted_projection("cp-b"),
+        source_rights=rights_ok,
+        suppression_snapshot=_clear_snapshot(biz_b),
+        provider=provider_ok,
+        now=now,
+    )
+    print(f"\n4) business B consented address -> {tenant_b.decision.value} reasons={tenant_b.reasons}")
+
+    out = {
+        "consented": {"decision": consented.decision.value, "reasons": list(consented.reasons)},
+        "flag_only": {"decision": flag_only.decision.value, "reasons": list(flag_only.reasons)},
+        "provider_blocked": {
+            "decision": provider_blocked.decision.value,
+            "reasons": list(provider_blocked.reasons),
+        },
+        "tenant_b": {"decision": tenant_b.decision.value, "reasons": list(tenant_b.reasons)},
+    }
+    checks = {
+        "consented_eligible": consented.decision is EmailEligibility.ELIGIBLE
+        and consented.reasons == (REASON_OK,),
+        "flag_only_blocked_no_consent": flag_only.decision is EmailEligibility.BLOCKED
+        and REASON_CONSENT_NOT_IN_FORCE in flag_only.reasons
+        and flag_only.decisive.gate == "permission",
+        "verification_fit_did_not_qualify": flag_only.email_verified is True
+        and flag_only.fit_band == "high"
+        and flag_only.decision is EmailEligibility.BLOCKED,
+        "provider_denies_independently": provider_blocked.decision is EmailEligibility.BLOCKED
+        and provider_blocked.reasons == (REASON_PROVIDER_RESTRICTED,),
+        "tenant_b_unaffected": tenant_b.decision is EmailEligibility.ELIGIBLE,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The ONE composed email decision "
+        "is consent-first with NO generic B2B exception: a verified, high-fit address with no evidenced "
+        "consent stays BLOCKED, and a sender-provider restriction denies INDEPENDENTLY of permission / "
+        "rights / freshness / suppression. ELIGIBLE is NOT recipient consent and NOT a send authorization "
+        "— the actual send stays a disabled future capability behind the host's one send pipeline. The "
+        "decision reads nothing and writes nothing.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
