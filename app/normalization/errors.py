@@ -42,6 +42,13 @@ REASON_UNPARSEABLE_PHONE = "unparseable_phone"
 # NOT refused — it is returned UNRESOLVED (see :mod:`app.normalization.phones`).
 REASON_INVALID_PHONE = "invalid_phone"
 
+# -- DCA-068 contact email normalization (for contact identity matching) ----------------------------
+# An email contact value supplied with no usable content after trimming.
+REASON_EMPTY_EMAIL = "empty_email"
+# A value that is not a well-formed ``local@host`` address (no single ``@``, empty local part, or a
+# host that is not a well-formed domain). A denial here is reproducible and changes nothing.
+REASON_INVALID_EMAIL = "invalid_email"
+
 
 class NormalizationError(Exception):
     """A normalization request was refused with a stable code. Pure — raising it mutates no state, so

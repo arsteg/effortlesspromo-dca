@@ -8663,6 +8663,168 @@ def _dca_067(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-068",
+    "match contacts WITHOUT merging consent: run shared-personal-mailbox, recycled-number, common-name "
+    "and reassignment fixtures through the pure deterministic contact matcher and show, side by side, "
+    "each pair's OUTCOME (match/no_match/review/insufficient), confidence and contributing signals. "
+    "Prove a compatible PERSONAL mailbox is the ONLY thing that confirms a person (MATCH); that a "
+    "shared/recycled NUMBER or a common NAME is only a WEAK review candidate and, when refuted by "
+    "different personal mailboxes, a NO_MATCH (two different people on a recycled contact point) — so "
+    "one person's permission NEVER transfers to another; that a reassignment/role change is flagged "
+    "for REVIEW, never a silent carry-over; and that the result + the relevant denial are reproducible "
+    "with no state change (the matcher is pure, merges nothing and transfers no permission)",
+)
+def _dca_068(ctx: CheckContext) -> dict:
+    """Exercise the DCA-068 contact matcher (manual-test step 2) on local synthetic fixtures only.
+
+    Pure, deterministic, network-free Python — no model, no DB write, no HTTP. Only a compatible
+    PERSONAL mailbox confirms a person; a shared/recycled number or a common name is weak and never
+    transfers permission (refuted by different personal mailboxes => NO_MATCH); a reassignment/role
+    change is a REVIEW flag, never an automatic match. A MATCH is a conclusion, never a merge
+    (auto_merged / permission_transferred stay False), and every result/denial is reproducible with no
+    state change.
+    """
+    from app.matching import ContactMatchOutcome, build_contact_subject, build_subject, match_contacts
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+
+    out: dict = {}
+    # The matcher is pure and tenant-agnostic: it compares two evidence bundles and records / merges /
+    # transfers NOTHING against either tenant. Within the product it is a WITHIN-business
+    # candidate-resolution aid (acting on a conclusion — merging people, moving permission — stays a
+    # disabled future capability).
+    out["tenant_agnostic"] = {
+        "business_a": biz_a,
+        "business_b": biz_b,
+        "records_nothing": True,
+        "transfers_no_permission": True,
+    }
+
+    recycled = "9900112233"  # synthetic India mobile, shared below to model a recycled/shared number
+    acme = build_subject(name="Acme", identifiers=[("cin", "U72900MH2010PTC123456")])
+    globex = build_subject(name="Globex", identifiers=[("cin", "U72900KA2011PTC654321")])
+
+    def _pair(label: str, a, b) -> dict:
+        r = match_contacts(a, b)
+        return {
+            "label": label,
+            "outcome": r.outcome.value,
+            "confidence": r.confidence.value,
+            "reassignment_review": r.requires_reassignment_review,
+            "auto_merged": r.auto_merged,
+            "permission_transferred": r.permission_transferred,
+            "signals": [f"{s.kind.value}:{s.strength.value}:{s.relation.value}" for s in r.signals],
+        }
+
+    cases = [
+        _pair(
+            "shared_personal_mailbox_is_match",
+            build_contact_subject(name="Ramesh Kumar", emails=["ramesh@acme.in"]),
+            build_contact_subject(name="R. Kumar", emails=["Ramesh@ACME.in"]),
+        ),
+        _pair(
+            "recycled_number_different_mailboxes_is_no_match",
+            build_contact_subject(name="Ramesh Kumar", emails=["ramesh@acme.in"], phones=[recycled]),
+            build_contact_subject(name="Suresh Rao", emails=["suresh@globex.in"], phones=[recycled]),
+        ),
+        _pair(
+            "shared_number_alone_is_review",
+            build_contact_subject(name="Ramesh Kumar", phones=[recycled]),
+            build_contact_subject(name="Suresh Rao", phones=[recycled]),
+        ),
+        _pair(
+            "common_name_alone_is_review",
+            build_contact_subject(name="Ramesh Kumar"),
+            build_contact_subject(name="ramesh kumar"),
+        ),
+        _pair(
+            "shared_role_mailbox_alone_is_review",
+            build_contact_subject(name="Front Desk", emails=["info@acme.in"]),
+            build_contact_subject(name="Reception", emails=["info@acme.in"]),
+        ),
+        _pair(
+            "reassignment_same_person_new_employer_is_review",
+            build_contact_subject(emails=["ramesh@personal.in"], employer=acme),
+            build_contact_subject(emails=["ramesh@personal.in"], employer=globex),
+        ),
+        _pair(
+            "role_change_is_review",
+            build_contact_subject(emails=["ramesh@personal.in"], role_title="Procurement Head"),
+            build_contact_subject(emails=["ramesh@personal.in"], role_title="Finance Head"),
+        ),
+        _pair(
+            "no_shared_evidence_insufficient",
+            build_contact_subject(name="Alpha", emails=["alpha@a.in"], phones=["9811111111"]),
+            build_contact_subject(name="Beta", emails=["beta@b.in"], phones=["9822222222"]),
+        ),
+    ]
+    out["cases"] = cases
+
+    # The relevant DENIAL (refusing to transfer permission via a recycled number) is reproducible with
+    # no state change.
+    denial_a = build_contact_subject(name="Ramesh", emails=["ramesh@acme.in"], phones=[recycled])
+    denial_b = build_contact_subject(name="Suresh", emails=["suresh@globex.in"], phones=[recycled])
+    repeated = [match_contacts(denial_a, denial_b).outcome.value for _ in range(2)]
+    out["denial_reproducible"] = repeated
+
+    print("\n2) contact-match fixtures (outcome + confidence + reassignment + signals):")
+    for row in cases:
+        print(f"\n   [{row['label']}]")
+        print(f"     outcome               = {row['outcome']}")
+        print(f"     confidence            = {row['confidence']}")
+        print(f"     reassignment_review   = {row['reassignment_review']}")
+        print(f"     auto_merged           = {row['auto_merged']}")
+        print(f"     permission_transferred= {row['permission_transferred']}")
+        print(f"     signals               = {row['signals']}")
+    print(f"\n3) recycled-number denial reproduced twice: {repeated}")
+
+    by_label = {c["label"]: c for c in cases}
+    checks = {
+        "personal_mailbox_is_match": by_label["shared_personal_mailbox_is_match"]["outcome"]
+        == ContactMatchOutcome.MATCH.value,
+        "recycled_number_is_no_match": by_label["recycled_number_different_mailboxes_is_no_match"][
+            "outcome"
+        ]
+        == ContactMatchOutcome.NO_MATCH.value,
+        "shared_number_alone_is_review": by_label["shared_number_alone_is_review"]["outcome"]
+        == ContactMatchOutcome.REVIEW.value,
+        "common_name_alone_is_review": by_label["common_name_alone_is_review"]["outcome"]
+        == ContactMatchOutcome.REVIEW.value,
+        "shared_role_mailbox_is_review": by_label["shared_role_mailbox_alone_is_review"]["outcome"]
+        == ContactMatchOutcome.REVIEW.value,
+        "reassignment_is_review": (
+            by_label["reassignment_same_person_new_employer_is_review"]["outcome"]
+            == ContactMatchOutcome.REVIEW.value
+            and by_label["reassignment_same_person_new_employer_is_review"]["reassignment_review"]
+        ),
+        "role_change_is_review": (
+            by_label["role_change_is_review"]["outcome"] == ContactMatchOutcome.REVIEW.value
+            and by_label["role_change_is_review"]["reassignment_review"]
+        ),
+        "no_evidence_is_insufficient": by_label["no_shared_evidence_insufficient"]["outcome"]
+        == ContactMatchOutcome.INSUFFICIENT.value,
+        "never_auto_merges": all(c["auto_merged"] is False for c in cases),
+        "never_transfers_permission": all(c["permission_transferred"] is False for c in cases),
+        "denial_reproducible": repeated == [ContactMatchOutcome.NO_MATCH.value] * 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no DB write, no network. Matching is pure and "
+        "deterministic: ONLY a compatible PERSONAL mailbox confirms a MATCH; a shared/recycled NUMBER "
+        "or a common NAME (or a shared role mailbox) is WEAK — at most a REVIEW candidate, and when "
+        "refuted by different personal mailboxes a NO_MATCH (two different people on a recycled contact "
+        "point) — so one person's permission NEVER transfers to another; a reassignment / role change "
+        "is flagged for REVIEW, never a silent carry-over. A MATCH is a conclusion, NEVER an automatic "
+        "merge and NEVER a permission transfer (auto_merged / permission_transferred stay False) — "
+        "acting on it, and acquisition/consent, stay disabled future capabilities. The result and the "
+        "relevant denial are reproducible with no state to change.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
