@@ -12984,6 +12984,140 @@ def _dca_091(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-092",
+    "gate social use by operation: in isolated synthetic Businesses A/B, run the per-operation social "
+    "decision and show the four operations are SEPARATELY authorized — (1) content research on the "
+    "business's OWN company facts is ELIGIBLE; (2) that SAME content-research grant permits content "
+    "research ONLY: it does NOT grant direct-message, customer-list-upload ('ad upload') or publish "
+    "permission (permits_operation False, grants_* False); (3) separately requesting a direct message or "
+    "a customer-list upload is independently BLOCKED as a disabled future capability (on BOTH the "
+    "operation and platform families); (4) even content research is BLOCKED on an unsupported audience "
+    "platform (LinkedIn) — unsupported audience platforms stay disabled. The decision reads nothing and "
+    "writes nothing. Local synthetic; no AI/paid action; ELIGIBLE is NOT recipient consent and NOT a "
+    "publish/DM/upload authorization.",
+)
+def _dca_092(ctx: CheckContext) -> dict:
+    """Show the per-operation social gate: an ELIGIBLE content-research decision authorizes content
+    research ONLY and never leaks into DM/upload/publish, which are independently blocked disabled future
+    capabilities; unsupported audience platforms stay disabled — all pure, changing no state."""
+    from datetime import UTC, datetime
+
+    from app.compliance.social_operation_eligibility import (
+        REASON_OK,
+        REASON_OPERATION_NOT_SUPPORTED,
+        REASON_PLATFORM_NOT_SUPPORTED,
+        SocialOperation,
+        SocialOperationEligibility,
+        SocialPlatform,
+        evaluate_social_operation,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    RESEARCH = SocialOperation.CONTENT_RESEARCH.value
+    DM = SocialOperation.DIRECT_MESSAGE.value
+    UPLOAD = SocialOperation.CUSTOMER_LIST_UPLOAD.value
+    FACTS = SocialPlatform.COMPANY_FACTS.value
+    LINKEDIN = SocialPlatform.LINKEDIN.value
+
+    # 1) Content research on the business's OWN company facts (Business A) -> ELIGIBLE.
+    research = evaluate_social_operation(
+        operation=RESEARCH,
+        platform=FACTS,
+        purpose="draft_company_fact_post",
+        requested_by="business-a-operator",
+        now=now,
+    )
+    print(
+        f"\n1) content_research on company_facts -> {research.decision.value} "
+        f"reasons={research.reasons}"
+    )
+
+    # 2) The SAME research grant authorizes content research ONLY — not DM/upload/publish.
+    print(
+        "\n2) the content-research grant permits:\n"
+        f"   content_research      -> {research.permits_operation(RESEARCH)}\n"
+        f"   direct_message        -> {research.permits_operation(DM)} "
+        f"(grants_direct_message={research.grants_direct_message})\n"
+        f"   customer_list_upload  -> {research.permits_operation(UPLOAD)} "
+        f"(grants_customer_list_upload={research.grants_customer_list_upload})\n"
+        f"   content_publish       -> {research.grants_publish}"
+    )
+
+    # 3) Separately requesting DM / upload -> independently BLOCKED (disabled future capabilities).
+    dm = evaluate_social_operation(operation=DM, platform=LINKEDIN, now=now)
+    upload = evaluate_social_operation(
+        operation=UPLOAD, platform=SocialPlatform.FACEBOOK.value, now=now
+    )
+    print(
+        f"\n3) request direct_message -> {dm.decision.value} reasons={dm.reasons}\n"
+        f"   request customer_list_upload -> {upload.decision.value} reasons={upload.reasons}"
+    )
+
+    # 4) Content research on an UNSUPPORTED audience platform (LinkedIn) -> BLOCKED on the platform family.
+    research_on_linkedin = evaluate_social_operation(operation=RESEARCH, platform=LINKEDIN, now=now)
+    print(
+        f"\n4) content_research on LinkedIn (audience platform) -> "
+        f"{research_on_linkedin.decision.value} reasons={research_on_linkedin.reasons}"
+    )
+
+    out = {
+        "content_research": {
+            "decision": research.decision.value,
+            "reasons": list(research.reasons),
+            "permits_research": research.permits_operation(RESEARCH),
+            "permits_direct_message": research.permits_operation(DM),
+            "permits_customer_list_upload": research.permits_operation(UPLOAD),
+            "grants_publish": research.grants_publish,
+        },
+        "direct_message_request": {
+            "decision": dm.decision.value,
+            "reasons": list(dm.reasons),
+        },
+        "customer_list_upload_request": {
+            "decision": upload.decision.value,
+            "reasons": list(upload.reasons),
+        },
+        "research_on_unsupported_platform": {
+            "decision": research_on_linkedin.decision.value,
+            "reasons": list(research_on_linkedin.reasons),
+        },
+    }
+    checks = {
+        "content_research_eligible": research.decision is SocialOperationEligibility.ELIGIBLE
+        and research.reasons == (REASON_OK,),
+        "research_grant_permits_research_only": research.permits_operation(RESEARCH) is True
+        and research.permits_operation(DM) is False
+        and research.permits_operation(UPLOAD) is False
+        and research.grants_direct_message is False
+        and research.grants_customer_list_upload is False
+        and research.grants_publish is False,
+        "direct_message_independently_blocked": dm.decision is SocialOperationEligibility.BLOCKED
+        and REASON_OPERATION_NOT_SUPPORTED in dm.reasons,
+        "customer_list_upload_independently_blocked": upload.decision
+        is SocialOperationEligibility.BLOCKED
+        and REASON_OPERATION_NOT_SUPPORTED in upload.reasons,
+        "unsupported_audience_platform_disabled": research_on_linkedin.decision
+        is SocialOperationEligibility.BLOCKED
+        and research_on_linkedin.reasons == (REASON_PLATFORM_NOT_SUPPORTED,),
+        "eligible_is_not_consent": research.grants_consent is False,
+        "tenant_isolated_inputs": BUSINESS_A != BUSINESS_B,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no publish/DM/upload. The social surface "
+        "is gated PER OPERATION: content research (drafting company-fact content from the business's OWN "
+        "public information) is the one supported operation; publish, direct message and customer-list "
+        "upload ('ad upload') are independently-authorized DISABLED future capabilities, and a "
+        "content-research grant never confers any of them. Unsupported audience platforms stay disabled. "
+        "ELIGIBLE is NOT recipient consent and NOT a publish/DM/upload authorization. The decision reads "
+        "nothing and writes nothing.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
