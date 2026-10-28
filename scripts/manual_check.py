@@ -8186,6 +8186,151 @@ def _dca_064(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-065",
+    "validate typed Indian org identifiers (CIN/LLPIN/GSTIN): run checksum-valid fixtures through the "
+    "pure validator and show, side by side, each identifier's declared TYPE, its derived entity class "
+    "(legal_entity for CIN/LLPIN, establishment for GSTIN), the preserved ORIGINAL evidence and the "
+    "canonical normalized form. Prove a GSTIN is an ESTABLISHMENT reference never conflated with the "
+    "legal-entity CIN/LLPIN; that two GSTINs of ONE legal entity (same PAN, two states) stay distinct "
+    "establishments; that the GSTIN's embedded PAN is NEVER extracted; and that malformed values / a "
+    "bad GSTIN check digit / a GSTIN declared as a CIN are refused reproducibly with no state change",
+)
+def _dca_065(ctx: CheckContext) -> dict:
+    """Exercise the DCA-065 typed-identifier validator (manual-test step 2) on local synthetic fixtures.
+
+    Pure, deterministic, network-free Python — no model, no DB write, no HTTP, no registry lookup. A
+    validated identifier keeps its declared TYPE and original evidence; an establishment id (GSTIN) is
+    never treated as the legal-entity id (CIN/LLPIN); the PAN embedded in a GSTIN is never extracted;
+    and every denial is reproducible and leaves no state behind (there is no state to change).
+    """
+    from app.normalization import (
+        NormalizationError,
+        entity_class_for,
+        validate_org_identifier,
+    )
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+
+    out: dict = {}
+    # The validator is pure and tenant-agnostic: Businesses A/B would each validate the same typed id
+    # to the identical result, yet it records/merges nothing against either tenant (recording a
+    # validated id against an observation is DCA-059's job, a separate scoped write).
+    out["tenant_agnostic"] = {"business_a": biz_a, "business_b": biz_b, "records_nothing": True}
+
+    # 1) Typed fixtures — each identifier keeps its declared type and derived entity class.
+    #    Two GSTINs share ONE legal entity's PAN (AAPFU0939F) across two states (establishments).
+    fixtures = {
+        "legal_entity_cin": ("cin", "U72200MH2010PTC123456"),
+        "legal_entity_llpin": ("llpin", "AAB-1234"),
+        "establishment_gstin_maharashtra": ("gstin", "27AAPFU0939F1ZV"),
+        "establishment_gstin_karnataka": ("gstin", "29AAPFU0939F1ZR"),
+    }
+    validated = {label: validate_org_identifier(s, v) for label, (s, v) in fixtures.items()}
+    out["identifiers"] = {
+        label: {
+            "scheme": r.scheme,
+            "entity_class": r.entity_class,
+            "original": r.original,
+            "normalized": r.normalized,
+            "state_code": r.state_code,
+            "validated": r.validated,
+        }
+        for label, r in validated.items()
+    }
+
+    # 2) Establishment vs legal entity is NEVER conflated; two establishments of one entity stay distinct.
+    mh = validated["establishment_gstin_maharashtra"]
+    ka = validated["establishment_gstin_karnataka"]
+    cin = validated["legal_entity_cin"]
+    out["no_conflation"] = {
+        "gstin_is_establishment": mh.entity_class == "establishment",
+        "cin_is_legal_entity": cin.entity_class == "legal_entity",
+        "two_establishments_of_one_entity_distinct": mh.normalized != ka.normalized
+        and mh.state_code != ka.state_code,
+        "legal_entity_id_not_equated_to_its_gstins": cin.normalized
+        not in {mh.normalized, ka.normalized},
+        "entity_class_derived_from_scheme": entity_class_for("gstin") == "establishment"
+        and entity_class_for("cin") == "legal_entity",
+    }
+
+    # 3) The PAN embedded in a GSTIN is NEVER extracted — only whole-id forms + non-personal state code.
+    out["no_personal_extraction"] = {
+        "result_fields": sorted(vars(mh)),
+        "embedded_pan_not_a_field": not hasattr(mh, "pan"),
+    }
+
+    # 4) Failure cases — refused reproducibly, with no state change (the validator is pure).
+    denials: dict[str, list[str | None]] = {}
+    cases = {
+        "malformed_cin": ("cin", "U72200MH2010PTC12345"),  # too short
+        "bad_gstin_check_digit": ("gstin", "27AAPFU0939F1ZA"),  # wrong final digit
+        "gstin_declared_as_cin": ("cin", "27AAPFU0939F1ZV"),  # establishment id under legal-entity type
+        "unknown_scheme": ("pan", "AAPFU0939F"),  # not a supported typed scheme here
+    }
+    for label, (scheme, value) in cases.items():
+        codes: list[str | None] = []
+        for _ in range(2):
+            try:
+                validate_org_identifier(scheme, value)
+                codes.append(None)
+            except NormalizationError as exc:
+                codes.append(exc.code)
+        denials[label] = codes
+    out["denials"] = denials
+
+    print("\n1) typed identifiers — declared TYPE + derived entity class, original preserved:")
+    for label, r in out["identifiers"].items():
+        print(f"\n   [{label}]")
+        for k, v in r.items():
+            print(f"     {k:14} = {v!r}")
+    print("\n2) establishment vs legal entity is never conflated:")
+    for k, v in out["no_conflation"].items():
+        print(f"     {k:44} = {v}")
+    print("\n3) the GSTIN's embedded PAN is never extracted (only whole-id forms + state code):")
+    for k, v in out["no_personal_extraction"].items():
+        print(f"     {k:28} = {v}")
+    print("\n4) malformed / bad-checksum / mis-typed / unknown-scheme denials are reproducible:")
+    for label, codes in out["denials"].items():
+        print(f"     {label:24} = {codes} (reproducible={codes[0] == codes[1] and codes[0]})")
+
+    checks = {
+        "gstin_is_establishment_cin_is_legal_entity": out["no_conflation"]["gstin_is_establishment"]
+        is True
+        and out["no_conflation"]["cin_is_legal_entity"] is True,
+        "two_establishments_of_one_entity_distinct": out["no_conflation"][
+            "two_establishments_of_one_entity_distinct"
+        ]
+        is True,
+        "legal_entity_not_equated_to_gstins": out["no_conflation"][
+            "legal_entity_id_not_equated_to_its_gstins"
+        ]
+        is True,
+        "embedded_pan_not_extracted": out["no_personal_extraction"]["embedded_pan_not_a_field"]
+        is True
+        and "pan" not in out["no_personal_extraction"]["result_fields"],
+        "malformed_refused": denials["malformed_cin"] == ["malformed_identifier"] * 2,
+        "bad_checksum_refused": denials["bad_gstin_check_digit"]
+        == ["identifier_checksum_failed"] * 2,
+        "mistyped_refused_not_coerced": denials["gstin_declared_as_cin"]
+        == ["malformed_identifier"] * 2,
+        "unknown_scheme_refused": denials["unknown_scheme"] == ["unknown_identifier_scheme"] * 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no DB write, no network, no registry lookup. "
+        "Validation is pure and deterministic: each identifier KEEPS its declared type and original "
+        "evidence, a GSTIN is an ESTABLISHMENT reference never conflated with the legal-entity "
+        "CIN/LLPIN, two GSTINs of one legal entity stay distinct establishments, the PAN embedded in a "
+        "GSTIN is NEVER extracted, and a malformed / bad-checksum / mis-typed value is refused "
+        "reproducibly with no state change. Mapping an id onto a stored observation and acquisition "
+        "stay disabled future capabilities.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
