@@ -10456,6 +10456,200 @@ def _dca_077(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-078",
+    "store scoped processing restrictions: Business A's acting user records a LOCAL restriction "
+    "(brand/channel/purpose) — it persists tenant-owned (business_id set, authority_plane=business, "
+    "version 1) with an atomic audit entry; a read-only VIEWER is refused and stages NO row. A platform "
+    "OPERATOR records a justified PLATFORM-WIDE source removal — control-plane (no business_id, "
+    "authority_plane=platform, justification required); a tenant admin and a missing justification are "
+    "each refused and stage nothing. The two kinds coexist in one ledger yet are distinguishable.",
+)
+def _dca_078(ctx: CheckContext) -> dict:
+    """Show the restriction ledger: a LOCAL (tenant) restriction and a PLATFORM-WIDE source removal,
+    each requiring its own plane's authority, with the relevant denials changing nothing.
+
+    Local synthetic only (AI disabled, ephemeral DB). A restriction authorizes no send and creates no
+    prospect/host record — it only ever makes processing MORE restrictive; acting on it stays a disabled
+    future capability behind the one send pipeline.
+    """
+    from datetime import UTC, datetime
+
+    from app.db.models import AuditEvent, PlatformSourceRestriction, ProcessingRestriction
+    from app.services.processing_restriction import (
+        PlatformRestrictionPrincipal,
+        PlatformSourceRestrictionStore,
+        ProcessingRestrictionAuthorizationError,
+        ProcessingRestrictionError,
+        ProcessingRestrictionInput,
+        ProcessingRestrictionStore,
+        RestrictionPrincipal,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    user = "00000000-0000-4000-9000-0000000a0078"
+    operator = "00000000-0000-4000-9000-00000090e778"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    source_key = "mca_master_data"
+
+    acting_user = RestrictionPrincipal(subject=user, roles=("user",))
+    viewer = RestrictionPrincipal(subject=user, roles=("viewer",))
+    operator_principal = PlatformRestrictionPrincipal(
+        subject=operator, roles=("platform_operator",)
+    )
+    tenant_admin = PlatformRestrictionPrincipal(subject=user, roles=("owner", "admin"))
+
+    out: dict = {"business_a": biz_a}
+
+    # 1) LOCAL restriction recorded by an authorized acting user.
+    with ctx.session_factory() as session:
+        row = ProcessingRestrictionStore(session, biz_a).restrict(
+            ProcessingRestrictionInput(
+                brand_key="AcmeNewsletter",
+                channel="email",
+                purpose="marketing_email",
+                reason="subject_request",
+            ),
+            acting_user,
+            now=now,
+        )
+        session.commit()
+        local_id = row.id
+
+    with ctx.session_factory() as session:
+        row = ProcessingRestrictionStore(session, biz_a).get(local_id)
+        assert row is not None
+        audit = (
+            session.query(AuditEvent)
+            .filter(AuditEvent.action == "processing.restriction.record")
+            .count()
+        )
+        out["local_restriction"] = {
+            "id": row.id,
+            "business_id": row.business_id,
+            "authority_plane": row.authority_plane,
+            "authority_scope": row.authority_scope,
+            "scope": [row.scope_brand, row.scope_channel, row.scope_purpose],
+            "version": row.version,
+            "retention_mode": row.retention_mode,
+            "audit_entries": audit,
+        }
+
+    # 2) The LOCAL denial: a read-only viewer is refused and stages NO row.
+    with ctx.session_factory() as session:
+        before = session.query(ProcessingRestriction).count()
+        try:
+            ProcessingRestrictionStore(session, biz_a).restrict(
+                ProcessingRestrictionInput(channel="email"), viewer, now=now
+            )
+            denied = "NOT REFUSED (bug)"
+        except ProcessingRestrictionAuthorizationError as exc:
+            denied = exc.code
+        session.rollback()
+        after = session.query(ProcessingRestriction).count()
+        out["local_viewer_denied"] = {"code": denied, "rows_unchanged": before == after}
+
+    # 3) PLATFORM-WIDE source removal recorded by an authorized operator.
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="api",
+                name="Synthetic Registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        session.commit()
+
+    with ctx.session_factory() as session:
+        row = PlatformSourceRestrictionStore(session).restrict_source(
+            source_key,
+            operator_principal,
+            justification="licence revoked by registry",
+            now=now,
+        )
+        session.commit()
+        platform_id = row.id
+
+    with ctx.session_factory() as session:
+        row = PlatformSourceRestrictionStore(session).get(platform_id)
+        assert row is not None
+        out["platform_restriction"] = {
+            "id": row.id,
+            "has_business_id": hasattr(row, "business_id"),
+            "authority_plane": row.authority_plane,
+            "authority_scope": row.authority_scope,
+            "source_key": row.source_key,
+            "justification": row.justification,
+            "version": row.version,
+        }
+
+    # 4) The PLATFORM denials: a tenant admin, and a missing justification, each refused + no row.
+    platform_denials: dict = {}
+    with ctx.session_factory() as session:
+        before = session.query(PlatformSourceRestriction).count()
+        try:
+            PlatformSourceRestrictionStore(session).restrict_source(
+                source_key, tenant_admin, justification="j", now=now
+            )
+            platform_denials["tenant_admin"] = "NOT REFUSED (bug)"
+        except ProcessingRestrictionAuthorizationError as exc:
+            platform_denials["tenant_admin"] = exc.code
+        session.rollback()
+
+        try:
+            PlatformSourceRestrictionStore(session).restrict_source(
+                source_key, operator_principal, justification="   ", now=now
+            )
+            platform_denials["missing_justification"] = "NOT REFUSED (bug)"
+        except ProcessingRestrictionError as exc:
+            platform_denials["missing_justification"] = exc.code
+        session.rollback()
+
+        after = session.query(PlatformSourceRestriction).count()
+        platform_denials["rows_unchanged"] = before == after
+    out["platform_denials"] = platform_denials
+
+    local = out["local_restriction"]
+    plat = out["platform_restriction"]
+    print("\n1) LOCAL restriction (tenant-owned, business-plane authority):")
+    for k, v in local.items():
+        print(f"     {k:16} = {v}")
+    print(f"\n2) LOCAL denial — read-only viewer: {out['local_viewer_denied']}")
+    print("\n3) PLATFORM-WIDE source removal (control-plane, platform-plane authority):")
+    for k, v in plat.items():
+        print(f"     {k:16} = {v}")
+    print(f"\n4) PLATFORM denials — tenant admin / missing justification: {platform_denials}")
+
+    checks = {
+        "local_is_tenant_owned": local["business_id"] == biz_a
+        and local["authority_plane"] == "business",
+        "local_has_atomic_audit": local["audit_entries"] == 1,
+        "local_viewer_refused_no_row": out["local_viewer_denied"]
+        == {"code": "processing_restriction_not_authorized", "rows_unchanged": True},
+        "platform_is_control_plane": plat["has_business_id"] is False
+        and plat["authority_plane"] == "platform",
+        "platform_requires_justification": plat["justification"] != "",
+        "tenant_admin_refused": platform_denials["tenant_admin"] == "not_platform_operator",
+        "missing_justification_refused": platform_denials["missing_justification"]
+        == "missing_justification",
+        "platform_denials_changed_nothing": platform_denials["rows_unchanged"] is True,
+        "distinguishable": local["authority_plane"] != plat["authority_plane"],
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A LOCAL restriction is tenant-owned and needs a "
+        "business user holding 'processing.restrict'; a PLATFORM-WIDE source removal is control-plane, "
+        "needs a platform operator holding 'platform.source.restrict', and requires a justification. "
+        "Each kind is distinguishable by plane/ownership, and every denial stages no row. Recording a "
+        "restriction authorizes no send and creates no prospect/host record.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
