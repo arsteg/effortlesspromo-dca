@@ -10,11 +10,13 @@ stable reason code), and every cycle produces one DiscoveryRun — the explainab
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.compliance.field_minimization import minimize_contact
 from app.compliance.rulepacks import (
     REASON_DUPLICATE,
     REASON_OK,
@@ -39,6 +41,8 @@ from app.services.entitlement_gate import (
 )
 from app.sources.base import SourceAdapter
 from app.sources.synthetic_india import SyntheticIndiaRegistry
+
+_log = logging.getLogger("dca.discovery")
 
 
 class DiscoveryError(Exception):
@@ -139,13 +143,23 @@ def run_discovery(
                 continue
             suggested += 1
             existing_ids.add(raw.org_identifier)
+            # DCA-058 — data minimisation: discard prohibited personal field classes (children/
+            # sensitive profiling, private mobiles, unnecessary identifiers) from the contact BEFORE
+            # the candidate is persisted. A business-role label does not bypass classification. The
+            # log line carries field names/classes only — never a rejected raw value.
+            minimised = minimize_contact(raw.contact)
+            if minimised.rejected:
+                _log.info(
+                    "minimised prohibited candidate fields",
+                    extra={"minimization": minimised.log_summary()},
+                )
             session.add(
                 ProspectCandidate(
                     business_id=business_id,
                     run_id=run.id,
                     org_name=raw.org_name,
                     org_identifier=raw.org_identifier,
-                    contact=raw.contact,
+                    contact=minimised.kept,
                     source_key=raw.source_key,
                     source_ref=raw.source_ref,
                     trust_tier=raw.trust_tier,

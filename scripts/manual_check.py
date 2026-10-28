@@ -6636,6 +6636,170 @@ def _dca_057(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-058",
+    "reject prohibited personal field classes: a deterministic minimization screen discards "
+    "children/sensitive profiling, private-mobile harvesting and unnecessary identifiers BEFORE a "
+    "candidate is persisted; a business-role label (kind/role) does not bypass classification; "
+    "allowed company facts survive; logs/metadata carry field names/classes only — never a rejected "
+    "raw value",
+)
+def _dca_058(ctx: CheckContext) -> dict:
+    """Feed allowed company facts + forbidden fixture fields through the screen and the acquisition
+    path, then inspect storage and the log-safe summary for the ABSENCE of forbidden values
+    (manual-test step 2):
+
+      1. classify a representative field of every class (company fact -> allowed; aadhaar/pan ->
+         unnecessary identifier; dob/caste -> children/sensitive; personal mobile -> private mobile);
+      2. the role-label rule: ``director_aadhaar`` is still an identifier and a personal mobile VALUE
+         carried under ``kind=company_phone``/``role=CEO`` is still a private mobile — the label does
+         not launder the class;
+      3. run discovery for synthetic Business A against an adapter that smuggles a personal mobile +
+         aadhaar + age into an otherwise-clean org contact; the stored candidate keeps only the labels
+         and the clean fields — every prohibited value is discarded before the row is written;
+      4. the log-safe summary lists the discarded field NAMES/CLASSES but contains no raw value, and a
+         grep over the persisted row + summary for the forbidden values finds none.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral
+    DB). The screen is wired only into the acquisition minimisation point; future capabilities stay
+    disabled.
+    """
+    from sqlalchemy import select
+
+    from app.compliance.field_minimization import (
+        CLASS_ALLOWED,
+        CLASS_CHILDREN_SENSITIVE,
+        CLASS_PRIVATE_MOBILE,
+        CLASS_UNNECESSARY_IDENTIFIER,
+        classify_field,
+        minimize_contact,
+    )
+    from app.compliance.rulepacks import RawCandidate
+    from app.db.models import IcpProfile, ProspectCandidate, TenantAgent
+    from app.services import discovery as discovery_mod
+    from app.services.discovery import run_discovery
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+
+    out: dict = {}
+
+    # 1) + 2) classification, including the role-label rule.
+    classifications = {
+        "org_name": classify_field("org_name", "Synthetic Textiles Pvt Ltd"),
+        "gstin": classify_field("gstin", "27AAAAA0000A1Z5"),
+        "company_phone (landline)": classify_field("company_phone", "+91-11-2345-6789"),
+        "aadhaar": classify_field("aadhaar", "1234-5678-9012"),
+        "director_aadhaar (role label)": classify_field("director_aadhaar", "1234-5678-9012"),
+        "founder_dob (role label)": classify_field("founder_dob", "2012-01-01"),
+        "caste": classify_field("caste", "x"),
+        "personal_mobile": classify_field("personal_mobile", "9812345678"),
+        "ceo_mobile (role label, mobile value)": classify_field("ceo_mobile", "9812345678"),
+        "company_phone w/ mobile value": classify_field("company_phone", "9812345678"),
+    }
+    out["classifications"] = classifications
+
+    forbidden_contact = {
+        "kind": "company_phone",
+        "role": "CEO",
+        "phone": "+91-98765-43210",  # personal mobile behind a company label
+        "aadhaar": "1234-5678-9012",  # unnecessary identifier
+        "age": "15",  # children/sensitive
+    }
+    screened = minimize_contact(forbidden_contact)
+    out["screen"] = {
+        "kept": screened.kept,
+        "log_summary": screened.log_summary(),
+    }
+
+    # 3) run discovery against an adapter that smuggles the forbidden fields into a clean org.
+    class _ForbiddenAdapter:
+        key = "synthetic.forbidden"
+        trust_tier = "official_registry"
+
+        def fetch(self, icp: dict) -> list[RawCandidate]:
+            return [
+                RawCandidate(
+                    org_name="Synthetic Textiles Pvt Ltd",
+                    org_identifier="U17120MH2026PTC900099",
+                    source_key=self.key,
+                    source_ref="synthetic://mca/U17120MH2026PTC900099",
+                    trust_tier=self.trust_tier,
+                    contact=dict(forbidden_contact),
+                )
+            ]
+
+    # Platform feature flag on for this synthetic run only (off by default); still local synthetic.
+    discovery_settings = ctx.settings.model_copy(update={"feature_enabled": True})
+    original_enabled = discovery_mod.enabled_adapters
+    discovery_mod.enabled_adapters = lambda settings: [_ForbiddenAdapter()]  # type: ignore[assignment]
+    try:
+        with ctx.session_factory() as session:
+            session.add(TenantAgent(business_id=biz_a, country="IN", enabled=True))
+            session.add(
+                IcpProfile(business_id=biz_a, industries=[], regions=[], roles=[], status="active")
+            )
+            session.commit()
+        with ctx.session_factory() as session:
+            run_discovery(session, discovery_settings, biz_a)
+        with ctx.session_factory() as session:
+            candidate = session.scalar(
+                select(ProspectCandidate).where(ProspectCandidate.business_id == biz_a)
+            )
+            stored_contact = dict(candidate.contact) if candidate else None
+    finally:
+        discovery_mod.enabled_adapters = original_enabled  # type: ignore[assignment]
+
+    out["stored_contact"] = stored_contact
+
+    # 4) grep the persisted row + the log-safe summary for the forbidden raw values.
+    forbidden_values = ["98765", "43210", "1234-5678-9012", "15"]
+    haystack = repr(stored_contact) + repr(out["screen"]["log_summary"])
+    leaks = {v: (v in haystack) for v in forbidden_values}
+    out["forbidden_value_leaks"] = leaks
+
+    print("\n1-2) classification (business-role labels do NOT bypass classification):")
+    for name, cls in classifications.items():
+        print(f"     {name:42} -> {cls}")
+    print("\n3) minimized contact kept (labels + clean fields only), log-safe summary:")
+    print(f"     kept        = {out['screen']['kept']}")
+    print(f"     log_summary = {out['screen']['log_summary']}")
+    print("\n   persisted candidate contact after a real discovery run:")
+    print(f"     stored_contact = {stored_contact}")
+    print("\n4) grep the persisted row + summary for forbidden raw values (expect all False):")
+    for value, present in leaks.items():
+        print(f"     {value!r:20} present={present}")
+
+    checks = {
+        "company_facts_allowed": (
+            classifications["org_name"] == CLASS_ALLOWED
+            and classifications["gstin"] == CLASS_ALLOWED
+            and classifications["company_phone (landline)"] == CLASS_ALLOWED
+        ),
+        "identifiers_rejected": classifications["aadhaar"] == CLASS_UNNECESSARY_IDENTIFIER,
+        "sensitive_rejected": classifications["caste"] == CLASS_CHILDREN_SENSITIVE,
+        "private_mobile_rejected": classifications["personal_mobile"] == CLASS_PRIVATE_MOBILE,
+        "role_label_does_not_bypass": (
+            classifications["director_aadhaar (role label)"] == CLASS_UNNECESSARY_IDENTIFIER
+            and classifications["founder_dob (role label)"] == CLASS_CHILDREN_SENSITIVE
+            and classifications["ceo_mobile (role label, mobile value)"] == CLASS_PRIVATE_MOBILE
+            and classifications["company_phone w/ mobile value"] == CLASS_PRIVATE_MOBILE
+        ),
+        "prohibited_discarded_before_persistence": stored_contact
+        == {"kind": "company_phone", "role": "CEO"},
+        "no_forbidden_value_in_storage_or_logs": not any(leaks.values()),
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Disallowed personal field classes — children/"
+        "sensitive profiling, private-mobile harvesting and unnecessary identifiers — are discarded "
+        "BEFORE the candidate is persisted; a business-role label never bypasses classification; "
+        "metadata/logs carry field names and classes only, never a rejected raw value. The screen is "
+        "wired only into the acquisition minimisation point: future capabilities stay disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
