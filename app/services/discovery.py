@@ -31,6 +31,7 @@ from app.db.models import (
     DiscoveryRun,
     IcpProfile,
     ProspectCandidate,
+    RestrictedIdentityOrigin,
     TenantAgent,
 )
 from app.entitlements import EntitlementClient
@@ -38,6 +39,10 @@ from app.services.entitlement_gate import (
     EntitlementGateError,
     default_entitlement_client,
     ensure_entitled,
+)
+from app.services.reacquisition import (
+    REASON_RESTRICTED_IDENTITY,
+    reacquisition_decision,
 )
 from app.sources.base import SourceAdapter
 from app.sources.synthetic_india import SyntheticIndiaRegistry
@@ -127,6 +132,28 @@ def run_discovery(
         for raw in adapter.fetch(icp_dict):
             found += 1
             result = screen(raw, pack)
+            # DCA-086 — reacquisition guard: a restricted platform-sourced identity must NOT be
+            # resurrected by a reimport, even after its operational rows were erased. The scope-aware
+            # comparison (same business + subject kind + platform origin + identity fingerprint) takes
+            # precedence over the duplicate check so a restricted identity reads as restricted, not as a
+            # stale duplicate. A different identity / origin / tenant is not blocked — unrelated lawful
+            # scoped data is preserved.
+            if result.allowed:
+                block = reacquisition_decision(
+                    session,
+                    business_id,
+                    "organization",
+                    raw.org_identifier,
+                    RestrictedIdentityOrigin.PLATFORM.value,
+                    identity_scheme="org_identifier",
+                    now=now,
+                )
+                if block.blocked:
+                    result = ScreenResult(
+                        False,
+                        REASON_RESTRICTED_IDENTITY,
+                        "restricted identity — reacquisition prevented",
+                    )
             if result.allowed and raw.org_identifier in existing_ids:
                 result = ScreenResult(False, REASON_DUPLICATE, "already known for this business")
             session.add(

@@ -2733,3 +2733,119 @@ class ExternalDeletionPropagation(TenantOwned, Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class RestrictedIdentityOrigin(str, Enum):
+    """DCA-086 — the SOURCING origin a reacquisition tombstone speaks for (scope-aware comparison).
+
+    A tombstone forbids *re-acquiring* an identity, but only within the origin it was restricted for —
+    so the comparison is scope-aware, never a blanket block:
+
+    - ``PLATFORM`` — the identity was a PLATFORM-sourced record (acquired through a catalogued source /
+      the discovery cycle). A platform-sourced restriction blocks a platform-sourced reacquisition of
+      the same identity; it is exactly the "restricted platform-sourced record cannot be resurrected"
+      guarantee.
+    - ``TENANT`` — the identity was the tenant's OWN supplied/first-party data. A tenant-origin
+      restriction does NOT block a platform-sourced reacquisition (a different origin / lawful basis),
+      and vice-versa. This is what keeps *unrelated lawful scoped data preserved* even when the raw
+      identifier happens to collide.
+    """
+
+    PLATFORM = "platform"
+    TENANT = "tenant"
+
+
+class ReacquisitionPurpose(str, Enum):
+    """DCA-086 — WHY a reacquisition tombstone is retained (a controlled, declared purpose).
+
+    A tombstone is the minimal record kept so a restricted identity cannot be silently re-acquired.
+    Because the tombstone still carries a (pseudonymous, NOT anonymous) identity fingerprint, it must
+    declare the limited purpose it is retained FOR — it exists ONLY to screen reacquisition, never to
+    re-enable contact, scoring or any other processing.
+    """
+
+    PREVENT_REACQUISITION = "prevent_reacquisition"
+
+
+class RestrictedIdentityTombstone(TenantOwned, Base):
+    """DCA-086 — a protected minimal tombstone that prevents reacquisition of a restricted identity.
+
+    When a platform-sourced record is restricted/erased, deleting its operational rows is not enough:
+    the NEXT discovery cycle would fetch the same identity from the same source and silently resurrect
+    it. This tombstone is the durable "do not re-acquire this identity" marker that survives the
+    deletion so a reimport is screened out rather than re-suggested.
+
+    **Minimal and protected — a pseudonym, never called anonymous.** The row stores NO raw identifier
+    (no CIN/GSTIN/email/phone): only a deterministic ``identity_hash`` (the fingerprint the scope-aware
+    comparison matches on), the ``hash_algorithm`` that produced it, the subject kind, the sourcing
+    ``origin`` it speaks for, the declared ``purpose`` and ``retention``, and opaque provenance (who/
+    when/under which authority, and the erasure/restriction it answers). The hash is a *pseudonym* — it
+    is derived from, and re-derivable from, the identifier, so it is treated as personal data: it is
+    tenant-owned (RLS-protected like every other tenant table), minimised, retained only for the
+    declared purpose and never exported. It is deliberately NOT labelled anonymous.
+
+    **Scope-aware comparison (the load-bearing guarantee).** A tombstone blocks reacquisition only for
+    the SAME business, the SAME subject kind, the SAME ``origin`` and the SAME identity fingerprint.
+    A different identity, a different origin (a tenant-supplied record vs a platform-sourced one), or a
+    different tenant is NOT blocked — unrelated lawful scoped data is preserved. Unresolved scope reads
+    nothing (RLS fail-closed), so a tombstone can never leak across tenants.
+
+    **Insert-only, idempotent.** Each ``(subject_type, origin, identity_hash)`` is unique within a
+    business, so re-restricting the same identity reuses the existing tombstone rather than duplicating
+    it. Lifting a tombstone (re-permitting reacquisition) stays a DISABLED future capability.
+    """
+
+    __tablename__ = "restricted_identity_tombstones"
+    __table_args__ = (
+        tenant_unique(
+            "subject_type",
+            "origin",
+            "identity_hash",
+            name="uq_restricted_identity_scope",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The subject kind the restricted identity is (mirrors FieldSubjectType): organization | person.
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    # WHICH kind of identifier was fingerprinted (e.g. "org_identifier" / "contact_point") — descriptive
+    # provenance for the hash, so a reviewer knows what the fingerprint is OF. A controlled short code.
+    identity_scheme: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    # The deterministic PSEUDONYMOUS fingerprint of the restricted identity (hex). Derived from the raw
+    # identifier; the raw identifier itself is NEVER stored. The scope-aware comparison matches on this.
+    identity_hash: Mapped[str] = mapped_column(String(64), index=True)
+    # The algorithm/scheme that produced ``identity_hash`` — recorded so the fingerprint is explicitly a
+    # documented pseudonym (reproducible from the identifier), not an opaque "anonymous" value.
+    hash_algorithm: Mapped[str] = mapped_column(
+        String(32), default="sha256", server_default="sha256"
+    )
+    # The sourcing origin this tombstone speaks for (RestrictedIdentityOrigin) — the scope dimension
+    # that keeps the comparison scope-aware (a platform restriction never blocks a tenant-origin record).
+    origin: Mapped[str] = mapped_column(String(16), index=True)
+    # WHY the tombstone is retained (ReacquisitionPurpose) — the limited, declared purpose.
+    purpose: Mapped[str] = mapped_column(
+        String(48),
+        default=ReacquisitionPurpose.PREVENT_REACQUISITION.value,
+        server_default=ReacquisitionPurpose.PREVENT_REACQUISITION.value,
+    )
+    # How long the tombstone is honoured (RestrictionRetentionMode) — until explicitly lifted
+    # (indefinite) or until a stated date, after which a future sweep may treat it as lapsed.
+    retention_mode: Mapped[str] = mapped_column(
+        String(16),
+        default=RestrictionRetentionMode.UNTIL_LIFTED.value,
+        server_default=RestrictionRetentionMode.UNTIL_LIFTED.value,
+    )
+    retain_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # The restriction/erasure this tombstone answers — an opaque row key (e.g. a DataErasureJournal.id
+    # or a ProcessingRestriction.id) + a short kind, both descriptive only. Optional.
+    origin_kind: Mapped[str] = mapped_column(String(48), default="", server_default="")
+    origin_ref: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Which authority plane authorized the tombstone (always 'business' here) + the explicit scope held.
+    authority_plane: Mapped[str] = mapped_column(
+        String(16), default="business", server_default="business"
+    )
+    authority_scope: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHO recorded the tombstone — an opaque subject id (never a name/email) plus its kind.
+    created_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    created_by_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

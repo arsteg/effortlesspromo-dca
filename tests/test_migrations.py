@@ -61,6 +61,8 @@ DCA_TABLES = {
     "restriction_propagations",
     "privacy_grievances",
     "data_erasure_journals",
+    "external_deletion_propagations",
+    "restricted_identity_tombstones",
 }
 
 

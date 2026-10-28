@@ -11895,6 +11895,201 @@ def _dca_085(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-086",
+    "prevent reacquisition of restricted identities: in isolated synthetic Businesses A/B, run "
+    "discovery in A (a platform-sourced identity is suggested), then an A administrator records a "
+    "protected minimal tombstone for that identity and its candidate row is deleted (simulating the "
+    "erasure); a REIMPORT from the SAME source is screened out 'restricted_identity' (NOT resurrected) "
+    "while an unrelated lawful candidate is preserved; Business B — which never restricted it — may "
+    "still lawfully acquire the SAME identity (scope-aware, tenant-isolated); and a read-only viewer is "
+    "denied with nothing written. The tombstone stores only a PSEUDONYMOUS fingerprint, never the raw "
+    "identifier. Local synthetic; no AI/paid action.",
+)
+def _dca_086(ctx: CheckContext) -> dict:
+    """Show that a restricted platform-sourced identity cannot be resurrected by a reimport.
+
+    The headline acceptance criterion: a reimport of a restricted identity is screened out
+    'restricted_identity' (never re-suggested), while unrelated lawful scoped data is preserved and
+    another tenant that never restricted it is unaffected. The relevant denial (a read-only viewer)
+    writes nothing, and the tombstone never stores the raw identifier.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.core.config import Settings
+    from app.db.models import (
+        AcquisitionDecision,
+        IcpProfile,
+        ProspectCandidate,
+        RestrictedIdentityOrigin,
+        RestrictedIdentityTombstone,
+        TenantAgent,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.discovery import run_discovery
+    from app.services.reacquisition import (
+        ReacquisitionAuthorizationError,
+        ReacquisitionPrincipal,
+        RestrictedIdentityTombstoneStore,
+        fingerprint_identity,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    restricted_id = "U17120MH2026PTC900001"  # synthetic org registry id (platform-sourced)
+    unrelated_id = "U15400GJ2026PTC900002"  # a second synthetic id, left lawful
+    platform = RestrictedIdentityOrigin.PLATFORM.value
+    admin_a = ReacquisitionPrincipal(subject="op-admin-a", roles=("owner",))
+    viewer_a = ReacquisitionPrincipal(subject="op-viewer-a", roles=("viewer",))
+
+    # Discovery needs the feature + a synthetic source on; the base ctx settings leave AI/paid off.
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        environment=ctx.settings.environment,
+        database_url=ctx.settings.database_url,
+        service_auth_token="manual-check-token",
+        synthetic_sources_enabled=True,
+        feature_enabled=True,
+        worker_enabled=False,
+    )
+
+    def _enable(session, business_id):
+        session.add(TenantAgent(business_id=business_id, country="IN", enabled=True))
+        session.add(
+            IcpProfile(
+                business_id=business_id, industries=[], regions=[], roles=[], status="active"
+            )
+        )
+
+    def _decisions(session, business_id):
+        rows = session.scalars(
+            select(AcquisitionDecision).where(AcquisitionDecision.business_id == business_id)
+        ).all()
+        out = {}
+        for r in sorted(rows, key=lambda r: r.created_at):
+            out[r.org_identifier] = f"{r.decision}:{r.reason_code}"
+        return out
+
+    out: dict = {}
+    with ctx.session_factory() as session:
+        _enable(session, BUSINESS_A)
+        _enable(session, BUSINESS_B)
+        session.commit()
+
+    # 1) First discovery in A suggests the restricted identity (no tombstone yet).
+    with ctx.session_factory() as session:
+        run_discovery(session, settings, BUSINESS_A, now=now)
+    with ctx.session_factory() as session:
+        first = _decisions(session, BUSINESS_A)
+    print(f"\n1) first discovery(A) decisions: {first}")
+    out["first_discovery"] = first
+
+    # 2) Restrict the identity (tombstone) + delete its candidate row (simulate the erasure).
+    with ctx.session_factory() as session:
+        ts = RestrictedIdentityTombstoneStore(session, BUSINESS_A).record(
+            "organization",
+            restricted_id,
+            admin_a,
+            origin=platform,
+            identity_scheme="org_identifier",
+            origin_kind="erasure",
+            now=now,
+        )
+        session.query(ProspectCandidate).filter_by(
+            business_id=BUSINESS_A, org_identifier=restricted_id
+        ).delete()
+        session.commit()
+        tombstone_id = ts.id
+    with ctx.session_factory() as session:
+        row = session.get(RestrictedIdentityTombstone, tombstone_id)
+        stored = {
+            "identityHash": row.identity_hash,
+            "hashAlgorithm": row.hash_algorithm,
+            "origin": row.origin,
+            "purpose": row.purpose,
+            "storesRawIdentifier": restricted_id
+            in (row.identity_hash + row.identity_scheme + (row.origin_ref or "")),
+        }
+    print(
+        f"\n2) recorded tombstone {tombstone_id} — stored={stored} "
+        f"(fingerprint == sha256 of the id: "
+        f"{stored['identityHash'] == fingerprint_identity('organization', 'org_identifier', restricted_id)})"
+    )
+    out["tombstone"] = stored
+
+    # 3) A reimport from the SAME source must NOT resurrect the restricted identity.
+    with ctx.session_factory() as session:
+        run_discovery(session, settings, BUSINESS_A, now=now)
+    with ctx.session_factory() as session:
+        again = _decisions(session, BUSINESS_A)
+        restricted_rows = (
+            session.query(ProspectCandidate)
+            .filter_by(business_id=BUSINESS_A, org_identifier=restricted_id)
+            .count()
+        )
+        unrelated_rows = (
+            session.query(ProspectCandidate)
+            .filter_by(business_id=BUSINESS_A, org_identifier=unrelated_id)
+            .count()
+        )
+    print(f"\n3) reimport(A) decisions: {again}")
+    print(
+        f"   restricted candidate rows after reimport={restricted_rows} (0 = not resurrected); "
+        f"unrelated candidate rows={unrelated_rows} (1 = preserved)"
+    )
+    out["reimport_discovery"] = again
+
+    # 4) Business B never restricted it — a scope-aware, tenant-isolated acquisition still suggests it.
+    with ctx.session_factory() as session:
+        run_discovery(session, settings, BUSINESS_B, now=now)
+    with ctx.session_factory() as session:
+        b = _decisions(session, BUSINESS_B)
+    print(f"\n4) discovery(B) decisions (B never restricted it): {b}")
+    out["business_b_discovery"] = b
+
+    # 5) A read-only viewer is DENIED (relevant denial) — nothing written.
+    with ctx.session_factory() as session:
+        before = session.query(RestrictedIdentityTombstone).count()
+        try:
+            RestrictedIdentityTombstoneStore(session, BUSINESS_A).record(
+                "organization", unrelated_id, viewer_a, origin=platform
+            )
+            denied_code = None
+        except ReacquisitionAuthorizationError as exc:
+            denied_code = exc.code
+        session.commit()
+    with ctx.session_factory() as session:
+        after = session.query(RestrictedIdentityTombstone).count()
+    print(
+        f"\n5) viewer recording a tombstone -> denied code={denied_code!r}; rows {before} -> {after}"
+    )
+    out["viewer_denied"] = {"code": denied_code}
+
+    checks = {
+        "first_run_suggested_restricted": first.get(restricted_id) == "suggested:ok",
+        "reimport_blocks_restricted": again.get(restricted_id)
+        == "screened_out:restricted_identity",
+        "restricted_not_resurrected": restricted_rows == 0,
+        "unrelated_preserved": again.get(unrelated_id) == "screened_out:duplicate"
+        and unrelated_rows == 1,
+        "tenant_b_unaffected": b.get(restricted_id) == "suggested:ok",
+        "tombstone_stores_no_raw_identifier": stored["storesRawIdentifier"] is False,
+        "viewer_denied": denied_code == "reacquisition_tombstone_not_authorized"
+        and after == before,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network. A restricted platform-sourced identity "
+        "cannot be resurrected by a reimport — it is screened out 'restricted_identity' — while unrelated "
+        "lawful scoped data is preserved and another tenant that never restricted it is unaffected. The "
+        "tombstone stores only a PSEUDONYMOUS fingerprint, never the raw identifier, and is never called "
+        "anonymous. A read-only viewer is denied with nothing written.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

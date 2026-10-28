@@ -23,6 +23,7 @@ from app.api.routes import (
     privacy_erasure,
     privacy_scope,
     profiles,
+    reacquisition,
     records,
     service_integration,
     targeting,
@@ -138,5 +139,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(privacy_scope.router)
     app.include_router(privacy_erasure.router)
     app.include_router(deletion_propagation.router)
+    app.include_router(reacquisition.router)
     app.include_router(service_integration.router)
     return app
