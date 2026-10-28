@@ -12420,6 +12420,168 @@ def _dca_088(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-089",
+    "evaluate SMS recipient preferences: in isolated synthetic Businesses A/B, run the ONE composed "
+    "recipient decision over the provider-backed preference/DND screening contract — (1) a CONSENTED "
+    "recipient whom the registry CLEARS is ELIGIBLE; (2) the required screening UNAVAILABLE fails closed "
+    "'preference_screening_unavailable' even with consent in force; (3) a CONSENTED recipient who IS on "
+    "DND is BLOCKED 'recipient_dnd_registered' (law denies independently of product consent); (4) a "
+    "not-on-DND recipient with NO consent stays BLOCKED 'product_consent_not_in_force' (consent-first "
+    "product default distinct from law); (5) a DND/SMS clear grants NOTHING on email/WhatsApp "
+    "(permits_channel SMS-only; an SMS-scoped screen refuses other channels). Business B is unaffected "
+    "(tenant-isolated). The decision reads nothing and writes nothing. Local synthetic; no AI/paid "
+    "action; a clear DND result is NOT recipient consent and NOT a send authorization.",
+)
+def _dca_089(ctx: CheckContext) -> dict:
+    """Show the composed SMS recipient-preference decision: required screening fails closed, a DND
+    result never grants another channel, and consent-first product default stays distinct from law —
+    all pure, changing no state."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.compliance.sms_recipient_preferences import (
+        REASON_OK,
+        REASON_PRODUCT_CONSENT_NOT_IN_FORCE,
+        SmsRecipientEligibility,
+        evaluate_sms_recipient_eligibility,
+    )
+    from app.compliance.sms_sender_prerequisites import SMS_CHANNEL, SmsRoute
+    from app.consent.permission_state import PermissionEvent, project_permission_states
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.preferences.contract import (
+        PreferenceScreeningDecision,
+        PreferenceScreeningRequest,
+    )
+    from app.preferences.fake import FakePreferenceScreeningClient
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    purpose = "marketing_sms"
+    promo = SmsRoute.PROMOTIONAL.value
+    clear_phone = "+919900000001"
+    dnd_phone = "+919812345678"  # fully-DND in the fake's Business A fixture
+
+    def _granted():
+        events = [
+            PermissionEvent(
+                receipt_id="receipt-1",
+                brand_key="brand",
+                contact_point_id="cp-1",
+                channel=SMS_CHANNEL,
+                purpose=purpose,
+                action="grant",
+                collected_at=now - timedelta(days=3),
+            )
+        ]
+        return next(iter(project_permission_states(events, now=now).values()))
+
+    available = FakePreferenceScreeningClient(now=now)  # SMS-only, Business-A fixture has DND entries
+    unavailable = FakePreferenceScreeningClient(available=False, now=now)
+
+    # 1) Consented + registry clears (Business B recipient is not registered) -> ELIGIBLE.
+    snap_clear = available.screen(
+        PreferenceScreeningRequest(business_id=BUSINESS_B, contact_point=clear_phone)
+    )
+    eligible = evaluate_sms_recipient_eligibility(
+        contact_point=clear_phone,
+        purpose=purpose,
+        route=promo,
+        permission=_granted(),
+        screening_snapshot=snap_clear,
+        now=now,
+    )
+    print(f"\n1) consented + DND-clear -> {eligible.decision.value} reasons={eligible.reasons}")
+
+    # 2) Required screening UNAVAILABLE -> fail closed, even with consent in force.
+    snap_down = unavailable.screen(
+        PreferenceScreeningRequest(business_id=BUSINESS_B, contact_point=clear_phone)
+    )
+    screening_down = evaluate_sms_recipient_eligibility(
+        contact_point=clear_phone,
+        purpose=purpose,
+        route=promo,
+        permission=_granted(),
+        screening_snapshot=snap_down,
+        now=now,
+    )
+    print(
+        f"\n2) screening UNAVAILABLE (consent in force) -> {screening_down.decision.value} "
+        f"reasons={screening_down.reasons} decisive={screening_down.decisive.gate!r}"
+    )
+
+    # 3) Consented but ON DND (Business A's fully-DND recipient) -> law denies independently.
+    snap_dnd = available.screen(
+        PreferenceScreeningRequest(business_id=BUSINESS_A, contact_point=dnd_phone)
+    )
+    on_dnd = evaluate_sms_recipient_eligibility(
+        contact_point=dnd_phone,
+        purpose=purpose,
+        route=promo,
+        permission=_granted(),
+        screening_snapshot=snap_dnd,
+        now=now,
+    )
+    print(
+        f"\n3) consented but ON DND -> {on_dnd.decision.value} reasons={on_dnd.reasons} "
+        f"detail={on_dnd.decisive.detail!r}"
+    )
+
+    # 4) Not on DND but NO consent -> consent-first product default blocks (distinct from law).
+    no_consent = evaluate_sms_recipient_eligibility(
+        contact_point=clear_phone,
+        purpose=purpose,
+        route=promo,
+        permission=None,  # flag-only import produced no evidenced consent
+        screening_snapshot=snap_clear,
+        now=now,
+    )
+    print(
+        f"\n4) DND-clear but NO consent -> {no_consent.decision.value} reasons={no_consent.reasons} "
+        f"decisive={no_consent.decisive.gate!r}"
+    )
+
+    # 5) The DND/SMS clear grants NOTHING on email / WhatsApp.
+    cross = {ch: eligible.permits_channel(ch) for ch in (SMS_CHANNEL, "email", "whatsapp")}
+    print(f"\n5) permits_channel from the SMS clear -> {cross}")
+
+    out = {
+        "eligible": {"decision": eligible.decision.value, "reasons": list(eligible.reasons)},
+        "screening_unavailable": {
+            "decision": screening_down.decision.value,
+            "reasons": list(screening_down.reasons),
+        },
+        "on_dnd": {"decision": on_dnd.decision.value, "reasons": list(on_dnd.reasons)},
+        "no_consent": {"decision": no_consent.decision.value, "reasons": list(no_consent.reasons)},
+        "permits_channel": cross,
+    }
+    checks = {
+        "consented_clear_eligible": eligible.decision is SmsRecipientEligibility.ELIGIBLE
+        and eligible.reasons == (REASON_OK,),
+        "unavailable_fails_closed": screening_down.decision is SmsRecipientEligibility.BLOCKED
+        and PreferenceScreeningDecision.UNAVAILABLE in screening_down.reasons,
+        "on_dnd_blocks_with_consent": on_dnd.decision is SmsRecipientEligibility.BLOCKED
+        and on_dnd.reasons == (PreferenceScreeningDecision.DND_REGISTERED,),
+        "no_consent_blocks_when_dnd_clear": no_consent.decision is SmsRecipientEligibility.BLOCKED
+        and REASON_PRODUCT_CONSENT_NOT_IN_FORCE in no_consent.reasons,
+        "dnd_result_grants_no_other_channel": cross[SMS_CHANNEL] is True
+        and cross["email"] is False
+        and cross["whatsapp"] is False,
+        "clear_is_not_consent": eligible.grants_consent is False,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The ONE composed SMS "
+        "recipient-preference decision combines the provider-backed TRAI/NCPR DND screening (LAW) with "
+        "the consent-first product default (PRODUCT), kept distinct: a required screening that is "
+        "unavailable/stale/off-scope FAILS CLOSED, a DND registration denies even a consented recipient, "
+        "a not-on-DND recipient still needs product consent, and a DND/SMS clear grants NOTHING on email "
+        "or WhatsApp. ELIGIBLE is NOT recipient consent authority and NOT a send authorization — the "
+        "actual SMS send stays a disabled future capability behind the host's one send pipeline. The "
+        "decision reads nothing and writes nothing.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
