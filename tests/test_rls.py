@@ -62,6 +62,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "person_observations",
         "contact_points",
         "field_observations",
+        "evidence_objects",
     }
 
 

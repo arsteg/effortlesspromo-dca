@@ -1885,3 +1885,107 @@ class FieldObservation(TenantOwned, Base):
     )
     # When this observation row was recorded in the service (distinct from observed_at at the source).
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class EvidenceRetentionMode(str, Enum):
+    """DCA-062 — how much of a captured evidence object this service is permitted to retain.
+
+    The mode is DERIVED deterministically from the source's terms (DCA-045) at capture time, never
+    chosen by the caller — it records the outcome of the license-aware retention screen:
+
+    - ``RAW_RETAINED`` — the source's terms both GRANT the ``store`` operation AND permit raw
+      retention, so the raw payload is kept alongside its reference and digest.
+    - ``REFERENCE_ONLY`` — raw retention is prohibited (the ``store`` right is withheld, or the
+      retention policy is a no-retention policy, or the retention window is zero days). The raw payload
+      is NEVER written; only the locator reference and a non-reversible content digest are kept, so the
+      evidence is still traceable/verifiable without holding a prohibited raw copy.
+    """
+
+    RAW_RETAINED = "raw_retained"
+    REFERENCE_ONLY = "reference_only"
+
+
+class EvidenceObject(TenantOwned, Base):
+    """DCA-062 — a bounded, license-aware evidence object (tenant-owned, RLS-protected).
+
+    One row is ONE piece of evidence this business captured from a catalogued :class:`Source` under a
+    specific :class:`SourceTerms` version — the raw material that backs an observation (a fetched
+    registry record, a public page, a document). It is stored with **license-aware retention**: the
+    single sanctioned writer (:class:`~app.services.evidence_store.EvidenceObjectStore`) consults the
+    cited source terms and keeps only what the licence permits.
+
+    The load-bearing guarantee (the DCA-062 acceptance criterion):
+
+    - **A no-retention source leaves no raw content copy.** When the source's terms do NOT permit raw
+      retention — the ``store`` operation is withheld, the retention policy is a no-retention policy, or
+      the retention window is zero days — the evidence is stored ``REFERENCE_ONLY``: ``raw_content`` is
+      left ``NULL`` and never written, while the locator ``content_ref`` and a non-reversible
+      ``content_digest`` (a SHA-256 of the captured bytes) ARE kept, so the evidence stays traceable and
+      verifiable without retaining a prohibited raw copy. When the terms DO permit it the raw payload is
+      kept (``RAW_RETAINED``), bounded by ``retention_until`` when the terms set a max retention window.
+      The retention ``mode`` is DERIVED from the terms at capture time, never supplied by the caller.
+
+    The supporting guarantees:
+
+    - **Scoped, never globally visible.** The object is owned by exactly one ``business_id`` and read
+      only within it (DCA-017/018). A by-id read of another business's evidence object resolves to
+      not-found — a cross-tenant id reads exactly like a non-existent one, never surfaced.
+
+    - **Provenance is required.** Every object cites the ``source_key`` + ``source_version`` it was
+      captured from (validated to exist), the actual ``content_ref`` locator, the rights basis, and the
+      capture time; an optional subject links it to one of this business's observations.
+
+    - **A denial changes nothing + no host record.** Validation runs BEFORE the session is mutated, so a
+      refusal stages no evidence row. Capturing evidence creates no prospect / host record and promotes
+      nothing to any shared/canonical table; acquisition stays a disabled future capability.
+
+    The ``raw_content`` is treated as potentially personal/business data — RLS-protected here and NEVER
+    written to the audit trail (only opaque references, including the safe digest, are audited).
+    """
+
+    __tablename__ = "evidence_objects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The catalogued Source.key the evidence came from (validated to exist in the platform catalog).
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The SourceTerms version the evidence was captured under (validated to exist) — the licence whose
+    # retention terms decide whether the raw payload may be kept.
+    source_version: Mapped[int] = mapped_column(Integer)
+    # Optional link to the subject the evidence is about: an OrgObservation.id or PersonObservation.id
+    # in THIS business (resolved within the business; a cross-tenant/unknown subject is refused). "" when
+    # the evidence is captured independently of a recorded subject.
+    subject_type: Mapped[str] = mapped_column(String(16), default="", server_default="", index=True)
+    subject_id: Mapped[str] = mapped_column(String(36), default="", server_default="", index=True)
+    # WHAT the evidence is — a short descriptive kind (e.g. "registry_record", "public_listing",
+    # "document"), normalized (trimmed + lower-cased) by the store. Required.
+    content_kind: Mapped[str] = mapped_column(String(64), index=True)
+    # The locator/reference that points at where the raw evidence lives (a record URL / registry ref /
+    # object key). ALWAYS kept — this is what is preserved when raw retention is prohibited. Required.
+    content_ref: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    # A non-reversible SHA-256 (hex) of the captured bytes. ALWAYS kept, in either mode — it lets the
+    # evidence be verified / deduplicated without retaining the raw payload. Computed by the store.
+    content_digest: Mapped[str] = mapped_column(
+        String(64), default="", server_default="", index=True
+    )
+    # Optional declared media type of the captured content (e.g. "application/json"); "" when unknown.
+    content_media_type: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # The raw captured payload — kept ONLY when the licence permits raw retention; NULL (never written)
+    # for a REFERENCE_ONLY object. Potentially personal/business data: RLS-protected, never audited.
+    raw_content: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    # raw_retained | reference_only — DERIVED from the source terms at capture time (not caller-chosen).
+    retention_mode: Mapped[str] = mapped_column(String(16), index=True)
+    # A stable code recording WHY the raw payload was dropped (store_not_permitted / no_retention_policy
+    # / zero_retention_window), or "" when the raw payload was retained. Auditable why-reference-only.
+    retention_reason: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The rights/retention basis recorded for the capture (e.g. the purpose / permitted-operation basis
+    # asserted). Required, non-empty. RECORDED provenance, not an authorization — grants no right.
+    rights_basis: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # When the evidence was captured from the source. Required.
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The retention deadline derived from the terms' max-retention window (captured_at + max_days) when
+    # the raw payload is kept and a window is set; NULL means no stated raw-retention limit.
+    retention_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None
+    )
+    # When this evidence row was recorded in the service (distinct from captured_at at the source).
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

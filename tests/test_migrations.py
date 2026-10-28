@@ -53,6 +53,7 @@ DCA_TABLES = {
     "person_observations",
     "contact_points",
     "field_observations",
+    "evidence_objects",
 }
 
 
@@ -1096,6 +1097,48 @@ def test_0026_creates_field_observation_table_on_a_preexisting_database(clean_sc
         }
     eng.dispose()
     assert policies == {"field_observations"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0027_creates_evidence_objects_table_on_a_preexisting_database(clean_schema):
+    """DCA-062 — the 0027 create branch (for a DB migrated before the evidence-object table existed).
+
+    ``evidence_objects`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0027 is a no-op there. To exercise 0027's real job, upgrade to head, drop the
+    table, stamp history back to 0026, then upgrade to head again — 0027 must recreate the table and
+    add its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "evidence_objects" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0026_field_observations")  # pretend we predate the evidence-object table
+    command.upgrade(cfg, "head")  # 0027 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "evidence_objects" in tables
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'evidence_objects' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert policies == {"evidence_objects"}  # tenant-owned: RLS applied
 
 
 @requires_pg

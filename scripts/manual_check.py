@@ -7521,6 +7521,237 @@ def _dca_061(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-062",
+    "store only permitted evidence objects: Business A captures evidence from a source whose terms "
+    "PERMIT raw retention (store right + a retention window) — the raw payload is kept (raw_retained), "
+    "bounded by a retention_until; then captures evidence from a NO-RETENTION source (store withheld / "
+    "no-retention policy / zero-day window) — NO raw copy is kept (reference_only), only the locator "
+    "reference and a non-reversible digest survive; the retention mode is derived from the terms, not "
+    "the caller; a cross-tenant subject (B linking to A's organization) reads as not-found and stages "
+    "nothing; Business B cannot retrieve either of A's evidence objects by id; each capture stages an "
+    "atomic DCA-026 audit entry whose references never carry the raw payload or locator; no "
+    "prospect/host record is created",
+)
+def _dca_062(ctx: CheckContext) -> dict:
+    """Store and screen evidence objects against a disposable DB (manual-test step 2):
+
+      1. Business A catalogues a source whose terms PERMIT raw retention and captures evidence — the
+         raw payload is kept (raw_retained) with a retention_until derived from the terms' window;
+      2. A catalogues a NO-RETENTION source (store withheld / no-retention policy / zero-day window)
+         and captures the SAME bytes — NO raw copy is kept (reference_only); only the locator reference
+         and a non-reversible SHA-256 digest survive, so the evidence stays traceable without a
+         prohibited raw copy;
+      3. a cross-tenant subject (Business B linking to A's organization) reads as not-found and stages
+         nothing; Business B cannot retrieve either of A's evidence objects by id;
+      4. each capture staged an atomic DCA-026 audit entry whose references never carry the raw payload
+         or the locator (only the safe digest), and no prospect/host record was created.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    Storing evidence is wired into no acquisition/send path: future capabilities stay disabled.
+    """
+    from datetime import UTC, datetime
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import AuditEvent, EvidenceObject, ProspectCandidate
+    from app.services.evidence_store import (
+        AUDIT_ACTION_STORE_EVIDENCE,
+        REASON_SUBJECT_NOT_FOUND,
+        EvidenceInput,
+        EvidenceObjectStore,
+        EvidenceStoreError,
+        _digest,
+    )
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0062", type=ActorType.USER)
+    captured_at = datetime(2026, 10, 24, 9, 0, tzinfo=UTC)
+    raw = '{"cin": "U17110KA1990PTC011089", "revenue_inr": 120000000}'
+    locator = "https://synthetic.registry.example/mca/record/42"
+
+    def _seed(session, key, *, operations, retention):
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="api",
+                name="Synthetic Source",
+                india_coverage={"nationwide": True},
+            )
+        )
+        return (
+            SourceTermsStore(session)
+            .add_version(
+                SourceTermsInput(
+                    source_key=key,
+                    operations=operations,
+                    purposes=["prospecting"],
+                    retention=retention,
+                    contract_evidence={
+                        "reference": "LIC-1",
+                        "kind": "licence",
+                        "uri": "file://lic",
+                    },
+                )
+            )
+            .version
+        )
+
+    def _input(src, ver):
+        return EvidenceInput(
+            source_key=src,
+            source_version=ver,
+            content_kind="registry_record",
+            content_ref=locator,
+            raw_content=raw,
+            captured_at=captured_at,
+            rights_basis="source_terms:collect+store;purpose=prospecting",
+            content_media_type="application/json",
+        )
+
+    out: dict = {}
+
+    # 1) a source whose terms PERMIT raw retention → the raw payload is kept.
+    # 2) a NO-RETENTION source → only a reference + digest survive, never the raw payload.
+    with ctx.session_factory() as session:
+        raw_ver = _seed(
+            session,
+            "retain_ok",
+            operations={"collect": True, "store": True},
+            retention={"max_days": 365, "policy": "retain"},
+        )
+        ref_ver = _seed(
+            session,
+            "no_retention",
+            operations={"collect": True, "store": True},
+            retention={"policy": "no_retention"},
+        )
+        org = OrgObservationStore(session, biz_a).create(
+            ObservationInput(entity_type="legal_entity", display_name="Synthetic Textiles Pvt Ltd"),
+            actor=actor,
+        )
+        store = EvidenceObjectStore(session, biz_a)
+        raw_obj = store.store(_input("retain_ok", raw_ver), actor=actor)
+        ref_obj = store.store(_input("no_retention", ref_ver), actor=actor)
+        session.commit()
+        a_org_id, raw_id, ref_id = org.id, raw_obj.id, ref_obj.id
+
+    with ctx.session_factory() as session:
+        store = EvidenceObjectStore(session, biz_a)
+        raw_row = store.get(raw_id)
+        ref_row = store.get(ref_id)
+        assert raw_row is not None and ref_row is not None  # just-committed by A; present
+        out["permitted_source"] = {
+            "retention_mode": raw_row.retention_mode,
+            "raw_payload_kept": raw_row.raw_content == raw,
+            "has_reference": bool(raw_row.content_ref),
+            "digest_matches": raw_row.content_digest == _digest(raw),
+            "has_retention_until": raw_row.retention_until is not None,
+        }
+        out["no_retention_source"] = {
+            "retention_mode": ref_row.retention_mode,
+            "retention_reason": ref_row.retention_reason,
+            "raw_content_is_null": ref_row.raw_content is None,
+            "reference_preserved": bool(ref_row.content_ref),
+            "digest_preserved": ref_row.content_digest == _digest(raw),
+        }
+
+    # 3) cross-tenant subject reads as not-found + B cannot read A's objects by id.
+    with ctx.session_factory() as session:
+        store_b = EvidenceObjectStore(session, biz_b)
+        cross_tenant_code = None
+        try:
+            store_b.store(
+                EvidenceInput(
+                    source_key="retain_ok",
+                    source_version=raw_ver,
+                    content_kind="registry_record",
+                    content_ref=locator,
+                    raw_content=raw,
+                    captured_at=captured_at,
+                    rights_basis="x",
+                    subject_type="organization",
+                    subject_id=a_org_id,
+                ),
+                actor=actor,
+            )
+        except EvidenceStoreError as exc:
+            cross_tenant_code = exc.code
+        session.rollback()
+        b_can_read_raw = store_b.get(raw_id) is not None
+        b_can_read_ref = store_b.get(ref_id) is not None
+
+    # 4) atomic audit without the raw payload/locator + no prospect/host record.
+    with ctx.session_factory() as session:
+        audits = (
+            session.query(AuditEvent).filter(AuditEvent.action == AUDIT_ACTION_STORE_EVIDENCE).all()
+        )
+        raw_in_audit = any(raw in (repr(a.references) + a.reason) for a in audits)
+        locator_in_audit = any("synthetic.registry.example" in repr(a.references) for a in audits)
+        out["isolation"] = {
+            "cross_tenant_subject_code": cross_tenant_code,
+            "b_can_read_raw_object": b_can_read_raw,
+            "b_can_read_reference_object": b_can_read_ref,
+        }
+        out["audit_and_promotion"] = {
+            "evidence_audit_entries": len(audits),
+            "raw_payload_in_any_audit": raw_in_audit,
+            "locator_in_any_audit": locator_in_audit,
+            "evidence_object_rows": session.query(EvidenceObject).count(),
+            "prospect_candidates": session.query(ProspectCandidate).count(),
+        }
+
+    print("\n1) a source whose terms PERMIT raw retention keeps the raw payload:")
+    for k, v in out["permitted_source"].items():
+        print(f"     {k:28} = {v}")
+    print("\n2) a NO-RETENTION source keeps ONLY a reference + digest (no raw copy):")
+    for k, v in out["no_retention_source"].items():
+        print(f"     {k:28} = {v}")
+    print("\n3) tenant isolation (cross-tenant subject + by-id reads):")
+    for k, v in out["isolation"].items():
+        print(f"     {k:34} = {v}")
+    print("\n4) atomic audit without raw/locator + no prospect/host record:")
+    for k, v in out["audit_and_promotion"].items():
+        print(f"     {k:34} = {v}")
+
+    checks = {
+        "permitted_source_retains_raw": out["permitted_source"]["retention_mode"] == "raw_retained"
+        and out["permitted_source"]["raw_payload_kept"] is True
+        and out["permitted_source"]["has_retention_until"] is True,
+        "no_retention_source_leaves_no_raw_copy": out["no_retention_source"]["retention_mode"]
+        == "reference_only"
+        and out["no_retention_source"]["raw_content_is_null"] is True
+        and out["no_retention_source"]["reference_preserved"] is True
+        and out["no_retention_source"]["digest_preserved"] is True,
+        "cross_tenant_subject_rejected": out["isolation"]["cross_tenant_subject_code"]
+        == REASON_SUBJECT_NOT_FOUND,
+        "b_cannot_read_a_objects_by_id": out["isolation"]["b_can_read_raw_object"] is False
+        and out["isolation"]["b_can_read_reference_object"] is False,
+        "raw_and_locator_never_audited": out["audit_and_promotion"]["raw_payload_in_any_audit"]
+        is False
+        and out["audit_and_promotion"]["locator_in_any_audit"] is False,
+        "no_prospect_or_host_record": out["audit_and_promotion"]["prospect_candidates"] == 0,
+        # 1 raw_retained + 1 reference_only = 2; the cross-tenant rejection staged nothing.
+        "only_permitted_rows_persisted": out["audit_and_promotion"]["evidence_object_rows"] == 2,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Evidence is stored with LICENSE-AWARE retention: "
+        "the raw payload is kept ONLY when the cited source terms permit it; a no-retention source "
+        "leaves NO raw content copy — only the locator reference and a non-reversible digest survive. "
+        "The retention mode is derived from the terms, not the caller. Another tenant can never "
+        "retrieve an evidence object by id; each capture stages an atomic audit entry that never "
+        "carries the raw payload or locator; and no prospect/host record is created. Wired into no "
+        "acquisition/send path: future capabilities stay disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
