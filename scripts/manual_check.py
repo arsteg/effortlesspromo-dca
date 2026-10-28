@@ -7752,6 +7752,271 @@ def _dca_062(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-063",
+    "filter fields by display entitlement: two businesses observe the SAME source-licensed field "
+    "(revenue) plus each its OWN private overlay (an inferred segment). Business A holds a DISPLAY "
+    "entitlement (DCA-047) for the source and Business B does not. Project each record and each "
+    "evidence object through the rights-aware projection: A's licensed value IS present, B's is ABSENT "
+    "from the payload (not nulled) and marked restricted with a stable reason; each business's private "
+    "overlay is visible to it regardless; an evidence raw payload is gated the same way; and the denial "
+    "is reproducible with NO state change (read-only projection)",
+)
+def _dca_063(ctx: CheckContext) -> dict:
+    """Apply the DCA-063 display projection to record/evidence responses (manual-test step 2):
+
+      1. catalogue one shared source whose terms document DISPLAY and approve it in-force;
+      2. entitle Business A with the display right and Business B WITHOUT it (DCA-047);
+      3. each business observes the SAME real-world org — a licensed shared fact (revenue, from the
+         source) plus its OWN private overlay (an inferred segment, no source);
+      4. project each record: A sees the licensed value; B's licensed value is ABSENT from the payload
+         (the serializer carries no value key) and is marked restricted with a stable reason; each
+         business's private overlay is visible to it regardless of the source entitlement;
+      5. the same gate applies to an evidence object's raw payload; and re-projecting changes nothing
+         (the row count is unchanged), so the denial reproduces with no side effects.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    The projection is READ-ONLY and wired into no acquisition/send path: future capabilities stay disabled.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import FieldObservation
+    from app.projection.field_visibility import (
+        display_decider_from_permits,
+        project_evidence,
+        project_fields,
+    )
+    from app.services.evidence_store import EvidenceInput, EvidenceObjectStore
+    from app.services.field_observation import FieldObservationInput, FieldObservationStore
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    source_key = "mca_master_data"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0063", type=ActorType.USER)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0001", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    revenue = "120000000"
+    segment = "mid-market textiles"
+    raw = '{"cin": "U17110KA1990PTC011089"}'
+
+    def _record(session, business_id):
+        org = OrgObservationStore(session, business_id).create(
+            ObservationInput(entity_type="legal_entity", display_name="Synthetic Textiles Pvt Ltd"),
+            actor=actor,
+        )
+        fields = FieldObservationStore(session, business_id)
+        fields.record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=org.id,
+                field_key="revenue_inr",
+                field_value=revenue,
+                inference_label="observed",
+                source_key=source_key,
+                source_version=1,
+                provenance_ref="synthetic://mca/record/42",
+                observed_at=now,
+                scope="nationwide",
+                rights_basis="source_terms:display;purpose=prospecting",
+            ),
+            actor=actor,
+        )
+        fields.record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=org.id,
+                field_key="segment",
+                field_value=segment,
+                inference_label="inferred",  # the business's own derivation — a private overlay
+                provenance_ref="derived:size+industry",
+                observed_at=now,
+                scope="nationwide",
+                rights_basis="own_analysis",
+            ),
+            actor=actor,
+        )
+        ev = EvidenceObjectStore(session, business_id).store(
+            EvidenceInput(
+                source_key=source_key,
+                source_version=1,
+                content_kind="registry_record",
+                content_ref="synthetic://mca/record/42",
+                raw_content=raw,
+                captured_at=now,
+                rights_basis="source_terms:store;purpose=prospecting",
+                content_media_type="application/json",
+            ),
+            actor=actor,
+        )
+        return org.id, ev.id
+
+    def _project_record(session, business_id, subject_id):
+        store = BusinessSourceEntitlementStore(session, business_id)
+        decide = display_decider_from_permits(store.permits, now=now)
+        observations = FieldObservationStore(session, business_id).for_subject(
+            "organization", subject_id
+        )
+        return project_fields(observations, decide)
+
+    out: dict = {}
+
+    # Setup: shared approved source, A entitled to display, B not; each business records the data.
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="api",
+                name="Synthetic MCA",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "store": True, "display": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        for biz, display in ((biz_a, True), (biz_b, False)):
+            BusinessSourceEntitlementStore(session, biz).set_entitlement(
+                BusinessSourceEntitlementInput(
+                    source_key=source_key,
+                    enabled=True,
+                    operations={"display": display},
+                    purposes=["prospecting"],
+                ),
+                admin,
+                now=now,
+            )
+        a_org, a_ev = _record(session, biz_a)
+        b_org, b_ev = _record(session, biz_b)
+        session.commit()
+
+    # Project each record + evidence through the rights-aware projection.
+    with ctx.session_factory() as session:
+        a_fields = {f.field_key: f for f in _project_record(session, biz_a, a_org)}
+        b_fields = {f.field_key: f for f in _project_record(session, biz_b, b_org)}
+        out["business_a_display_entitled"] = {
+            "revenue_visible": a_fields["revenue_inr"].visible,
+            "revenue_value": a_fields["revenue_inr"].value,
+            "segment_overlay_visible": a_fields["segment"].visible and a_fields["segment"].overlay,
+            "segment_value": a_fields["segment"].value,
+        }
+        out["business_b_not_entitled"] = {
+            "revenue_visible": b_fields["revenue_inr"].visible,
+            # The restricted value is DROPPED — the projected field carries no value.
+            "revenue_value_is_absent": b_fields["revenue_inr"].value is None,
+            "revenue_restricted_reason": b_fields["revenue_inr"].restricted_reason,
+            "segment_overlay_visible": b_fields["segment"].visible and b_fields["segment"].overlay,
+            "segment_value": b_fields["segment"].value,
+        }
+
+        store_a = BusinessSourceEntitlementStore(session, biz_a)
+        store_b = BusinessSourceEntitlementStore(session, biz_b)
+        a_ev_row = EvidenceObjectStore(session, biz_a).get(a_ev)
+        b_ev_row = EvidenceObjectStore(session, biz_b).get(b_ev)
+        assert a_ev_row is not None and b_ev_row is not None  # just-committed by each business
+        a_evidence = project_evidence(
+            a_ev_row, display_decider_from_permits(store_a.permits, now=now)
+        )
+        b_evidence = project_evidence(
+            b_ev_row, display_decider_from_permits(store_b.permits, now=now)
+        )
+        out["evidence_projection"] = {
+            "a_raw_visible": a_evidence.raw_visible,
+            "a_raw_value": a_evidence.raw_content,
+            "b_raw_visible": b_evidence.raw_visible,
+            "b_raw_value_is_absent": b_evidence.raw_content is None,
+            "b_raw_restricted_reason": b_evidence.restricted_reason,
+            "both_keep_digest": bool(a_evidence.content_digest)
+            and a_evidence.content_digest == b_evidence.content_digest,
+        }
+        rows_before = session.query(FieldObservation).count()
+
+    # Re-project: the projection is read-only, so the denial reproduces with no state change.
+    with ctx.session_factory() as session:
+        _project_record(session, biz_b, b_org)
+        rows_after = session.query(FieldObservation).count()
+        out["read_only"] = {
+            "field_rows_before": rows_before,
+            "field_rows_after": rows_after,
+            "no_state_change": rows_before == rows_after,
+        }
+
+    print("\n1) Business A (DISPLAY entitled) — the licensed value is present:")
+    for k, v in out["business_a_display_entitled"].items():
+        print(f"     {k:30} = {v}")
+    print("\n2) Business B (NOT entitled) — the licensed value is ABSENT from the payload:")
+    for k, v in out["business_b_not_entitled"].items():
+        print(f"     {k:30} = {v}")
+    print("\n3) evidence raw payload is gated the same way (metadata stays traceable):")
+    for k, v in out["evidence_projection"].items():
+        print(f"     {k:30} = {v}")
+    print("\n4) the projection is read-only (the denial reproduces with no state change):")
+    for k, v in out["read_only"].items():
+        print(f"     {k:30} = {v}")
+
+    checks = {
+        "entitled_business_sees_value": out["business_a_display_entitled"]["revenue_visible"]
+        is True
+        and out["business_a_display_entitled"]["revenue_value"] == revenue,
+        "restricted_value_absent_from_payload": out["business_b_not_entitled"]["revenue_visible"]
+        is False
+        and out["business_b_not_entitled"]["revenue_value_is_absent"] is True
+        and out["business_b_not_entitled"]["revenue_restricted_reason"] == "operation_not_entitled",
+        "private_overlay_visible_to_both": out["business_a_display_entitled"][
+            "segment_overlay_visible"
+        ]
+        is True
+        and out["business_b_not_entitled"]["segment_overlay_visible"] is True,
+        "evidence_raw_gated_metadata_kept": out["evidence_projection"]["a_raw_visible"] is True
+        and out["evidence_projection"]["b_raw_visible"] is False
+        and out["evidence_projection"]["b_raw_value_is_absent"] is True
+        and out["evidence_projection"]["both_keep_digest"] is True,
+        "projection_is_read_only": out["read_only"]["no_state_change"] is True,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A licensed shared fact is served back ONLY when "
+        "the business holds a DISPLAY entitlement (DCA-047) for it — otherwise the value is ABSENT from "
+        "the payload, not merely hidden. A private overlay (the business's own un-sourced data) is "
+        "always visible to its owner. The projection is read-only, so the denial reproduces with no "
+        "state change. Wired into no acquisition/send path: future capabilities stay disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
