@@ -1540,3 +1540,121 @@ class AiInvocation(TenantOwned, Base):
     cost_currency: Mapped[str] = mapped_column(String(8), default="USD")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class OrgObservationType(str, Enum):
+    """DCA-059 — whether an organization observation is a LEGAL ENTITY or one of its ESTABLISHMENTS.
+
+    ``LEGAL_ENTITY`` — the registered legal person (e.g. a company identified by its CIN/PAN): the top
+    of a scoped observation tree. ``ESTABLISHMENT`` — a place of business / registration of that legal
+    entity (e.g. a state GST registration or a branch): it always hangs off exactly one parent
+    LEGAL_ENTITY within the SAME business. The distinction is load-bearing — one legal entity can have
+    many establishments (in India, typically one GSTIN per state), and the two are never conflated. An
+    establishment is never the parent of another observation.
+    """
+
+    LEGAL_ENTITY = "legal_entity"
+    ESTABLISHMENT = "establishment"
+
+
+class OrgExternalScheme(str, Enum):
+    """DCA-059 — the identifier scheme of an external platform-ID mapping (controlled vocabulary).
+
+    A scheme names WHICH external register/platform an identifier belongs to, so a mapping is never an
+    ambiguous bare string. India-oriented company identifiers plus the platform's own org id:
+
+    - ``CIN`` — Corporate Identification Number (a legal entity, MCA).
+    - ``PAN`` — Permanent Account Number (a legal entity).
+    - ``LEI`` — Legal Entity Identifier (global, a legal entity).
+    - ``GSTIN`` — Goods & Services Tax Identification Number (an establishment — per state).
+    - ``TAN`` — Tax Deduction and Collection Account Number.
+    - ``DUNS`` — D-U-N-S number (commercial).
+    - ``PLATFORM_ORG_ID`` — the EffortlessPromo platform's own organisation id (an opaque mapping to
+      the platform master held per-business; NOT a claim of global visibility).
+
+    An unrecognized scheme is refused by the store — a mapping can never carry an unknown register.
+    """
+
+    CIN = "cin"
+    PAN = "pan"
+    LEI = "lei"
+    GSTIN = "gstin"
+    TAN = "tan"
+    DUNS = "duns"
+    PLATFORM_ORG_ID = "platform_org_id"
+
+
+class OrgObservation(TenantOwned, Base):
+    """DCA-059 — a scoped organization observation identity (tenant-owned, RLS-protected).
+
+    One row is ONE observation this business has recorded about an organization it is looking at — a
+    ``LEGAL_ENTITY`` or one of its ``ESTABLISHMENT``s (:class:`OrgObservationType`). It is an *identity
+    node* only: it carries the observation's own type, display name, and (for an establishment) the
+    Indian state/UT it operates in. It is NOT a prospect / host record — no contact data, no
+    acquisition and no send path — and creating one grants nothing; those stay disabled future
+    capabilities.
+
+    **Scoped, never globally visible.** The observation is owned by exactly one ``business_id`` and is
+    only ever read within that business (DCA-017/018). The SAME real-world company observed by two
+    businesses yields TWO independent observation rows — one per tenant — never a shared global node:
+    this is deliberately NOT a cross-tenant master graph, so an identity here can never imply that one
+    business can see another's observations (contrast the platform's global Organisation master).
+
+    **Legal entity vs establishment.** ``parent_observation_id`` links an ``ESTABLISHMENT`` to its
+    parent ``LEGAL_ENTITY`` *within the same business*; a ``LEGAL_ENTITY`` has no parent. The single
+    sanctioned writer (:class:`~app.services.org_observation.OrgObservationStore`) enforces the shape —
+    an establishment must name a parent that exists in this business and is itself a legal entity; a
+    legal entity must not name one — so one legal entity can carry many distinct establishments and the
+    two are never conflated.
+
+    The external register identifiers (CIN / PAN / GSTIN / …) are kept in a SEPARATE mapping table
+    (:class:`OrgExternalId`), not inlined here, so an identity never assumes a single primary
+    identifier and the same observation can carry several scheme-specific ids.
+    """
+
+    __tablename__ = "org_observations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # legal_entity | establishment — the load-bearing distinction (never conflated).
+    entity_type: Mapped[str] = mapped_column(String(16), index=True)
+    # An ESTABLISHMENT's parent LEGAL_ENTITY observation id (within THIS business); NULL for a legal
+    # entity. Scoped: the writer validates the parent exists in this business and is a legal entity.
+    parent_observation_id: Mapped[str | None] = mapped_column(String(36), index=True, default=None)
+    # The observation's display name (a company/establishment name — a company fact, not contact data).
+    display_name: Mapped[str] = mapped_column(String(300), default="", server_default="")
+    # For an establishment, the recognized Indian state/UT (ISO 3166-2:IN code) it operates in; ""
+    # when not applicable/known. India-only: an unrecognized code is refused by the store.
+    state_code: Mapped[str] = mapped_column(String(8), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class OrgExternalId(TenantOwned, Base):
+    """DCA-059 — a SEPARATE external platform-ID mapping for an organization observation (tenant-owned).
+
+    One row maps one external register/platform identifier — a ``scheme`` (:class:`OrgExternalScheme`)
+    plus its ``value`` — to one :class:`OrgObservation` within this business. Kept apart from the
+    identity node on purpose: an observation can carry several identifiers (a legal entity its CIN and
+    PAN; each establishment its own GSTIN), and the identity never has to assume a single primary id.
+
+    ``(business_id, scheme, value)`` is unique, so within ONE business a given external id maps to at
+    most one observation (a duplicate is rejected, never silently re-pointed). The key is PER business:
+    two businesses may legitimately record the SAME external id against their own observations and
+    neither constrains the other — the mapping is scoped, it does NOT make an identifier a global key.
+
+    The ``value`` is a company/establishment register identifier (CIN / GSTIN / …), not personal
+    contact data. Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS
+    policy like every other tenant data table, so one business can never read another's mappings.
+    """
+
+    __tablename__ = "org_external_ids"
+    # An external id is unique PER business; the same (scheme, value) may recur across tenants.
+    __table_args__ = (tenant_unique("scheme", "value", name="uq_org_external_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The observation this identifier belongs to (an OrgObservation.id within the same business).
+    observation_id: Mapped[str] = mapped_column(String(36), index=True)
+    # cin | pan | lei | gstin | tan | duns | platform_org_id — the register this id belongs to.
+    scheme: Mapped[str] = mapped_column(String(32), index=True)
+    # The identifier value, normalized (trimmed + upper-cased) by the store. A company fact, not contact data.
+    value: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

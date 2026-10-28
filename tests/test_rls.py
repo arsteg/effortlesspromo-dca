@@ -57,6 +57,8 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "budget_limits",
         "business_source_entitlements",
         "policy_decision_records",
+        "org_observations",
+        "org_external_ids",
     }
 
 

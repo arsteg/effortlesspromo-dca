@@ -48,6 +48,8 @@ DCA_TABLES = {
     "business_source_entitlements",
     "compliance_policy_rulepacks",
     "compliance_policy_approvals",
+    "org_observations",
+    "org_external_ids",
 }
 
 
@@ -951,6 +953,55 @@ def test_0022_creates_compliance_policy_approvals_on_a_preexisting_database(clea
     eng.dispose()
     assert "uq_policy_approval_version" in uniques  # one approval per policy version; never reused
     assert policy is None  # control-plane registry: no tenant RLS policy
+
+
+@requires_pg
+def test_0024_creates_org_observation_tables_on_a_preexisting_database(clean_schema):
+    """DCA-059 — the 0024 create branch (for a DB migrated before the org-observation tables existed).
+
+    ``org_observations`` and ``org_external_ids`` are tenant-owned, so a fresh DB gets them from the
+    metadata baseline (0001) with RLS from 0002, and 0024 is a no-op there. To exercise 0024's real
+    job, upgrade to head, drop both tables, stamp history back to 0023, then upgrade to head again —
+    0024 must recreate both tables (with the per-business unique external-id constraint) and add their
+    tenant-isolation RLS policies.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "org_external_ids" CASCADE'))
+        conn.execute(text('DROP TABLE IF EXISTS "org_observations" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0023_policy_decision_records")  # pretend we predate the org tables
+    command.upgrade(cfg, "head")  # 0024 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert {"org_observations", "org_external_ids"}.issubset(tables)
+    ext_uniques = {
+        u["name"] for u in insp.get_unique_constraints("org_external_ids", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename IN ('org_observations', 'org_external_ids') "
+                    "AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_org_external_id" in ext_uniques  # one (scheme, value) per business; never reused
+    assert policies == {"org_observations", "org_external_ids"}  # both tenant-owned: RLS applied
 
 
 @requires_pg

@@ -6800,6 +6800,255 @@ def _dca_058(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-059",
+    "store DCA organization observations: scoped identity nodes (LEGAL_ENTITY vs ESTABLISHMENT) with a "
+    "SEPARATE external platform-ID mapping table; create two establishments under one fixture legal "
+    "entity and inspect their DISTINCT identifiers (observation ids + per-state GSTINs); identities are "
+    "business-scoped (no global visibility) and never a prospect/host record; a relevant denial "
+    "(cross-tenant parent / duplicate external id) stages no row; each create stages an atomic DCA-026 "
+    "audit entry",
+)
+def _dca_059(ctx: CheckContext) -> dict:
+    """Create and inspect real organization-observation identities against a disposable DB
+    (manual-test step 2):
+
+      1. create a LEGAL_ENTITY observation for Business A (carrying its CIN) and two ESTABLISHMENT
+         observations under it — one Maharashtra (GSTIN 27…), one Karnataka (GSTIN 29…);
+      2. open the two establishments and inspect their DISTINCT identifiers: distinct observation ids,
+         distinct state codes, distinct GSTIN mappings, each resolving back to its own establishment;
+      3. no host/prospect record is created (prospect_candidates stays empty) and each create staged an
+         atomic DCA-026 audit entry;
+      4. relevant denials that change nothing: Business B cannot hang an establishment off Business A's
+         legal entity (parent_not_found — no cross-tenant link), and a duplicate GSTIN within Business A
+         is refused (duplicate_external_id); neither stages a row;
+      5. no global visibility: Business B cannot read Business A's observation, yet the SAME GSTIN may be
+         recorded by Business B against its own observation — the mapping is per-business, not a global key.
+
+    Pure deterministic Python — no model is consulted. Local synthetic only (AI disabled, ephemeral DB).
+    Recording an identity is wired into no acquisition/send path: future capabilities stay disabled.
+    """
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import AuditEvent, OrgExternalId, OrgObservation, ProspectCandidate
+    from app.services.org_observation import (
+        REASON_DUPLICATE_EXTERNAL_ID,
+        REASON_PARENT_NOT_FOUND,
+        ExternalIdInput,
+        ObservationInput,
+        OrgObservationError,
+        OrgObservationStore,
+    )
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0059", type=ActorType.USER)
+    mh_gstin = "27AAACS0000A1Z5"
+    ka_gstin = "29AAACS0000A1Z1"
+
+    out: dict = {}
+
+    # 1) create the legal entity + two establishments for Business A.
+    with ctx.session_factory() as session:
+        store = OrgObservationStore(session, biz_a)
+        le = store.create(
+            ObservationInput(
+                entity_type="legal_entity",
+                display_name="Synthetic Textiles Pvt Ltd",
+                external_ids=[ExternalIdInput("cin", "U17120MH2026PTC900099")],
+            ),
+            actor=actor,
+        )
+        mh = store.create(
+            ObservationInput(
+                entity_type="establishment",
+                display_name="Synthetic Textiles — Maharashtra",
+                parent_observation_id=le.id,
+                state_code="MH",
+                external_ids=[ExternalIdInput("gstin", mh_gstin)],
+            ),
+            actor=actor,
+        )
+        ka = store.create(
+            ObservationInput(
+                entity_type="establishment",
+                display_name="Synthetic Textiles — Karnataka",
+                parent_observation_id=le.id,
+                state_code="KA",
+                external_ids=[ExternalIdInput("gstin", ka_gstin)],
+            ),
+            actor=actor,
+        )
+        session.commit()
+        le_id, mh_id, ka_id = le.id, mh.id, ka.id
+
+    # 2) inspect the two establishments' distinct identifiers.
+    with ctx.session_factory() as session:
+        store = OrgObservationStore(session, biz_a)
+        establishments = store.establishments_of(le_id)
+        mh_gstin_hit = store.resolve_external("gstin", mh_gstin)
+        ka_gstin_hit = store.resolve_external("gstin", ka_gstin)
+        cin_hit = store.resolve_external("cin", "U17120MH2026PTC900099")
+        legal_entity = store.get(le_id)
+        assert legal_entity is not None
+        out["legal_entity"] = {
+            "id": le_id,
+            "entity_type": legal_entity.entity_type,
+            "parent": legal_entity.parent_observation_id,
+            "cin_resolves_to_legal_entity": cin_hit is not None and cin_hit.id == le_id,
+        }
+        out["establishments"] = {
+            e.id: {
+                "state_code": e.state_code,
+                "parent": e.parent_observation_id,
+                "external_ids": [(x.scheme, x.value) for x in store.external_ids_of(e.id)],
+            }
+            for e in establishments
+        }
+        out["distinct_identifiers"] = {
+            "distinct_ids": mh_id != ka_id,
+            "distinct_states": {e.state_code for e in establishments} == {"MH", "KA"},
+            "mh_gstin_resolves_to_mh": mh_gstin_hit is not None and mh_gstin_hit.id == mh_id,
+            "ka_gstin_resolves_to_ka": ka_gstin_hit is not None and ka_gstin_hit.id == ka_id,
+            "both_parented_to_legal_entity": all(
+                e.parent_observation_id == le_id for e in establishments
+            ),
+        }
+
+    # 3) no host/prospect record + atomic audit.
+    with ctx.session_factory() as session:
+        out["no_host_record"] = {
+            "org_observations": session.query(OrgObservation).count(),
+            "org_external_ids": session.query(OrgExternalId).count(),
+            "prospect_candidates": session.query(ProspectCandidate).count(),
+            "audit_entries": session.query(AuditEvent).count(),
+        }
+
+    # 4) relevant denials that change nothing.
+    with ctx.session_factory() as session:
+        store_b = OrgObservationStore(session, biz_b)
+        cross_tenant_code = None
+        try:
+            store_b.create(
+                ObservationInput(
+                    entity_type="establishment",
+                    display_name="B branch on A parent",
+                    parent_observation_id=le_id,
+                ),
+                actor=actor,
+            )
+        except OrgObservationError as exc:
+            cross_tenant_code = exc.code
+        session.rollback()
+
+    with ctx.session_factory() as session:
+        store = OrgObservationStore(session, biz_a)
+        duplicate_code = None
+        try:
+            store.create(
+                ObservationInput(
+                    entity_type="establishment",
+                    display_name="MH duplicate",
+                    parent_observation_id=le_id,
+                    state_code="MH",
+                    external_ids=[ExternalIdInput("gstin", mh_gstin)],
+                ),
+                actor=actor,
+            )
+        except OrgObservationError as exc:
+            duplicate_code = exc.code
+        session.rollback()
+
+    with ctx.session_factory() as session:
+        out["denials"] = {
+            "cross_tenant_parent_code": cross_tenant_code,
+            "duplicate_external_id_code": duplicate_code,
+            "business_b_created_nothing": len(OrgObservationStore(session, biz_b).observations()) == 0,
+            "business_a_unchanged": session.query(OrgObservation).count() == 3,
+            "mappings_unchanged": session.query(OrgExternalId).count() == 3,
+        }
+
+    # 5) no global visibility (but the same external id may be recorded per-business).
+    with ctx.session_factory() as session:
+        b_sees_a = OrgObservationStore(session, biz_b).get(mh_id)
+    with ctx.session_factory() as session:
+        store_b = OrgObservationStore(session, biz_b)
+        b_le = store_b.create(
+            ObservationInput(entity_type="legal_entity", display_name="B Textiles Pvt Ltd"),
+            actor=actor,
+        )
+        store_b.create(
+            ObservationInput(
+                entity_type="establishment",
+                display_name="B — Maharashtra",
+                parent_observation_id=b_le.id,
+                state_code="MH",
+                external_ids=[ExternalIdInput("gstin", mh_gstin)],  # same GSTIN, different tenant
+            ),
+            actor=actor,
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        a_hit = OrgObservationStore(session, biz_a).resolve_external("gstin", mh_gstin)
+        b_hit = OrgObservationStore(session, biz_b).resolve_external("gstin", mh_gstin)
+        out["scoping"] = {
+            "business_b_can_read_a_observation": b_sees_a is not None,
+            "same_gstin_resolves_per_business": (
+                a_hit is not None
+                and b_hit is not None
+                and a_hit.id != b_hit.id
+                and a_hit.business_id == biz_a
+                and b_hit.business_id == biz_b
+            ),
+        }
+
+    print("\n1-2) one legal entity, two establishments under it (distinct identifiers):")
+    print(f"     legal_entity          = {out['legal_entity']}")
+    for obs_id, info in out["establishments"].items():
+        print(f"     establishment {obs_id} = {info}")
+    for k, v in out["distinct_identifiers"].items():
+        print(f"     {k:28} = {v}")
+    print("\n3) no host/prospect record created + atomic audit:")
+    for k, v in out["no_host_record"].items():
+        print(f"     {k:28} = {v}")
+    print("\n4) relevant denials that change nothing:")
+    for k, v in out["denials"].items():
+        print(f"     {k:28} = {v}")
+    print("\n5) no global visibility (same GSTIN still recordable per-business):")
+    for k, v in out["scoping"].items():
+        print(f"     {k:28} = {v}")
+
+    checks = {
+        "establishments_have_distinct_identifiers": all(out["distinct_identifiers"].values()),
+        "cin_resolves_to_legal_entity": out["legal_entity"]["cin_resolves_to_legal_entity"],
+        "no_host_or_prospect_record": out["no_host_record"]["prospect_candidates"] == 0,
+        "every_create_audited": out["no_host_record"]["audit_entries"] == 3,
+        "cross_tenant_parent_refused_no_change": (
+            out["denials"]["cross_tenant_parent_code"] == REASON_PARENT_NOT_FOUND
+            and out["denials"]["business_b_created_nothing"] is True
+            and out["denials"]["business_a_unchanged"] is True
+            and out["denials"]["mappings_unchanged"] is True
+        ),
+        "duplicate_external_id_refused": out["denials"]["duplicate_external_id_code"]
+        == REASON_DUPLICATE_EXTERNAL_ID,
+        "scoped_no_global_visibility": (
+            out["scoping"]["business_b_can_read_a_observation"] is False
+            and out["scoping"]["same_gstin_resolves_per_business"] is True
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. Organization observations are scoped identity "
+        "nodes that keep LEGAL_ENTITY and ESTABLISHMENT apart — one legal entity carries many distinct "
+        "establishments, each with its own id and GSTIN in a SEPARATE mapping table. Identities are "
+        "business-scoped: they carry no global visibility and are never a prospect/host record. A "
+        "relevant denial (cross-tenant parent, duplicate external id) changes nothing, and each create "
+        "stages an atomic audit entry. Wired into no acquisition/send path: future capabilities stay "
+        "disabled.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
