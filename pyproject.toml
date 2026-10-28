@@ -16,6 +16,7 @@ dependencies = [
     "httpx==0.28.1",
     "sqlalchemy==2.0.36",
     "alembic==1.14.0",
+    "idna==3.20",
 ]
 
 [project.optional-dependencies]

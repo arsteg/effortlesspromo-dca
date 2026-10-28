@@ -8017,6 +8017,175 @@ def _dca_063(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-064",
+    "normalize company names & domains: run Hindi/English trade-name and IDN fixtures through the pure "
+    "Unicode/IDN-aware normalizer and show, side by side, the ORIGINAL multilingual text (preserved), "
+    "the repeatable normalized match key (script kept), the ASCII transliteration (a SEARCH AID ONLY), "
+    "and the canonical IDN A-label/U-label. Prove it is repeatable; that similar names (Acme vs Acme "
+    "Ltd) and www-vs-apex domains are NOT auto-merged; that two synthetic Businesses A/B normalizing "
+    "the SAME shared name/domain get identical forms yet keep SEPARATE identities (the normalizer "
+    "records/merges nothing); and that an invalid-domain denial is reproducible and changes no state",
+)
+def _dca_064(ctx: CheckContext) -> dict:
+    """Exercise the DCA-064 normalizer (manual-test step 2) on local synthetic fixtures only.
+
+    Pure, deterministic, network-free Python — no model, no DB write, no HTTP. The normalizer derives
+    repeatable search/clustering forms WITHOUT discarding the original multilingual text, treats
+    transliteration as a search aid (never identity proof), and merges nothing; resolving identity
+    stays a disabled future capability. The failure case (an invalid domain) is reproducible and
+    leaves no state behind (there is no state to change).
+    """
+    from app.normalization import (
+        NormalizationError,
+        normalize_company_name,
+        normalize_domain,
+        share_host,
+        share_match_key,
+    )
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+
+    out: dict = {}
+
+    # 1) Hindi + English + IDN fixtures — original preserved, derived forms shown.
+    name_fixtures = {
+        "hindi_trade_name": "भारत टेक्सटाइल्स प्राइवेट लिमिटेड",
+        "latin_with_diacritics": "  Café   Résumé  Solutions  Pvt Ltd  ",
+        "fullwidth_latin": "ＡＣＭＥ",
+    }
+    names = {label: normalize_company_name(raw) for label, raw in name_fixtures.items()}
+    out["names"] = {
+        label: {
+            "original": n.original,
+            "display": n.display,
+            "match_key": n.match_key,
+            "transliteration_search_aid": n.transliteration,
+            "identity_proof": n.identity_proof,
+        }
+        for label, n in names.items()
+    }
+
+    domain_fixtures = {
+        "hindi_idn": "कंपनी.भारत",
+        "url_with_noise": "HTTPS://User@EXAMPLE.COM:8080/path?q=1#frag",
+        "email_host": "mailto:sales@Acme.in",
+    }
+    domains = {label: normalize_domain(raw) for label, raw in domain_fixtures.items()}
+    out["domains"] = {
+        label: {
+            "original": d.original,
+            "ascii_match_key": d.ascii,
+            "unicode_display": d.unicode,
+            "identity_proof": d.identity_proof,
+        }
+        for label, d in domains.items()
+    }
+
+    # 2) Repeatable: the same input yields the same forms twice.
+    repeat = normalize_company_name(name_fixtures["latin_with_diacritics"])
+    out["repeatable"] = repeat == names["latin_with_diacritics"]
+
+    # 3) Similar names / www-vs-apex domains are NOT auto-merged.
+    acme = normalize_company_name("Acme Industries")
+    acme_ltd = normalize_company_name("Acme Industries Ltd")
+    bare = normalize_domain("acme.in")
+    www = normalize_domain("www.acme.in")
+    out["no_auto_merge"] = {
+        "acme_vs_acme_ltd_keys_differ": acme.match_key != acme_ltd.match_key,
+        "share_match_key": share_match_key(acme, acme_ltd),
+        "apex_vs_www_hosts_differ": bare.ascii != www.ascii,
+        "share_host": share_host(bare, www),
+    }
+
+    # 4) Two synthetic Businesses A/B normalize the SAME shared name/domain -> identical forms, yet
+    #    their identities stay SEPARATE (the normalizer is tenant-agnostic and records/merges nothing).
+    shared_name, shared_domain = "Acme Industries", "acme.in"
+    a_name, b_name = normalize_company_name(shared_name), normalize_company_name(shared_name)
+    a_dom, b_dom = normalize_domain(shared_domain), normalize_domain(shared_domain)
+    out["separate_identities"] = {
+        "business_a": biz_a,
+        "business_b": biz_b,
+        "same_match_key_for_both": a_name.match_key == b_name.match_key,
+        "same_host_for_both": a_dom.ascii == b_dom.ascii,
+        # A shared key is a HINT, never an identity merge — the normalizer wrote nothing to any store.
+        "merges_nothing": a_name.identity_proof is False and a_dom.identity_proof is False,
+    }
+
+    # 5) Failure case: an invalid domain is refused, reproducibly, with no state change.
+    denials: list[str | None] = []
+    for _ in range(2):
+        try:
+            normalize_domain("localhost")  # a bare label is not a registrable company domain
+            denials.append(None)
+        except NormalizationError as exc:
+            denials.append(exc.code)
+    out["denial"] = {"reason_both_runs": denials, "reproducible": denials[0] == denials[1]}
+
+    print(
+        "\n1) names — ORIGINAL preserved; match key keeps script; transliteration is a SEARCH AID:"
+    )
+    for label, n in out["names"].items():
+        print(f"\n   [{label}]")
+        for k, v in n.items():
+            print(f"     {k:28} = {v!r}")
+    print("\n2) domains — IDN A-label (match key) + U-label (display); original preserved:")
+    for label, d in out["domains"].items():
+        print(f"\n   [{label}]")
+        for k, v in d.items():
+            print(f"     {k:28} = {v!r}")
+    print(f"\n3) repeatable (same input -> same forms): {out['repeatable']}")
+    print("\n4) similar names / www-vs-apex are NOT auto-merged:")
+    for k, v in out["no_auto_merge"].items():
+        print(f"     {k:34} = {v}")
+    print(
+        "\n5) Businesses A/B share a normalized key yet keep SEPARATE identities (merges nothing):"
+    )
+    for k, v in out["separate_identities"].items():
+        print(f"     {k:28} = {v}")
+    print("\n6) invalid-domain denial is reproducible and changes no state:")
+    for k, v in out["denial"].items():
+        print(f"     {k:28} = {v}")
+
+    checks = {
+        "original_multilingual_preserved": out["names"]["hindi_trade_name"]["original"]
+        == name_fixtures["hindi_trade_name"]
+        and out["names"]["hindi_trade_name"]["match_key"]
+        == name_fixtures["hindi_trade_name"].casefold(),
+        "transliteration_is_ascii_search_aid": out["names"]["latin_with_diacritics"][
+            "transliteration_search_aid"
+        ]
+        == "cafe resume solutions pvt ltd"
+        and out["names"]["hindi_trade_name"]["transliteration_search_aid"] == "",
+        "idn_ascii_and_unicode": out["domains"]["hindi_idn"]["ascii_match_key"]
+        == "xn--i1b1b4ch5i.xn--h2brj9c"
+        and out["domains"]["hindi_idn"]["unicode_display"] == "कंपनी.भारत",
+        "repeatable": out["repeatable"] is True,
+        "no_automatic_merge": out["no_auto_merge"]["acme_vs_acme_ltd_keys_differ"] is True
+        and out["no_auto_merge"]["share_match_key"] is False
+        and out["no_auto_merge"]["apex_vs_www_hosts_differ"] is True
+        and out["no_auto_merge"]["share_host"] is False,
+        "separate_identities_preserved": out["separate_identities"]["same_match_key_for_both"]
+        is True
+        and out["separate_identities"]["merges_nothing"] is True,
+        "denial_reproducible": out["denial"]["reason_both_runs"]
+        == ["invalid_domain", "invalid_domain"]
+        and out["denial"]["reproducible"] is True,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no DB write, no network. Normalization is pure and "
+        "deterministic: the ORIGINAL multilingual text is preserved, the match key is repeatable and "
+        "keeps the source script, transliteration is a SEARCH AID (never identity proof), and similar "
+        "names / shared or www-vs-apex domains are NOT auto-merged. Two businesses can normalize the "
+        "same value to the same key yet keep separate identities — the normalizer records and merges "
+        "nothing. Resolving identity stays a disabled future capability.)"
+    )
+    return out
+
+
 def _confirm_icp(client, business_id, version, actor_id, auth):
     return client.post(
         f"/v1/tenants/{business_id}/icp/confirm",
