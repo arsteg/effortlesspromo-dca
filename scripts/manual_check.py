@@ -10650,6 +10650,156 @@ def _dca_078(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-079",
+    "authoritative suppression lookup: an AVAILABLE+FRESH answer clears a non-suppressed contact point "
+    "(activation permitted) and denies a suppressed one; an UNAVAILABLE answer and a STALE answer each "
+    "produce NO activation permission even for a contact point with no suppression record; a channel "
+    "outside the authoritative scope is refused. Host owns suppression+consent; an allow is not consent. "
+    "Production refuses the synthetic fake.",
+)
+def _dca_079(ctx: CheckContext) -> dict:
+    """Query active / stale / unavailable fake suppression states and show the gate input and result.
+
+    All synthetic (AI disabled, nothing persisted). The gate authorizes no send and grants no consent —
+    it only removes (or withholds) the suppression blocker; acting on an activation stays a disabled
+    future capability behind the one send pipeline.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.suppression import (
+        ActivationDecision,
+        FakePlatformSuppressionClient,
+        SuppressionContractDisabled,
+        SuppressionLookupRequest,
+        authorize_activation,
+        build_platform_suppression_client,
+    )
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    suppressed_email = "opted-out@synthetic-a.example"
+    clear_email = "prospect@synthetic-a.example"
+
+    def _show(label: str, snap, contact_point: str, channel: str, decision: ActivationDecision) -> dict:
+        print(f"\n{label}")
+        print(
+            f"  gate input       : business={snap.business_id} contact_point={contact_point} "
+            f"channel={channel}"
+        )
+        print(
+            f"  snapshot         : availability={snap.availability.value} version={snap.version} "
+            f"as_of={snap.as_of.isoformat()} covered={list(snap.covered_channels)} "
+            f"entries={len(snap.entries)} host_owns_consent={snap.host_owns_consent}"
+        )
+        print(
+            f"  decision         : {'ALLOW' if decision.allowed else 'DENY'} ({decision.reason}) "
+            f"grants_consent={decision.grants_consent}"
+        )
+        return {
+            "availability": snap.availability.value,
+            "version": snap.version,
+            "as_of": snap.as_of.isoformat(),
+            "covered_channels": list(snap.covered_channels),
+            "allowed": decision.allowed,
+            "reason": decision.reason,
+            "grants_consent": decision.grants_consent,
+        }
+
+    out: dict = {}
+    client = build_platform_suppression_client(ctx.settings)  # the dev fake (production refuses it)
+
+    # 1) ACTIVE + fresh, contact point NOT suppressed -> activation permitted.
+    snap = client.lookup(SuppressionLookupRequest(business_id=BUSINESS_A))
+    out["active_clear"] = _show(
+        "1) active+fresh, not suppressed",
+        snap,
+        clear_email,
+        "email",
+        authorize_activation(snap, clear_email, "email", now=now),
+    )
+
+    # 2) ACTIVE + fresh, contact point SUPPRESSED -> denied.
+    out["active_suppressed"] = _show(
+        "2) active+fresh, suppressed contact point",
+        snap,
+        suppressed_email,
+        "email",
+        authorize_activation(snap, suppressed_email, "email", now=now),
+    )
+
+    # 3) STALE: a clean answer fetched 2h ago (default window 1h) -> no activation permission.
+    stale = FakePlatformSuppressionClient(now=now - timedelta(hours=2)).lookup(
+        SuppressionLookupRequest(business_id=BUSINESS_B)
+    )
+    out["stale"] = _show(
+        "3) stale answer (fetched 2h ago)",
+        stale,
+        clear_email,
+        "email",
+        authorize_activation(stale, clear_email, "email", now=now),
+    )
+
+    # 4) UNAVAILABLE: registry unreachable -> no activation permission even for a clear contact point.
+    down = FakePlatformSuppressionClient(available=False, now=now).lookup(
+        SuppressionLookupRequest(business_id=BUSINESS_A)
+    )
+    out["unavailable"] = _show(
+        "4) unavailable answer (registry down)",
+        down,
+        clear_email,
+        "email",
+        authorize_activation(down, clear_email, "email", now=now),
+    )
+
+    # 5) CHANNEL outside the authoritative scope -> refused (the DCA does not guess).
+    out["uncovered_channel"] = _show(
+        "5) channel outside authoritative scope",
+        snap,
+        clear_email,
+        "whatsapp",
+        authorize_activation(snap, clear_email, "whatsapp", now=now),
+    )
+
+    # Production refuses the synthetic fake (contract disabled until the live adapter ships).
+    prod = type(ctx.settings)(
+        _env_file=None,  # type: ignore[call-arg]
+        environment="production",
+        database_url="postgresql+psycopg://user@db/dca",
+        service_auth_token="prod-token",
+        synthetic_sources_enabled=False,
+        auto_create_schema=False,
+    )
+    refused = False
+    try:
+        build_platform_suppression_client(prod)
+    except SuppressionContractDisabled as exc:
+        refused = True
+        print(f"\nproduction build_platform_suppression_client -> refused: {exc}")
+    out["production_refused"] = refused
+
+    checks = {
+        "active_clear_allows": out["active_clear"]["allowed"] is True
+        and out["active_clear"]["reason"] == ActivationDecision.OK,
+        "suppressed_denies": out["active_suppressed"]["reason"] == ActivationDecision.SUPPRESSED,
+        "stale_denies": out["stale"]["reason"] == ActivationDecision.STALE,
+        "unavailable_denies": out["unavailable"]["reason"] == ActivationDecision.LOOKUP_UNAVAILABLE,
+        "uncovered_channel_denies": out["uncovered_channel"]["reason"]
+        == ActivationDecision.CHANNEL_NOT_COVERED,
+        "allow_is_not_consent": out["active_clear"]["grants_consent"] is False,
+        "production_refused": refused,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action and nothing persisted. An AVAILABLE+FRESH answer "
+        "clears only a non-suppressed contact point on a covered channel; an UNAVAILABLE or STALE answer "
+        "yields no activation permission. Clearing suppression is NOT recipient consent — the host owns "
+        "both. Acting on an activation stays a disabled future capability behind the one send pipeline.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
