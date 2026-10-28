@@ -8546,9 +8546,7 @@ def _dca_067(ctx: CheckContext) -> dict:
             "outcome": r.outcome.value,
             "confidence": r.confidence.value,
             "auto_merged": r.auto_merged,
-            "signals": [
-                f"{s.kind.value}:{s.strength.value}:{s.relation.value}" for s in r.signals
-            ],
+            "signals": [f"{s.kind.value}:{s.strength.value}:{s.relation.value}" for s in r.signals],
         }
 
     # 2) exact-ID / shared-domain / similar-name fixtures (manual-test step 2).
@@ -8685,7 +8683,12 @@ def _dca_068(ctx: CheckContext) -> dict:
     (auto_merged / permission_transferred stay False), and every result/denial is reproducible with no
     state change.
     """
-    from app.matching import ContactMatchOutcome, build_contact_subject, build_subject, match_contacts
+    from app.matching import (
+        ContactMatchOutcome,
+        build_contact_subject,
+        build_subject,
+        match_contacts,
+    )
 
     biz_a = "11111111-1111-1111-1111-111111111111"
     biz_b = "22222222-2222-2222-2222-222222222222"
@@ -8702,7 +8705,9 @@ def _dca_068(ctx: CheckContext) -> dict:
         "transfers_no_permission": True,
     }
 
-    recycled = "9900112233"  # synthetic India mobile, shared below to model a recycled/shared number
+    recycled = (
+        "9900112233"  # synthetic India mobile, shared below to model a recycled/shared number
+    )
     acme = build_subject(name="Acme", identifiers=[("cin", "U72900MH2010PTC123456")])
     globex = build_subject(name="Globex", identifiers=[("cin", "U72900KA2011PTC654321")])
 
@@ -8726,8 +8731,12 @@ def _dca_068(ctx: CheckContext) -> dict:
         ),
         _pair(
             "recycled_number_different_mailboxes_is_no_match",
-            build_contact_subject(name="Ramesh Kumar", emails=["ramesh@acme.in"], phones=[recycled]),
-            build_contact_subject(name="Suresh Rao", emails=["suresh@globex.in"], phones=[recycled]),
+            build_contact_subject(
+                name="Ramesh Kumar", emails=["ramesh@acme.in"], phones=[recycled]
+            ),
+            build_contact_subject(
+                name="Suresh Rao", emails=["suresh@globex.in"], phones=[recycled]
+            ),
         ),
         _pair(
             "shared_number_alone_is_review",
@@ -8821,6 +8830,212 @@ def _dca_068(ctx: CheckContext) -> dict:
         "merge and NEVER a permission transfer (auto_merged / permission_transferred stay False) — "
         "acting on it, and acquisition/consent, stay disabled future capabilities. The result and the "
         "relevant denial are reproducible with no state to change.)"
+    )
+    return out
+
+
+@register(
+    "DCA-069",
+    "choose canonical field observations EXPLAINABLY: record conflicting fixture values for one field "
+    "(a stale official-registry observed value, a newer independently-verified value, a fresh inferred "
+    "value, and a value whose retention has lapsed) into synthetic Business A, then run the pure "
+    "canonical selection over the stored history and show the WINNER, the winning REASONS, every "
+    "candidate's verdict (eligible/denied) and the PRESERVED losing observations. Prove the acceptance: "
+    "stale registry data does NOT blindly replace the newer verified fact (reliability > rigid source "
+    "tier), the retention-lapsed value is DENIED canonical status (the relevant denial), nothing is "
+    "deleted (every observation remains in history), and the result is reproducible with no state change",
+)
+def _dca_069(ctx: CheckContext) -> dict:
+    """Exercise the DCA-069 canonical selector (manual-test step 2) on local synthetic fixtures only.
+
+    Writes conflicting field observations into an ephemeral synthetic DB (the harness cleans it up),
+    then runs the PURE selector over the stored history. Only reads happen during selection — it
+    records/mutates/deletes nothing — so the losing values remain in history. No AI/paid/network path.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.canonical import (
+        DENIAL_RETENTION_LAPSED,
+        REASON_VERIFIED_OVER_STALE_REGISTRY,
+        candidates_from_observations,
+        select_canonical,
+    )
+    from app.db.models import FieldObservation
+    from app.services.field_observation import FieldObservationInput, FieldObservationStore
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0069", type=ActorType.USER)
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    field_key = "annual_revenue_inr"
+
+    out: dict = {"business_a": biz_a, "business_b_scoped_out": biz_b, "field_key": field_key}
+
+    def _record(store, subject, src, ver, value, observed_at, label="observed", retention=None):
+        obs = store.record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=subject,
+                field_key=field_key,
+                field_value=value,
+                inference_label=label,
+                source_key=src if label == "observed" else "",
+                source_version=ver if label == "observed" else None,
+                provenance_ref="https://synthetic.registry.example/mca/record/42#revenue",
+                observed_at=observed_at,
+                scope="nationwide",
+                rights_basis="source_terms:collect+store;purpose=prospecting",
+                retention_until=retention,
+            ),
+            actor=actor,
+        )
+        return obs.id
+
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key="mca_master_data",
+                kind="official",
+                access_method="api",
+                name="MCA Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        terms = SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key="mca_master_data",
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "LIC-1", "kind": "licence", "uri": "file://lic"},
+            )
+        )
+        ver = terms.version
+        subject = (
+            OrgObservationStore(session, biz_a)
+            .create(
+                ObservationInput(
+                    entity_type="legal_entity", display_name="Synthetic Textiles Pvt Ltd"
+                ),
+                actor=actor,
+            )
+            .id
+        )
+        store = FieldObservationStore(session, biz_a)
+        # Four conflicting observations of the SAME field, recorded in append-only history.
+        registry_id = _record(
+            store, subject, "mca_master_data", ver, "120000000", now - timedelta(days=400)
+        )  # stale official registry
+        verified_id = _record(
+            store, subject, "mca_master_data", ver, "155000000", now - timedelta(days=5)
+        )  # newer, independently verified
+        inferred_id = _record(
+            store,
+            subject,
+            "mca_master_data",
+            ver,
+            "999999999",
+            now - timedelta(days=1),
+            label="inferred",
+        )  # fresh but weak
+        lapsed_id = _record(
+            store,
+            subject,
+            "mca_master_data",
+            ver,
+            "200000000",
+            now - timedelta(days=3),
+            retention=now - timedelta(days=1),
+        )  # retention lapsed => denied
+        session.commit()
+
+    with ctx.session_factory() as session:
+        store = FieldObservationStore(session, biz_a)
+        observations = store.for_subject("organization", subject)
+        # ``verified_id`` is marked verified by the caller (e.g. a confirmed channel / corroboration).
+        candidates = candidates_from_observations(
+            observations, verified_observation_ids={verified_id}
+        )
+        result = select_canonical(candidates, now=now)
+        # Reproduce it — a pure function yields the identical winner/reasons with nothing to mutate.
+        repeat = select_canonical(candidates, now=now)
+        total_rows = len(session.scalars(select(FieldObservation)).all())
+
+    id_label = {
+        registry_id: "stale_official_registry(observed)",
+        verified_id: "newer_verified",
+        inferred_id: "fresh_inferred",
+        lapsed_id: "retention_lapsed",
+    }
+    verdict_rows = [
+        {
+            "label": id_label.get(v.candidate.observation_id, v.candidate.observation_id),
+            "value": v.candidate.value,
+            "reliability": v.candidate.reliability.value,
+            "eligible": v.eligible,
+            "denial_reason": v.denial_reason,
+        }
+        for v in result.verdicts
+    ]
+    winner_label = id_label.get(result.winner.observation_id) if result.winner else None
+
+    print(
+        "\n2) canonical selection over conflicting fixture values (one field, append-only history):"
+    )
+    for row in verdict_rows:
+        flag = "ELIGIBLE" if row["eligible"] else f"DENIED({row['denial_reason']})"
+        print(
+            f"   - {row['label']:<34} value={row['value']:<10} "
+            f"reliability={row['reliability']:<9} {flag}"
+        )
+    print(
+        f"\n   WINNER        = {winner_label}  (value={result.winner.value if result.winner else None})"
+    )
+    print(f"   winner_reasons= {list(result.winner_reasons)}")
+    print(f"   preserved     = {[id_label.get(i, i) for i in result.preserved_observation_ids]}")
+    print(f"   rows in history after selection = {total_rows} (nothing deleted)")
+
+    checks = {
+        "newer_verified_wins_not_stale_registry": winner_label == "newer_verified",
+        "reason_records_verified_over_stale_registry": (
+            REASON_VERIFIED_OVER_STALE_REGISTRY in result.winner_reasons
+        ),
+        "retention_lapsed_is_denied": any(
+            v.candidate.observation_id == lapsed_id and v.denial_reason == DENIAL_RETENTION_LAPSED
+            for v in result.denied
+        ),
+        "fresh_inferred_did_not_win": winner_label != "fresh_inferred",
+        "all_losers_preserved": set(result.preserved_observation_ids)
+        == {registry_id, inferred_id, lapsed_id},
+        "nothing_deleted": total_rows == 4,
+        "reproducible": (
+            repeat.winner is not None
+            and result.winner is not None
+            and repeat.winner.observation_id == result.winner.observation_id
+            and repeat.winner_reasons == result.winner_reasons
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    out["verdicts"] = verdict_rows
+    out["winner_label"] = winner_label
+    out["winner_reasons"] = list(result.winner_reasons)
+    out["preserved"] = [id_label.get(i, i) for i in result.preserved_observation_ids]
+    out["rows_in_history"] = total_rows
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network. Selection is PURE and read-only: it "
+        "ranks by evidence RELIABILITY (verified > observed > inferred), FRESHNESS within a tier, and a "
+        "RIGHTS gate — NOT a rigid source tier. A newer VERIFIED fact beats a stale official-registry "
+        "value (stale registry does NOT blindly replace it); a retention-lapsed value is DENIED "
+        "canonical status (the relevant denial) yet stays in history; every losing observation is "
+        "preserved (nothing deleted/mutated); the result is reproducible with no state to change. "
+        "Business B is scoped out — the store only ever read Business A's observations. Promoting a "
+        "canonical value into any shared/host record stays a disabled future capability.)"
     )
     return out
 
