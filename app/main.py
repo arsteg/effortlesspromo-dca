@@ -19,6 +19,7 @@ from app.api.routes import (
     grievances,
     health,
     icp,
+    privacy_erasure,
     privacy_scope,
     profiles,
     records,
@@ -129,5 +130,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(budget.router)
     app.include_router(grievances.router)
     app.include_router(privacy_scope.router)
+    app.include_router(privacy_erasure.router)
     app.include_router(service_integration.router)
     return app

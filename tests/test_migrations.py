@@ -60,6 +60,7 @@ DCA_TABLES = {
     "platform_source_restrictions",
     "restriction_propagations",
     "privacy_grievances",
+    "data_erasure_journals",
 }
 
 
@@ -1291,6 +1292,49 @@ def test_0032_creates_privacy_grievances_table_on_a_preexisting_database(clean_s
         }
     eng.dispose()
     assert policies == {"privacy_grievances"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0033_creates_data_erasure_journals_table_on_a_preexisting_database(clean_schema):
+    """DCA-084 — the 0033 create branch (for a DB migrated before the erasure-journal table existed).
+
+    ``data_erasure_journals`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001)
+    with RLS from 0002, and 0033 is a no-op there. To exercise 0033's real job, upgrade to head, drop
+    the table, stamp history back to 0032, then upgrade to head again — 0033 must recreate the table and
+    add its tenant-isolation RLS policy, so the journal is protected exactly like every other tenant
+    table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "data_erasure_journals" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0032_privacy_grievances")  # pretend we predate the erasure-journal table
+    command.upgrade(cfg, "head")  # 0033 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "data_erasure_journals" in tables
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'data_erasure_journals' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert policies == {"data_erasure_journals"}  # tenant-owned: RLS applied
 
 
 @requires_pg

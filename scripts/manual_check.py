@@ -11479,6 +11479,231 @@ def _dca_083(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-084",
+    "erase permitted DCA operational data: seed a synthetic person subject in Business A (identity + "
+    "contact point + field observation + evidence + a correction projection) AND the SAME-shaped "
+    "subject in Business B; an A administrator executes a resolved erasure (A's observations/evidence/"
+    "projections are deleted and journaled with opaque tombstone references); show B is untouched, a "
+    "read-only viewer is denied with nothing deleted, and the audit/journal retain only opaque minimal "
+    "metadata (no contact/field value). Local synthetic; no AI/paid action.",
+)
+def _dca_084(ctx: CheckContext) -> dict:
+    """Execute a scoped erasure of a subject's operational data and show the actual before/after state.
+
+    Unlike DCA-083 (read-only resolution), this DELETES: the subject's observations, evidence and
+    projections are removed, and a DataErasureJournal survives with the justified tombstone references.
+    A one-tenant erasure never reaches another tenant; a viewer is denied and changes nothing; the
+    retained records (audit trail) and only permitted minimal metadata remain.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.db.models import (
+        AuditEvent,
+        ContactPoint,
+        DataErasureJournal,
+        EvidenceObject,
+        FieldCorrection,
+        FieldObservation,
+        PersonObservation,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.data_erasure import (
+        AUDIT_ACTION_ERASE,
+        DataErasureAuthorizationError,
+        ErasurePrincipal,
+        OperationalDataEraser,
+    )
+
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin_a = ErasurePrincipal(subject="op-admin-a", roles=("owner",))
+    viewer_a = ErasurePrincipal(subject="op-viewer-a", roles=("viewer",))
+    secret_email = "erase.me@synthetic.example"  # synthetic personal data — must be GONE after erasure
+    secret_value = "+91 90000 00001"
+
+    def _seed(session, business_id, person_id):
+        session.add(
+            PersonObservation(
+                id=person_id,
+                business_id=business_id,
+                display_name="Synthetic Person",
+                role_title="Head",
+            )
+        )
+        session.add(
+            ContactPoint(
+                business_id=business_id,
+                person_observation_id=person_id,
+                channel="email",
+                value=secret_email,
+                evidence="self_reported",
+            )
+        )
+        session.add(
+            FieldObservation(
+                business_id=business_id,
+                subject_type="person",
+                subject_id=person_id,
+                field_key="phone",
+                field_value=secret_value,
+                inference_label="observed",
+                source_key="synthetic.mca",
+                source_version=1,
+                provenance_ref="synthetic://fetch/1",
+                observed_at=now,
+                scope="nationwide",
+                rights_basis="synthetic_basis",
+            )
+        )
+        session.add(
+            EvidenceObject(
+                business_id=business_id,
+                source_key="synthetic.mca",
+                source_version=1,
+                subject_type="person",
+                subject_id=person_id,
+                content_kind="registry_record",
+                content_ref="synthetic://evidence/1",
+                content_digest="0" * 64,
+                retention_mode="reference_only",
+                rights_basis="synthetic_basis",
+                captured_at=now,
+            )
+        )
+        session.add(
+            FieldCorrection(
+                business_id=business_id,
+                subject_type="person",
+                subject_id=person_id,
+                field_key="phone",
+                corrected_value=secret_value,
+                version=1,
+                actor_id="op-correction-a",
+            )
+        )
+
+    def _counts(session, business_id, person_id):
+        return {
+            "person": session.query(PersonObservation)
+            .filter_by(business_id=business_id, id=person_id)
+            .count(),
+            "contact_points": session.query(ContactPoint)
+            .filter_by(business_id=business_id, person_observation_id=person_id)
+            .count(),
+            "field_observations": session.query(FieldObservation)
+            .filter_by(business_id=business_id, subject_type="person", subject_id=person_id)
+            .count(),
+            "evidence": session.query(EvidenceObject)
+            .filter_by(business_id=business_id, subject_type="person", subject_id=person_id)
+            .count(),
+            "corrections": session.query(FieldCorrection)
+            .filter_by(business_id=business_id, subject_type="person", subject_id=person_id)
+            .count(),
+        }
+
+    # Seed: a SAME-shaped subject in A and B — the A erasure must leave B entirely untouched.
+    with ctx.session_factory() as session:
+        _seed(session, BUSINESS_A, "person-a")
+        _seed(session, BUSINESS_B, "person-b")
+        session.commit()
+
+    out: dict = {}
+
+    with ctx.session_factory() as session:
+        before_a = _counts(session, BUSINESS_A, "person-a")
+    print(f"\n1) A operational data BEFORE erasure -> {before_a}")
+    out["before_a"] = before_a
+
+    # 2) The A administrator executes the resolved erasure.
+    with ctx.session_factory() as session:
+        result = OperationalDataEraser(session, BUSINESS_A).erase_subject(
+            "person", "person-a", admin_a, justification="grievance_erasure", request_ref="g-1"
+        )
+        session.commit()
+        journal_id = result.journal_id
+    erased = {
+        "observationsDeleted": result.observations_deleted,
+        "evidenceDeleted": result.evidence_deleted,
+        "projectionsDeleted": result.projections_deleted,
+        "totalDeleted": result.total_deleted,
+    }
+    print(f"\n2) erasure executed by A administrator -> {erased}")
+    out["erased"] = erased
+
+    # 3) After: A's operational data is GONE; B's identical subject is untouched; the journal survives.
+    with ctx.session_factory() as session:
+        after_a = _counts(session, BUSINESS_A, "person-a")
+        after_b = _counts(session, BUSINESS_B, "person-b")
+        journal = session.get(DataErasureJournal, journal_id)
+        audit = session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.business_id == BUSINESS_A)
+            .where(AuditEvent.action == AUDIT_ACTION_ERASE)
+        ).all()
+        import json
+
+        journal_blob = json.dumps(
+            {
+                "justification": journal.justification,
+                "tombstones": journal.tombstones,
+                "references": [a.references for a in audit],
+            }
+        )
+        no_pii_in_metadata = secret_email not in journal_blob and secret_value not in journal_blob
+    print(f"\n3) A operational data AFTER erasure -> {after_a} (gone)")
+    print(f"   B operational data (untouched)   -> {after_b}")
+    print(f"   journal totalDeleted={journal.total_deleted} tombstones={journal.tombstones}")
+    print(f"   audit entries for erasure={len(audit)}  PII-free metadata={no_pii_in_metadata}")
+    out["after_a"] = after_a
+    out["after_b"] = after_b
+    out["journal_total"] = journal.total_deleted
+
+    # 4) A read-only viewer is DENIED (relevant denial) — nothing deleted, no journal written.
+    with ctx.session_factory() as session:
+        _seed(session, BUSINESS_A, "person-c")
+        session.commit()
+    with ctx.session_factory() as session:
+        try:
+            OperationalDataEraser(session, BUSINESS_A).erase_subject(
+                "person", "person-c", viewer_a, justification="grievance_erasure"
+            )
+            denied_code = None
+        except DataErasureAuthorizationError as exc:
+            denied_code = exc.code
+    with ctx.session_factory() as session:
+        viewer_target_after = _counts(session, BUSINESS_A, "person-c")
+        journals_total = session.query(DataErasureJournal).count()
+    print(
+        f"\n4) viewer erasing A's subject -> denied code={denied_code!r}; target still present "
+        f"{viewer_target_after} (nothing deleted)"
+    )
+    out["viewer_denied"] = {"code": denied_code}
+
+    checks = {
+        "a_data_erased": set(after_a.values()) == {0},
+        "b_untouched": after_b == before_a,
+        "journal_records_tombstones": journal.total_deleted == 5
+        and len(audit) == 1,
+        "metadata_has_no_pii": no_pii_in_metadata,
+        "viewer_denied": denied_code == "data_erasure_not_authorized"
+        and viewer_target_after["person"] == 1,
+        # The viewer denial wrote no journal — only the one successful erasure is journaled.
+        "denial_wrote_no_journal": journals_total == 1,
+    }
+    print(f"\nchecks: {checks}")
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action. A scoped erasure deletes the subject's "
+        "observations/evidence/projections and journals opaque tombstone references; the audit/journal "
+        "retain only permitted minimal metadata; another tenant's identical subject is untouched; and a "
+        "read-only viewer is denied with nothing deleted. Retained records and acting beyond this scope "
+        "stay out of scope / disabled.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

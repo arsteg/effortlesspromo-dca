@@ -2569,3 +2569,71 @@ class PrivacyGrievance(TenantOwned, Base):
     # token's hash against this, constant-time. Never exposed in any response.
     access_token_hash: Mapped[str] = mapped_column(String(64), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class DataErasureJournal(TenantOwned, Base):
+    """DCA-084 — the execution journal of ONE scoped operational-data erasure (tenant-owned, RLS).
+
+    One row is the durable record of a single deletion the service actually executed across a business's
+    DCA-owned OPERATIONAL data for one subject — its observations, evidence and projections. Unlike the
+    DCA-083 :class:`~app.services.privacy_scope.PrivacyScopeResolver` (which only identifies a scope and
+    executes nothing), DCA-084 is the first story that deletes rows; this journal is the "justified
+    tombstone reference" the acceptance requires — it survives the erasure and names, in OPAQUE terms,
+    WHAT was erased (counts + the erased rows' row ids, grouped by category), WHO executed it, WHEN,
+    under WHICH authority, and WHY (the justification / the request it answers).
+
+    The load-bearing guarantees (the DCA-084 acceptance criteria):
+
+    - **The erased operational data is gone; only permitted minimal metadata is retained.** The
+      observation / evidence / projection rows for the subject are hard-deleted by the single sanctioned
+      executor (:class:`~app.services.data_erasure.OperationalDataEraser`), so they are no longer
+      accessible by any tenant-scoped read. What remains is this journal row plus the atomic DCA-026
+      audit entry — and both carry ONLY opaque references (row ids, counts, the opaque subject id, a
+      justification code), never a contact value, an org/person name or a field value. ``tombstones``
+      is the opaque id ledger of the deleted rows, so the erasure stays reviewable without re-exposing
+      the personal data it removed.
+
+    - **A denial changes nothing.** The executor checks authority FIRST and resolves the subject WITHIN
+      this business BEFORE deleting anything, so an unauthorized caller, an unknown/cross-tenant subject
+      or a missing justification each leaves every row — and writes no journal entry — exactly as it was.
+
+    Permitted scope only: the executor erases the DCA's OWN operational observation/evidence/projection
+    data for the subject. It deliberately does NOT touch the records a privacy obligation requires be
+    retained — the audit trail, consent receipts, restriction ledgers — nor any platform-owned data;
+    acting beyond this scope stays a disabled future capability. Tenant-owned: it inherits the DCA-017
+    ``business_id`` column and the DCA-018 RLS policy like every other tenant data table, so one tenant
+    can never read or drive another's erasures.
+    """
+
+    __tablename__ = "data_erasure_journals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The erased subject — an OrgObservation.id or PersonObservation.id in THIS business (opaque ids).
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # WHAT KIND of request drove the erasure (e.g. a local grievance erasure, or an operator-initiated
+    # erasure) — a short opaque code, descriptive only.
+    request_kind: Mapped[str] = mapped_column(String(48), default="", server_default="")
+    # The request this erasure answers — an opaque row key (e.g. a PrivacyGrievance.id), or "" when the
+    # erasure was initiated directly by an authorized operator.
+    request_ref: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # A short opaque justification/reason for the erasure (screened for secret/contact data like the
+    # audit trail). REQUIRED — an erasure must record WHY.
+    justification: Mapped[str] = mapped_column(String(300))
+    # Which authority plane authorized the erasure (always 'business' here) + the explicit scope held.
+    authority_plane: Mapped[str] = mapped_column(
+        String(16), default="business", server_default="business"
+    )
+    authority_scope: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHO executed the erasure — an opaque subject id (never a name/email) plus its kind.
+    executed_by: Mapped[str] = mapped_column(String(128))
+    executed_by_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    # HOW MANY rows were deleted, by category (observations / evidence / projections) and in total.
+    observations_deleted: Mapped[int] = mapped_column(Integer, default=0)
+    evidence_deleted: Mapped[int] = mapped_column(Integer, default=0)
+    projections_deleted: Mapped[int] = mapped_column(Integer, default=0)
+    total_deleted: Mapped[int] = mapped_column(Integer, default=0)
+    # The justified tombstone references: the OPAQUE row ids of every deleted row, grouped by table.
+    # Shape: {"observations": {table: [ids]}, "evidence": [ids], "projections": [ids]}. No personal data.
+    tombstones: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

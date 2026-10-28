@@ -59,6 +59,14 @@ class Scope(str, Enum):
     # read a client's grievances with their global rights alone; the REQUESTER's own status lookup takes
     # the separate claim-token path, which carries its own authority and needs no business role.
     GRIEVANCE_READ = "grievance.read"
+    # erase the DCA's OWN operational data (observations/evidence/projections) for ONE of this
+    # business's subjects, in response to a reviewed privacy obligation (DCA-084). An ADMINISTRATOR
+    # scope: erasing personal data is irreversible and sensitive, so an ordinary acting user and a
+    # read-only viewer both lack it — only a business administrator (admin/owner) holds it. It is a
+    # business-plane scope, so a platform operator (holding no membership) can never erase a client's
+    # data with their global rights alone; delegated client-support erasure would be a separate,
+    # scoped, expiring grant (a later story), never an Admin-role-alone right.
+    DATA_ERASE = "data.erase"
     SOURCE_APPROVE = "source.approve"  # administrator: approve a data source
     POLICY_APPROVE = "policy.approve"  # administrator: approve a compliance policy
     BUDGET_MANAGE = "budget.manage"  # administrator: change spend budgets
@@ -98,6 +106,8 @@ _ADMIN_SCOPES = frozenset(
         Scope.CONSENT_WITHDRAW,
         Scope.PROCESSING_RESTRICT,
         Scope.GRIEVANCE_READ,
+        # erasing operational data is an administrator action — never an ordinary acting user's.
+        Scope.DATA_ERASE,
         Scope.SOURCE_APPROVE,
         Scope.POLICY_APPROVE,
         Scope.BUDGET_MANAGE,
