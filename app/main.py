@@ -13,6 +13,7 @@ from fastapi import FastAPI
 
 from app.api.idempotency import install_idempotency
 from app.api.routes import (
+    activation_references,
     auth,
     authz,
     budget,
@@ -133,6 +134,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(icp.router)
     app.include_router(records.router)
     app.include_router(eligibility.router)
+    app.include_router(activation_references.router)
     app.include_router(targeting.router)
     app.include_router(auth.router)
     app.include_router(authz.router)

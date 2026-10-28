@@ -132,6 +132,21 @@ class Settings(BaseSettings):
     # path. Must be positive.
     consent_withdrawal_token_ttl_seconds: int = 2592000
 
+    # --- short-lived activation references (DCA-094) — OFF by default ---
+    # The signing secret for the tamper-resistant activation reference (app.activation.activation_
+    # reference). It is a DISTINCT secret from every auth/service/webhook/withdrawal secret above: a
+    # reference proves exactly one thing (this contact point cleared the DCA's gates for this context
+    # at this moment) and must never double as an authentication or service credential. Unset => the
+    # issue/verify path is disabled (fail-closed — a reference is never minted and every presented one
+    # is refused). The VALUE arrives out-of-band (env/secret manager); config carries only a reference
+    # (``*_secret_ref``), never the value in code.
+    activation_reference_secret: str | None = None
+    activation_reference_secret_ref: str | None = None
+    # How long a freshly-minted activation reference is good for (15 min). It rests on the host's
+    # authoritative suppression/consent view, which expires fast, so a reference is deliberately
+    # short-lived — never standing send permission. Must be positive.
+    activation_reference_ttl_seconds: int = 900
+
     # --- outbound: existing effortlesspromo-ai gateway (all model execution goes there) ---
     ai_base_url: str | None = None  # empty => AI-dependent features disabled
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
@@ -239,6 +254,13 @@ class Settings(BaseSettings):
         Unset => disabled (fail-closed): the subject is served by an authenticated business user
         instead. The authenticated withdrawal path does not depend on this."""
         return bool((self.consent_withdrawal_token_secret or "").strip())
+
+    @property
+    def activation_references_configured(self) -> bool:
+        """The DCA-094 activation-reference issue/verify path is active only when its signing secret is
+        set. Unset => disabled (fail-closed): no reference is minted and every presented one is
+        refused. It is independent of every other secret."""
+        return bool((self.activation_reference_secret or "").strip())
 
     @property
     def end_user_auth_configured(self) -> bool:
@@ -427,6 +449,11 @@ def validate_required(settings: Settings) -> None:
             "EFFORTLESSPROMO_DCA_CONSENT_WITHDRAWAL_TOKEN_TTL_SECONDS must be positive"
         )
 
+    # DCA-094: a minted activation reference's validity window must be positive so it is never
+    # already-expired (which would silently disable the capability for every caller).
+    if settings.activation_reference_ttl_seconds <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_ACTIVATION_REFERENCE_TTL_SECONDS must be positive")
+
     # DCA-082: the reviewed privacy-grievance response deadline must be a sane, reviewed window. 0/negative
     # would record an already-lapsed deadline; beyond 90 days exceeds the India DPDP grievance-redressal
     # statutory ceiling. Fail fast either way rather than pinning an impossible deadline onto a grievance.
@@ -477,6 +504,11 @@ def validate_required(settings: Settings) -> None:
             and not (settings.consent_withdrawal_token_secret_ref or "").strip()
         ):
             missing_refs.append("EFFORTLESSPROMO_DCA_CONSENT_WITHDRAWAL_TOKEN_SECRET_REF")
+        if (
+            settings.activation_references_configured
+            and not (settings.activation_reference_secret_ref or "").strip()
+        ):
+            missing_refs.append("EFFORTLESSPROMO_DCA_ACTIVATION_REFERENCE_SECRET_REF")
         if missing_refs:
             raise RuntimeError(
                 f"secret source '{settings.secret_source.value}' requires secret references: "

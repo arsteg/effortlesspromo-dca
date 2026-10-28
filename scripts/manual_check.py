@@ -13285,6 +13285,221 @@ def _run_dca_093(client, app, biz_a, biz_b, email_a, email_b, actor, auth) -> di
     return {"a_self": a_body, "b_cross_status": b_cross.status_code, "checks": checks}
 
 
+@register(
+    "DCA-094",
+    "short-lived activation references: in isolated synthetic Businesses A/B, A issues a "
+    "tamper-resistant reference for its OWN eligible email contact (bound to tenant/recipient/channel/"
+    "purpose/provider/campaign-revision/permission+source versions, recipient as a one-way digest, "
+    "short-lived). Then prove the acceptance failures: an ALTERED recipient, an ALTERED channel, a "
+    "TAMPERED signature, an EXPIRED reference, and a reference presented on B's path are each rejected "
+    "with a stable reason; a REVIEW/BLOCKED outcome mints NOTHING; and even a valid reference never "
+    "authorizes a send. Issuing/verifying is read-only, so every result reproduces with no state "
+    "change. Local synthetic; no AI/paid action, no network, no send.",
+)
+def _dca_094(ctx: CheckContext) -> dict:
+    """Drive the real activation-reference HTTP contract: issue only on a definitive ELIGIBLE, bind the
+    whole context into a signed short-lived token, and reject altered/expired/wrong-tenant references —
+    read-only, reproducible, never a send authorization."""
+    import time
+    from datetime import UTC, datetime, timedelta
+
+    from fastapi.testclient import TestClient
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.main import create_app
+    from app.services.contact_point import ContactPointInput, ContactPointStore, PersonInput
+
+    biz_a = "11111111-1111-1111-1111-11111111a094"
+    biz_b = "22222222-2222-2222-2222-22222222b094"
+    email_a = "owner@acme-synthetic.example"
+    email_b = "owner@globex-synthetic.example"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0094", type=ActorType.USER)
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    # The activation-reference signing secret is OFF by default; turn it on for this synthetic run only
+    # (a short TTL so the expiry case is observable within the scenario).
+    settings = ctx.settings.model_copy(
+        update={
+            "activation_reference_secret": "manual-check-activation-secret",
+            "activation_reference_ttl_seconds": 2,
+        }
+    )
+    app = create_app(settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        # Register both tenants; each privately records its OWN email contact point.
+        for biz in (biz_a, biz_b):
+            assert (
+                client.post("/v1/tenants", json={"businessId": biz}, headers=auth).status_code
+                == 201
+            )
+        with app.state.session_factory() as session:
+            for biz, email in ((biz_a, email_a), (biz_b, email_b)):
+                store = ContactPointStore(session, biz)
+                person = store.create_person(
+                    PersonInput(display_name="Synthetic Owner"), actor=actor
+                )
+                store.add_contact_point(
+                    ContactPointInput(
+                        person_observation_id=person.id,
+                        channel="email",
+                        value=email,
+                        evidence="self_reported",
+                    ),
+                    actor=actor,
+                )
+            session.commit()
+
+        now = datetime.now(UTC)
+
+        def _issue_body(contact_point: str, **over) -> dict:
+            body = {
+                "contactPoint": contact_point,
+                "purpose": "marketing_email",
+                "basis": "consent",
+                "permissionState": "granted",
+                "permissionScopeChannel": "email",
+                "consentCollectedAt": (now - timedelta(days=7)).isoformat(),
+                "sourceRights": {"permitsEmailContact": True},
+                "suppression": {
+                    "availability": "available",
+                    "version": "supp-v1",
+                    "asOf": now.isoformat(),
+                    "coveredChannels": ["email"],
+                    "suppressedContactPoints": [],
+                },
+                "provider": {"allowed": True, "reason": ""},
+                "providerName": "ses",
+                "campaignRevision": "rev-7",
+                "permissionVersion": "perm-v3",
+                "sourceVersion": "src-v2",
+            }
+            body.update(over)
+            return body
+
+        def _issue(biz: str, body: dict, channel: str = "email"):
+            return client.post(
+                f"/v1/tenants/{biz}/activation-references/{channel}", json=body, headers=auth
+            )
+
+        def _verify(biz: str, reference: str, channel: str = "email", expected=None):
+            payload: dict = {"reference": reference}
+            if expected is not None:
+                payload["expected"] = expected
+            return client.post(
+                f"/v1/tenants/{biz}/activation-references/{channel}/verify",
+                json=payload,
+                headers=auth,
+            )
+
+        # 1) A issues a reference for its OWN eligible contact.
+        issued = _issue(biz_a, _issue_body(email_a)).json()
+        reference = issued["reference"]
+        print(
+            f"\n1) A issues a reference -> issued={issued['issued']} outcome={issued['outcome']} "
+            f"ttlSeconds={issued['ttlSeconds']}"
+        )
+        print(f"   binding={issued['binding']}")
+        print(
+            f"   activation={issued['activation']}  (raw address present in token? {email_a in reference})"
+        )
+
+        # 2) The reference verifies against its exact intended context.
+        ok = _verify(biz_a, reference, expected={"recipient": email_a, "provider": "ses"}).json()
+        print(f"\n2) verify (matching intended context) -> valid={ok.get('valid')}")
+
+        # 3) Acceptance FAILURES — each rejected with a stable reason, nothing acted on.
+        altered_recipient = _verify(
+            biz_a, reference, expected={"recipient": "someone-else@acme-synthetic.example"}
+        )
+        altered_channel = _verify(biz_a, reference, expected={"channel": "sms"})
+        tampered = reference.rsplit(".", 1)[0] + ".TAMPEREDsig"
+        bad_sig = _verify(biz_a, tampered)
+        cross_tenant = _verify(biz_b, reference)
+        print(
+            f"\n3) altered recipient -> {altered_recipient.status_code} "
+            f"{altered_recipient.json()['error']['message']}"
+        )
+        print(
+            f"   altered channel   -> {altered_channel.status_code} "
+            f"{altered_channel.json()['error']['message']}"
+        )
+        print(f"   tampered signature-> {bad_sig.status_code} {bad_sig.json()['error']['message']}")
+        print(
+            f"   another tenant    -> {cross_tenant.status_code} "
+            f"{cross_tenant.json()['error']['message']}"
+        )
+
+        # 4) EXPIRED: wait past the short TTL, then the SAME reference is refused.
+        time.sleep(2.2)
+        expired = _verify(biz_a, reference)
+        print(
+            f"\n4) after TTL lapses -> {expired.status_code} {expired.json()['error']['message']}"
+        )
+
+        # 5) A non-eligible outcome mints NOTHING (no reference).
+        review = _issue(
+            biz_a,
+            _issue_body(
+                email_a,
+                suppression={
+                    "availability": "unavailable",
+                    "version": "supp-v1",
+                    "asOf": now.isoformat(),
+                    "coveredChannels": ["email"],
+                    "suppressedContactPoints": [],
+                },
+            ),
+        ).json()
+        print(
+            f"\n5) REVIEW outcome -> issued={review['issued']} reference={review['reference']} "
+            f"outcome={review['outcome']}"
+        )
+
+        # 6) B cannot issue for A's hidden contact (tenant isolation).
+        b_cross = _issue(biz_b, _issue_body(email_a))
+
+        # 7) Reproducible: re-issuing produces the identical binding (clock-independent fields aside).
+        reissued = _issue(biz_a, _issue_body(email_a)).json()
+
+        checks = {
+            "eligible_contact_issues_reference": issued["issued"] is True and bool(reference),
+            "recipient_bound_as_digest_not_raw": email_a not in reference
+            and bool(issued["binding"]["recipientDigest"]),
+            "reference_never_authorizes_send": issued["activation"]["authorizesSend"] is False,
+            "verifies_against_matching_context": ok.get("valid") is True,
+            "altered_recipient_rejected": altered_recipient.status_code == 422
+            and altered_recipient.json()["error"]["message"]
+            == "activation_reference_binding_mismatch:recipient_digest",
+            "altered_channel_rejected": altered_channel.status_code == 422
+            and altered_channel.json()["error"]["message"]
+            == "activation_reference_binding_mismatch:channel",
+            "tampered_signature_rejected": bad_sig.status_code == 422
+            and bad_sig.json()["error"]["message"] == "activation_reference_bad_signature",
+            "another_tenant_rejected": cross_tenant.status_code == 422
+            and cross_tenant.json()["error"]["message"]
+            == "activation_reference_binding_mismatch:business_id",
+            "expired_reference_rejected": expired.status_code == 422
+            and expired.json()["error"]["message"] == "activation_reference_expired",
+            "review_mints_no_reference": review["issued"] is False and review["reference"] is None,
+            "other_business_cannot_issue_hidden_contact": b_cross.status_code == 404,
+            "reproduces_with_no_state_change": reissued["binding"] == issued["binding"],
+        }
+        print(f"\nchecks: {checks}")
+        print(
+            "\n(local synthetic only; no AI/paid action, no network, no send. A reference is minted "
+            "ONLY for a definitive ELIGIBLE answer and binds the whole activation context into a "
+            "signed, short-lived token — altering any dimension, tampering the signature, presenting "
+            "it for another tenant, or letting it expire all reject it with a stable reason. A "
+            "reference is NOT recipient consent and NOT a send authorization: the one send pipeline "
+            "owns and re-gates the send, which stays a disabled future capability. Issuing/verifying "
+            "reads nothing and writes nothing.)"
+        )
+        return {"issued": issued, "checks": checks}
+    finally:
+        app.state.engine.dispose()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
