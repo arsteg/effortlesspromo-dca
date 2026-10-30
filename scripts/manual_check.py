@@ -17526,6 +17526,188 @@ def _dca_111(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-112",
+    "estimate bounded run costs: a PURE, deterministic estimator prices a planned run's OPERATIONAL "
+    "cost from a VERSIONED INR rate card (retaining currency/source/version/validity) with hard per-"
+    "operation and total CAPS, and folds in model-work cost taken ONLY from the AI gateway's dry-run "
+    "QUOTE (no paid model). The denial case: a pricingUnavailable quote BLOCKS paid model work and is "
+    "never costed as zero. No DB/network/state change; reserving/spending is a later story.",
+)
+def _dca_112(ctx: CheckContext) -> dict:
+    """Drive the DCA-112 estimator directly and PRINT the real estimate rows + the pricing-unavailable
+    denial - never a bare PASS. The estimator is pure: no synthetic DB rows are written (reserving/
+    spending is DCA-113+), so this proves the acceptance - bounded/capped, provenanced, AI-priced via a
+    dry-run quote, and 'unavailable AI price blocks paid model work, never zero' - with no state change."""
+    from datetime import UTC, datetime
+
+    from app.cost.estimate import (
+        DEFAULT_OPERATION_RATE_CARD,
+        ModelQuote,
+        ModelWorkItem,
+        OperationKind,
+        PlannedOperation,
+        RateCard,
+        estimate_run_cost,
+    )
+
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
+    card = DEFAULT_OPERATION_RATE_CARD
+    print(
+        f"\nversioned operational rate card: version={card.version} source={card.source} "
+        f"currency={card.currency} valid_from={card.valid_from.date()} "
+        f"caps(units/op={card.max_units_per_operation}, total={card.max_total_operational_minor} paise)"
+    )
+
+    # A known-currency AI dry-run quote envelope (shape per docs/DCA-001 §2). dryRun => NO paid model.
+    priced_quote = ModelQuote.from_envelope(
+        {
+            "status": "completed",
+            "model": "claude-sonnet-5",
+            "costEstimate": {"amount": 0.01, "currency": "USD", "estimated": True},
+        }
+    )
+    # The denial fixture: the gateway could not price the model work.
+    unavailable_quote = ModelQuote.from_envelope(
+        {"status": "completed", "model": "claude-sonnet-5", "costEstimate": {"available": False}}
+    )
+
+    # --- 1) a normal bounded estimate (operational INR + an AI dry-run quote in its OWN currency) ----
+    good = estimate_run_cost(
+        [
+            PlannedOperation(OperationKind.SOURCE_LOOKUP, 100),  # 100 * 50  = 5,000 paise
+            PlannedOperation(OperationKind.EMAIL_VERIFICATION, 50),  # 50  * 25  = 1,250 paise
+            PlannedOperation(OperationKind.IDENTITY_RESOLUTION, 10),  # 10  * 200 = 2,000 paise
+        ],
+        [
+            ModelWorkItem(capability="research", calls=20, quote=priced_quote)
+        ],  # 20 * 1 = 20 US cents
+        now=now,
+    )
+    print(
+        "\n1) bounded estimate (operational INR + a model dry-run QUOTE kept in its own currency):"
+    )
+    for op_line in good.operation_lines:
+        print(
+            f"   op {op_line.kind:<20} units={op_line.units_counted:<6} "
+            f"rate={op_line.unit_rate_minor} paise -> subtotal={op_line.subtotal_minor} paise "
+            f"(clamped={op_line.clamped})"
+        )
+    for model_line in good.model_lines:
+        print(
+            f"   model {model_line.capability:<12} calls={model_line.calls} "
+            f"unit={model_line.unit_amount_minor} {model_line.currency} -> "
+            f"subtotal={model_line.subtotal_minor} {model_line.currency} "
+            f"(source={model_line.source}, estimated={model_line.estimated})"
+        )
+    print(f"   operational subtotal : {good.operational_subtotal_minor} paise (INR)")
+    print(
+        f"   totals by currency   : {good.totals_by_currency}  "
+        "(operational INR kept DISTINCT from the model's USD - no fabricated conversion)"
+    )
+    print(
+        f"   provenance           : currency={good.currency} card={good.rate_card_version}"
+        f"/{good.rate_card_source} valid_at(now)={good.is_valid_at(now)}"
+    )
+    print(
+        f"   bounded={good.bounded} units_clamped={good.units_clamped} "
+        f"total_capped={good.total_capped} paid_model_work_allowed={good.paid_model_work_allowed}"
+    )
+
+    # --- 2) the CAPS actually bite: an absurdly large plan is clamped, never open-ended --------------
+    capped_card = RateCard(
+        version="demo.caps.1",
+        source="demo",
+        valid_from=datetime(2026, 1, 1, tzinfo=UTC),
+        unit_rates_minor={OperationKind.SOURCE_LOOKUP.value: 100},
+        max_units_per_operation=5,
+        max_total_operational_minor=300,
+    )
+    capped = estimate_run_cost(
+        [PlannedOperation(OperationKind.SOURCE_LOOKUP, 1_000_000)], rate_card=capped_card, now=now
+    )
+    cl = capped.operation_lines[0]
+    print("\n2) bounds bite (caps: 5 units/op, 300 paise total):")
+    print(
+        f"   requested={cl.units_requested} -> counted={cl.units_counted} (clamped={cl.clamped}); "
+        f"raw 5*100=500 paise -> subtotal={capped.operational_subtotal_minor} (total_capped="
+        f"{capped.total_capped})"
+    )
+
+    # --- 3) the DENIAL: a pricingUnavailable quote blocks paid model work and is NEVER zero ---------
+    denied = estimate_run_cost(
+        [PlannedOperation(OperationKind.SOURCE_LOOKUP, 100)],  # operational still estimates = 5,000
+        [ModelWorkItem(capability="research", calls=5, quote=unavailable_quote)],
+        now=now,
+    )
+    dm = denied.model_lines[0]
+    print("\n3) DENIAL - AI pricing unavailable blocks paid model work (never costed as zero):")
+    print(
+        f"   model line priceable={dm.priceable} subtotal={dm.subtotal_minor} "
+        f"unit={dm.unit_amount_minor} reason={dm.reason}"
+    )
+    print(f"   paid_model_work_allowed = {denied.paid_model_work_allowed}  (blocked)")
+    print(f"   blocked_reasons         = {list(denied.blocked_reasons)}")
+    print(
+        f"   operational still estimated = {denied.operational_subtotal_minor} paise; "
+        f"totals_by_currency = {denied.totals_by_currency}  (no zero/USD model line entered the total)"
+    )
+
+    # --- 4) reproducibility + no state change -------------------------------------------------------
+    again = estimate_run_cost(
+        [PlannedOperation(OperationKind.SOURCE_LOOKUP, 100)],
+        [ModelWorkItem(capability="research", calls=5, quote=unavailable_quote)],
+        now=now,
+    )
+    print(
+        f"\n4) reproducible: identical inputs reproduce the same estimate+denial? {again == denied}"
+    )
+
+    checks = {
+        "operational_subtotal_correct": good.operational_subtotal_minor == 8_250,
+        "model_kept_in_own_currency": good.totals_by_currency == {"INR": 8_250, "USD": 20},
+        "retains_currency_version_source": (
+            good.currency == "INR"
+            and good.rate_card_version == card.version
+            and good.rate_card_source == card.source
+        ),
+        "valid_at_now": good.is_valid_at(now) is True,
+        "is_structurally_bounded": good.bounded is True,
+        "caps_bite_units_and_total": cl.clamped
+        and capped.total_capped
+        and capped.operational_subtotal_minor == 300,
+        "unavailable_blocks_paid_model_work": denied.paid_model_work_allowed is False,
+        "unavailable_is_never_zero": dm.subtotal_minor is None and dm.unit_amount_minor is None,
+        "denial_excluded_from_totals": denied.totals_by_currency == {"INR": 5_000},
+        "reproducible_no_state_change": again == denied,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no DB writes, no send. DCA-112 is a PURE "
+        "estimator: it prices a planned run's OPERATIONAL cost from a VERSIONED INR rate card with hard "
+        "per-operation and total CAPS, and takes model-work cost ONLY from the AI gateway's DRY-RUN quote "
+        "(which projects cost without invoking a paid model). An unknown/unavailable AI price BLOCKS paid "
+        "model work and is never implied to be zero; operational cost is kept distinct from any customer "
+        "price, and currencies are never silently converted. Reserving budget and recording actual "
+        "provider spend are later, still-disabled stories - nothing here reserves, spends or sends.)"
+    )
+    return {
+        "rate_card_version": card.version,
+        "good_estimate": {
+            "operational_subtotal_minor": good.operational_subtotal_minor,
+            "totals_by_currency": good.totals_by_currency,
+            "paid_model_work_allowed": good.paid_model_work_allowed,
+        },
+        "capped_subtotal_minor": capped.operational_subtotal_minor,
+        "denial": {
+            "paid_model_work_allowed": denied.paid_model_work_allowed,
+            "blocked_reasons": list(denied.blocked_reasons),
+            "totals_by_currency": denied.totals_by_currency,
+        },
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
