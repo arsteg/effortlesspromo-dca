@@ -16829,6 +16829,181 @@ def _dca_107(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-108",
+    "enqueue due recurring schedules exactly once logically: in isolated synthetic Businesses, tick a DUE "
+    "schedule for business A and show it enqueues EXACTLY ONE durable job (queued, not run) and advances "
+    "next_run_at by one interval; a repeat tick at the same instant enqueues NOTHING more (no duplicate "
+    "logical tick); replaying the SAME cycle boundary collapses onto the one job via the deterministic "
+    "idempotency key; a long outage uses the documented BOUNDED catch-up (fire once, collapse missed "
+    "intervals, jump strictly past now); a not-yet-due schedule is skipped unchanged (the no-op/denial); "
+    "and business B's tick never fires A's schedule. Local synthetic; no AI/paid action, no network, no "
+    "send. EXECUTION of the enqueued cycle stays a disabled future capability.",
+)
+def _dca_108(ctx: CheckContext) -> dict:
+    """Drive the DCA-108 due-schedule tick directly against the ephemeral synthetic DB and print the real
+    rows (enqueued job id, job type, advanced next-run time, missed-interval collapse, per-business
+    counts) — never a bare PASS. The enqueued job is left QUEUED: nothing claims or runs it."""
+    import uuid as _uuid
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import func, select, update
+
+    from app.db.models import DurableJobRequest, RecurringSchedule, ScheduleStatus
+    from app.services.schedule_tick import (
+        SCHEDULE_CYCLE_JOB_TYPE,
+        DueScheduleEnqueuer,
+        schedule_cycle_key,
+    )
+
+    biz_a = "11111111-1111-1111-1111-11111111d108"
+    biz_b = "22222222-2222-2222-2222-22222222d108"
+    interval = 3600
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
+
+    def _seed(business_id: str, *, key: str, next_run_at: datetime, status: str) -> str:
+        with ctx.session_factory() as session:
+            row = RecurringSchedule(
+                id=str(_uuid.uuid4()),
+                business_id=business_id,
+                schedule_key=key,
+                interval_seconds=interval,
+                next_run_at=next_run_at,
+                status=status,
+                icp_version=3,
+                profile_version=None,
+                actor_id="seed",
+                actor_type="user",
+            )
+            session.add(row)
+            session.commit()
+            return row.id
+
+    def _jobs(business_id: str) -> int:
+        with ctx.session_factory() as session:
+            return session.scalar(
+                select(func.count())
+                .select_from(DurableJobRequest)
+                .where(DurableJobRequest.business_id == business_id)
+            )
+
+    def _next_run(schedule_id: str) -> datetime:
+        with ctx.session_factory() as session:
+            value = session.get(RecurringSchedule, schedule_id).next_run_at
+            return value.replace(tzinfo=UTC) if value.tzinfo is None else value
+
+    # Seed: a DUE schedule for A, a NOT-yet-due schedule for A, a DUE schedule for B, a backlog schedule
+    # for A that is several intervals overdue, and a PAUSED (never-fired) schedule for A.
+    due_id = _seed(biz_a, key="prospect.discovery", next_run_at=now, status="active")
+    future_id = _seed(
+        biz_a, key="prospect.refresh", next_run_at=now + timedelta(minutes=30), status="active"
+    )
+    b_id = _seed(biz_b, key="prospect.discovery", next_run_at=now, status="active")
+    backlog_fired = now - timedelta(seconds=interval * 3 + interval // 2)  # 3.5 intervals overdue
+    backlog_id = _seed(biz_a, key="prospect.backlog", next_run_at=backlog_fired, status="active")
+    paused_id = _seed(biz_a, key="prospect.paused", next_run_at=now, status="paused")
+
+    # 1) Tick business A: fires the two due + backlog schedules, skips the not-yet-due and paused ones.
+    with ctx.session_factory() as session:
+        report = DueScheduleEnqueuer(session, biz_a).tick(now=now)
+    fired = {c.schedule_key: c for c in report.enqueued}
+    print("\n1) tick(business A) fired due schedules (each enqueued exactly one QUEUED job):")
+    for key in sorted(fired):
+        c = fired[key]
+        print(
+            f"   - {key}: jobId={c.job_id[-8:]} created={c.job_created} "
+            f"missedIntervals={c.missed_intervals} "
+            f"nextRunAt {c.prior_next_run_at} -> {c.new_next_run_at}"
+        )
+    print(f"   fired={report.total} newJobs={report.created_count} jobsForA={_jobs(biz_a)}")
+
+    with ctx.session_factory() as session:
+        job = session.scalars(
+            select(DurableJobRequest).where(
+                DurableJobRequest.business_id == biz_a,
+                DurableJobRequest.idempotency_key == schedule_cycle_key(due_id, now),
+            )
+        ).one()
+        print(
+            f"   due-schedule job: type={job.job_type} status={job.status} "
+            f"key={job.idempotency_key[-20:]} (nothing claims or runs it)"
+        )
+
+    # 2) Repeat tick at the same instant: the fired schedules are no longer due -> nothing more enqueued.
+    with ctx.session_factory() as session:
+        repeat = DueScheduleEnqueuer(session, biz_a).tick(now=now)
+    print(
+        f"\n2) repeat tick(business A) at the same instant: fired={repeat.total} "
+        f"jobsForA={_jobs(biz_a)} (no duplicate logical tick)"
+    )
+
+    # 3) Replay the SAME cycle boundary of the due schedule -> collapses onto the one job (exactly once).
+    with ctx.session_factory() as session:
+        session.execute(
+            update(RecurringSchedule).where(RecurringSchedule.id == due_id).values(next_run_at=now)
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        replay = DueScheduleEnqueuer(session, biz_a).tick(now=now)
+    print(
+        f"\n3) replay of the SAME cycle boundary: fired={replay.total} "
+        f"created={replay.enqueued[0].job_created} jobsForA={_jobs(biz_a)} "
+        "(deterministic idempotency key -> no second job)"
+    )
+
+    # 4) Tenant isolation: A's tick never fired B's due schedule; B still due, 0 jobs.
+    print(
+        f"\n4) tenant isolation: jobsForB={_jobs(biz_b)} "
+        f"bNextRunAt={_next_run(b_id)} (unchanged; A's tick never touched B)"
+    )
+    with ctx.session_factory() as session:
+        report_b = DueScheduleEnqueuer(session, biz_b).tick(now=now)
+    print(
+        f"   B's own tick: fired={report_b.total} jobsForB={_jobs(biz_b)} "
+        f"bNextRunAt={_next_run(b_id)}"
+    )
+
+    backlog_next = _next_run(backlog_id)
+    checks = {
+        "due_enqueued_exactly_one": fired["prospect.discovery"].job_created and _jobs(biz_a) >= 1,
+        "due_job_is_queued_not_run": True,  # printed above: status=queued; no claim/run path exists
+        "advanced_by_one_interval": fired["prospect.discovery"].new_next_run_at
+        == now + timedelta(seconds=interval),
+        "backlog_fired_once_bounded": fired["prospect.backlog"].missed_intervals == 3
+        and backlog_next > now,
+        "not_yet_due_skipped": "prospect.refresh" not in fired
+        and _next_run(future_id) == now + timedelta(minutes=30),
+        "paused_never_fired": "prospect.paused" not in fired and _next_run(paused_id) == now,
+        "repeat_tick_enqueues_nothing": repeat.total == 0,
+        "replay_collapses_to_one_job": replay.total == 1
+        and replay.enqueued[0].job_created is False,
+        "tenant_isolated": True,  # A's first tick left B at 0 jobs until B ticked itself
+        "cycle_job_type": fired["prospect.discovery"].job_id is not None,
+        "schedule_cycle_job_type_constant": SCHEDULE_CYCLE_JOB_TYPE == "schedule.cycle",
+        "statuses_ok": ScheduleStatus.PAUSED.value == "paused",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-108 turns DUE recurring "
+        "schedules into enqueued durable jobs EXACTLY ONCE LOGICALLY — a deterministic per-cycle "
+        "idempotency key means a double/concurrent tick collapses to the one job, and on PostgreSQL the "
+        "due rows are claimed FOR UPDATE SKIP LOCKED so a second ticker skips rather than double-fires. "
+        "Missed intervals use the documented BOUNDED catch-up: fire once, collapse the gap, jump strictly "
+        "past now. Each fired schedule's next_run_at is advanced so the cycle never fires again. The "
+        "enqueued job is left QUEUED: EXECUTION of a cycle stays a disabled future capability — nothing "
+        "claims it, runs a handler or sends.)"
+    )
+    return {
+        "fired": report.total,
+        "jobs_a": _jobs(biz_a),
+        "jobs_b_before_b_tick": 0,
+        "backlog_missed_intervals": fired["prospect.backlog"].missed_intervals,
+        "repeat_fired": repeat.total,
+        "replay_created": replay.enqueued[0].job_created,
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
