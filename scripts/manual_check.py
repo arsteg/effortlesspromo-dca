@@ -13500,6 +13500,1539 @@ def _dca_094(ctx: CheckContext) -> dict:
         app.state.engine.dispose()
 
 
+@register(
+    "DCA-095",
+    "revalidate immediately before host dispatch: in isolated synthetic Businesses A/B, A issues a "
+    "DCA-094 reference while clear, then RE-CHECKS it immediately before a (faked) host dispatch. A "
+    "still-clear recheck GRANTS and consumes exactly one dispatch slot; a retry under the same key "
+    "REPLAYS that one grant (consume-once). Then pause the host, withdraw permission, and resume the "
+    "callback: the recheck BLOCKS with no consumption. Also prove the other denials fail closed with "
+    "no state change — a newly-suppressed contact BLOCKS, an unavailable authority is REVIEW, and a "
+    "version-drifted reference is REJECTED — and none of them authorizes a send. Local synthetic; no "
+    "AI/paid action, no network, no send.",
+)
+def _dca_095(ctx: CheckContext) -> dict:
+    """Drive the real dispatch-recheck HTTP contract: a still-clear recheck grants + consumes one slot
+    idempotently; a withdrawal recorded since issuance (or a new suppression entry, an unavailable
+    authority, a drifted version) blocks dispatch and consumes nothing — fail-closed, reproducible,
+    never a send authorization."""
+    from datetime import UTC, datetime, timedelta
+
+    from fastapi.testclient import TestClient
+    from sqlalchemy import func, select
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import DispatchRecheckConsumption
+    from app.main import create_app
+    from app.services.contact_point import ContactPointInput, ContactPointStore, PersonInput
+
+    biz_a = "11111111-1111-1111-1111-11111111a095"
+    biz_b = "22222222-2222-2222-2222-22222222b095"
+    email_a = "owner@acme-synthetic.example"
+    email_b = "owner@globex-synthetic.example"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0095", type=ActorType.USER)
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+
+    settings = ctx.settings.model_copy(
+        update={"activation_reference_secret": "manual-check-dispatch-recheck-secret"}
+    )
+    app = create_app(settings)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    def _count(business_id: str) -> int:
+        with app.state.session_factory() as session:
+            return session.scalar(
+                select(func.count())
+                .select_from(DispatchRecheckConsumption)
+                .where(DispatchRecheckConsumption.business_id == business_id)
+            )
+
+    try:
+        for biz, email in ((biz_a, email_a), (biz_b, email_b)):
+            assert (
+                client.post("/v1/tenants", json={"businessId": biz}, headers=auth).status_code
+                == 201
+            )
+        with app.state.session_factory() as session:
+            for biz, email in ((biz_a, email_a), (biz_b, email_b)):
+                store = ContactPointStore(session, biz)
+                person = store.create_person(
+                    PersonInput(display_name="Synthetic Owner"), actor=actor
+                )
+                store.add_contact_point(
+                    ContactPointInput(
+                        person_observation_id=person.id,
+                        channel="email",
+                        value=email,
+                        evidence="self_reported",
+                    ),
+                    actor=actor,
+                )
+            session.commit()
+
+        now = datetime.now(UTC)
+
+        def _context(contact_point: str, **over) -> dict:
+            body = {
+                "contactPoint": contact_point,
+                "purpose": "marketing_email",
+                "basis": "consent",
+                "permissionState": over.pop("permission_state", "granted"),
+                "permissionScopeChannel": "email",
+                "consentCollectedAt": (now - timedelta(days=7)).isoformat(),
+                "sourceRights": {"permitsEmailContact": True},
+                "suppression": {
+                    "availability": (
+                        "available" if over.pop("suppression_available", True) else "unavailable"
+                    ),
+                    "version": "supp-v1",
+                    "asOf": now.isoformat(),
+                    "coveredChannels": ["email"],
+                    "suppressedContactPoints": list(over.pop("suppressed", ())),
+                },
+                "provider": {"allowed": True, "reason": ""},
+                "providerName": "ses",
+                "campaignRevision": "rev-7",
+                "permissionVersion": over.pop("permission_version", "perm-v3"),
+                "sourceVersion": "src-v2",
+            }
+            body.update(over)
+            return body
+
+        def _issue(biz: str, contact_point: str) -> dict:
+            return client.post(
+                f"/v1/tenants/{biz}/activation-references/email",
+                json=_context(contact_point),
+                headers=auth,
+            ).json()
+
+        def _recheck(biz: str, reference: str, key: str, contact_point: str, **over):
+            body = _context(contact_point, **over)
+            body["reference"] = reference
+            body["idempotencyKey"] = key
+            return client.post(f"/v1/tenants/{biz}/dispatch-recheck/email", json=body, headers=auth)
+
+        # 1) A issues a reference while clear, then re-checks it immediately before dispatch -> GRANT.
+        reference = _issue(biz_a, email_a)["reference"]
+        granted = _recheck(biz_a, reference, "dispatch-1", email_a).json()
+        print(
+            f"\n1) still-clear recheck -> allowed={granted['dispatch']['allowed']} "
+            f"status={granted['dispatch']['status']} consumed={granted['consumption']['consumed']} "
+            f"replay={granted['consumption']['replay']} consumptions(A)={_count(biz_a)}"
+        )
+        print(
+            f"   binding={granted['binding']}  activation={granted['activation']['authorizesSend']=}"
+        )
+        print(
+            f"   (raw address present in response? {email_a in granted.get('binding', {}).get('recipientDigest', '')})"
+        )
+
+        # 2) A retry under the SAME key replays the one grant (consume-once) — no second row.
+        replay = _recheck(biz_a, reference, "dispatch-1", email_a).json()
+        print(
+            f"\n2) retry same key -> replay={replay['consumption']['replay']} "
+            f"sameRow={replay['consumption']['consumptionId'] == granted['consumption']['consumptionId']} "
+            f"consumptions(A)={_count(biz_a)}"
+        )
+
+        # 3) Pause the host, WITHDRAW permission, resume its callback with a FRESH key -> BLOCKED.
+        withdrawn = _recheck(
+            biz_a, reference, "dispatch-2", email_a, permission_state="withdrawn"
+        ).json()
+        print(
+            f"\n3) withdrawal before dispatch -> allowed={withdrawn['dispatch']['allowed']} "
+            f"status={withdrawn['dispatch']['status']} reasons={withdrawn['recheck']['reasons']} "
+            f"consumed={withdrawn['consumption']['consumed']} consumptions(A)={_count(biz_a)}"
+        )
+
+        # 4) Other fail-closed denials — each consumes nothing.
+        suppressed = _recheck(biz_a, reference, "dispatch-3", email_a, suppressed=(email_a,)).json()
+        unavailable = _recheck(
+            biz_a, reference, "dispatch-4", email_a, suppression_available=False
+        ).json()
+        drifted = _recheck(
+            biz_a, reference, "dispatch-5", email_a, permission_version="perm-v4"
+        ).json()
+        print(
+            f"\n4) newly suppressed -> {suppressed['dispatch']['status']} "
+            f"({suppressed['recheck']['reasons']})"
+        )
+        print(f"   unavailable authority -> {unavailable['dispatch']['status']} (fails closed)")
+        print(
+            f"   version drift -> {drifted['dispatch']['status']} "
+            f"({drifted['recheck']['referenceReason']})"
+        )
+        print(f"   consumptions(A) after all denials = {_count(biz_a)} (unchanged)")
+
+        # 5) Tenant isolation: B cannot recheck A's hidden contact.
+        b_cross = _recheck(biz_b, reference, "dispatch-1", email_a)
+        print(f"\n5) B re-checks A's hidden contact -> {b_cross.status_code} (not found)")
+
+        checks = {
+            "still_clear_recheck_grants": granted["dispatch"]["allowed"] is True,
+            "grant_consumes_exactly_one_slot": _count(biz_a) == 1,
+            "grant_never_authorizes_send": granted["activation"]["authorizesSend"] is False,
+            "retry_same_key_replays_one_grant": replay["consumption"]["replay"] is True
+            and replay["consumption"]["consumptionId"] == granted["consumption"]["consumptionId"],
+            "withdrawal_blocks_dispatch": withdrawn["dispatch"]["allowed"] is False
+            and "consent_not_in_force" in withdrawn["recheck"]["reasons"],
+            "withdrawal_consumes_nothing": withdrawn["consumption"]["consumed"] is False,
+            "newly_suppressed_blocks": suppressed["dispatch"]["status"] == "blocked",
+            "unavailable_authority_fails_closed": unavailable["dispatch"]["status"] == "review",
+            "version_drift_rejected": drifted["dispatch"]["status"] == "reference_rejected"
+            and drifted["recheck"]["referenceReason"]
+            == "activation_reference_binding_mismatch:permission_version",
+            "denials_leave_one_consumption": _count(biz_a) == 1,
+            "other_business_cannot_recheck_hidden_contact": b_cross.status_code == 404,
+        }
+        print(f"\nchecks: {checks}")
+        print(
+            "\n(local synthetic only; no AI/paid action, no network, no send. The recheck re-asserts "
+            "the DCA's OWN blockers — permission, suppression and version state — immediately before a "
+            "host dispatch, and consumes exactly one dispatch slot on a grant; a retry replays it. A "
+            "withdrawal recorded since issuance, a newly-suppressed contact, an unavailable authority, "
+            "or a drifted/expired/altered reference all BLOCK and consume nothing — fail-closed, "
+            "reproducible. A grant is NOT recipient consent and NOT a send authorization: the one send "
+            "pipeline owns and performs the actual send, which stays a disabled future capability.)"
+        )
+        return {"granted": granted, "withdrawn": withdrawn, "checks": checks}
+    finally:
+        app.state.engine.dispose()
+
+
+@register(
+    "DCA-096",
+    "request delivery ONLY through EffortlessPromo: in isolated synthetic Businesses A/B, build a "
+    "delivery request (idempotency key + the consumed DCA-095 decision context) and request delivery "
+    "through a fake platform host that ENFORCES delivery callbacks (ACCEPTED into the one send "
+    "pipeline, idempotent, never a send), then through one that does NOT enforce callbacks and one "
+    "that is unavailable (both DISABLED — live delivery off, nothing accepted). Prove the port has no "
+    "direct provider/send path. Local synthetic; no AI/paid action, no network, no send.",
+)
+def _dca_096(ctx: CheckContext) -> dict:
+    """Drive the delivery adapter contract + synthetic fake directly (no DB, no network, no send): a
+    callback-enforcing host ACCEPTS the request into the platform's one send pipeline (idempotent in
+    its key, never a send); a host that does not enforce callbacks — or is unavailable — DISABLES live
+    delivery instead of being bypassed. The DCA holds no provider/send path at all."""
+    from datetime import UTC, datetime
+
+    from app.delivery import (
+        DeliveryContext,
+        DeliveryDecision,
+        DeliveryReceipt,
+        DeliveryRequest,
+        FakeEffortlessPromoDeliveryPort,
+    )
+
+    biz_a = "11111111-1111-1111-1111-11111111a096"
+    biz_b = "22222222-2222-2222-2222-22222222b096"
+    now = datetime.now(UTC)
+
+    def _context(business_id: str) -> DeliveryContext:
+        # Stands in for a consumed DCA-095 grant: recipient as a one-way digest only, never the address.
+        return DeliveryContext(
+            business_id=business_id,
+            channel="email",
+            recipient_digest="sha256-digest-of-synthetic-recipient",
+            contact_point_id="cp-096",
+            consumption_id="consumption-096",
+            reference_fingerprint="fp-096",
+            permission_version="perm-v3",
+            source_version="src-v2",
+            suppression_version="supp-v1",
+            provider="ses",
+            campaign_revision="rev-7",
+        )
+
+    # 1) A callback-ENFORCING host: the request is ACCEPTED into the one send pipeline (not a send).
+    enforcing = FakeEffortlessPromoDeliveryPort(callback_enforcement=True, now=now)
+    req_a = DeliveryRequest(idempotency_key="dispatch-096-A", context=_context(biz_a))
+    accepted = enforcing.request_delivery(req_a)
+    print(
+        f"\n1) callback-enforcing host -> accepted={accepted.accepted} "
+        f"status={accepted.status} reason={accepted.reason} "
+        f"callbackEnforced={accepted.callback_enforced} authorizesSend={accepted.authorizes_send}"
+    )
+    print(
+        f"   hostReference={accepted.host_reference!r}  (raw recipient present? "
+        f"{'synthetic-recipient' in accepted.host_reference})"
+    )
+
+    # 2) A retry under the SAME key is idempotent — the same host reference comes back.
+    replay = enforcing.request_delivery(req_a)
+    print(
+        f"\n2) retry same key -> sameHostReference={replay.host_reference == accepted.host_reference} "
+        f"({replay.host_reference!r})"
+    )
+
+    # 3) A host that does NOT enforce delivery callbacks -> live delivery DISABLED (not bypassed).
+    non_enforcing = FakeEffortlessPromoDeliveryPort(callback_enforcement=False, now=now)
+    disabled = non_enforcing.request_delivery(
+        DeliveryRequest(idempotency_key="dispatch-096-B", context=_context(biz_b))
+    )
+    print(
+        f"\n3) non-callback host -> accepted={disabled.accepted} status={disabled.status} "
+        f"reason={disabled.reason} hostReference={disabled.host_reference!r} (nothing accepted)"
+    )
+
+    # 4) An unavailable host also fails closed (disabled), never a silent accept.
+    unavailable = FakeEffortlessPromoDeliveryPort(available=False, now=now).request_delivery(
+        DeliveryRequest(idempotency_key="dispatch-096-C", context=_context(biz_a))
+    )
+    print(
+        f"\n4) unavailable host -> accepted={unavailable.accepted} status={unavailable.status} "
+        f"reason={unavailable.reason} (fails closed)"
+    )
+
+    # 5) The port exposes ONLY request_delivery — no direct provider/send path exists.
+    surface = [n for n in dir(FakeEffortlessPromoDeliveryPort) if not n.startswith("_")]
+    forbidden = [
+        n for n in ("send", "send_message", "deliver", "provider", "transmit") if n in surface
+    ]
+    print(f"\n5) port surface (public) = {surface}; forbidden-send-path present = {forbidden}")
+
+    checks = {
+        "callback_enforcing_host_accepts": accepted.accepted is True
+        and accepted.status == DeliveryReceipt.ACCEPTED
+        and accepted.reason == DeliveryDecision.OK,
+        "accept_is_never_a_send": accepted.authorizes_send is False,
+        "request_is_idempotent_in_key": replay.host_reference == accepted.host_reference,
+        "missing_callback_enforcement_disables_delivery": disabled.accepted is False
+        and disabled.status == DeliveryReceipt.DISABLED
+        and disabled.reason == DeliveryDecision.CALLBACK_ENFORCEMENT_UNAVAILABLE,
+        "disabled_host_accepts_nothing": disabled.host_reference == "",
+        "unavailable_host_fails_closed": unavailable.accepted is False
+        and unavailable.reason == DeliveryDecision.HOST_UNAVAILABLE,
+        "no_direct_provider_or_send_path": forbidden == [],
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The DCA can only REQUEST "
+        "delivery through EffortlessPromo — it holds no provider/send path. A host that does not "
+        "ENFORCE terminal-outcome callbacks disables live delivery rather than being bypassed with a "
+        "fire-and-forget request; an unavailable host fails closed the same way. An accepted request "
+        "is NOT recipient consent and NOT a send: the one send pipeline owns and performs the actual "
+        "send, which stays a disabled future capability.)"
+    )
+    return {"accepted": accepted.model_dump(), "disabled": disabled.model_dump(), "checks": checks}
+
+
+@register(
+    "DCA-097",
+    "request cancellation of queued delivery on permission invalidation: in isolated synthetic "
+    "Businesses A/B, seed a host-side queue with one still-QUEUED and one already-PROVIDER_ACCEPTED "
+    "dispatch, then request cancellation through a fake platform host that ACKNOWLEDGES — the queued "
+    "work is CANCELED, the provider-accepted work is LABELED non-recallable (left in place), an unknown "
+    "key is NOT_FOUND, and a replay returns the same acknowledgment. Then request through a host that "
+    "does NOT acknowledge (DISABLED, queue left UNTOUCHED). Prove the port has no recall/send path. "
+    "Local synthetic; no AI/paid action, no network, no send, no recall.",
+)
+def _dca_097(ctx: CheckContext) -> dict:
+    """Drive the cancellation adapter contract + synthetic fake directly (no DB, no network, no send,
+    no recall): an acknowledging host CANCELS still-queued work and LABELS already-provider-accepted
+    work non-recallable (never pretending it was stopped); a host that does not acknowledge DISABLES the
+    request and leaves the queue exactly as it was. The DCA holds no recall/send path at all."""
+    from datetime import UTC, datetime
+
+    from app.delivery import (
+        CancellationDecision,
+        CancellationItemStatus,
+        CancellationReceipt,
+        CancellationRequest,
+        FakeEffortlessPromoCancellationPort,
+        QueuedWorkRef,
+        QueuedWorkState,
+    )
+
+    biz_a = "11111111-1111-1111-1111-11111111a097"
+    biz_b = "22222222-2222-2222-2222-22222222b097"
+    now = datetime.now(UTC)
+
+    def _ref(key: str) -> QueuedWorkRef:
+        # Recipient as a one-way digest only, never the raw address — no message content carried.
+        return QueuedWorkRef(
+            idempotency_key=key,
+            channel="email",
+            recipient_digest=f"sha256-digest-of-{key}",
+            consumption_id=f"consumption-{key}",
+        )
+
+    def _request(*keys: str, business_id: str, cancellation_key: str) -> CancellationRequest:
+        return CancellationRequest(
+            business_id=business_id,
+            cancellation_key=cancellation_key,
+            invalidation_reason="consent_withdrawn",
+            items=tuple(_ref(k) for k in keys),
+        )
+
+    # 1) An ACKNOWLEDGING host over a seeded queue: one still-queued, one already provider-accepted.
+    ack_host = FakeEffortlessPromoCancellationPort(
+        queued={
+            "dispatch-097-queued": QueuedWorkState.QUEUED,
+            "dispatch-097-accepted": QueuedWorkState.PROVIDER_ACCEPTED,
+        },
+        acknowledges=True,
+        now=now,
+    )
+    before = {
+        "dispatch-097-queued": ack_host.queue_state("dispatch-097-queued"),
+        "dispatch-097-accepted": ack_host.queue_state("dispatch-097-accepted"),
+    }
+    cancel = ack_host.request_cancellation(
+        _request(
+            "dispatch-097-queued",
+            "dispatch-097-accepted",
+            "dispatch-097-unknown",
+            business_id=biz_a,
+            cancellation_key="cancel-097-A",
+        )
+    )
+    outcomes = {o.idempotency_key: o for o in cancel.outcomes}
+    print(
+        f"\n1) acknowledging host -> acknowledged={cancel.acknowledged} status={cancel.status} "
+        f"canceled={cancel.canceled_count} nonRecallable={cancel.non_recallable_count} "
+        f"ackRef={cancel.acknowledgment_reference!r}"
+    )
+    for key, o in outcomes.items():
+        print(f"   {key}: status={o.status.value} recallable={o.recallable} note={o.note!r}")
+    print(
+        f"   queue after: queued-item={ack_host.queue_state('dispatch-097-queued')} "
+        f"accepted-item={ack_host.queue_state('dispatch-097-accepted')} "
+        f"(canceled work gone; provider-accepted work left in place, not pretended away)"
+    )
+
+    # 2) A replay under the SAME cancellation key returns the SAME acknowledgment (ack tracking).
+    replay = ack_host.request_cancellation(
+        _request(
+            "dispatch-097-queued",
+            "dispatch-097-accepted",
+            "dispatch-097-unknown",
+            business_id=biz_a,
+            cancellation_key="cancel-097-A",
+        )
+    )
+    print(
+        f"\n2) replay same key -> sameAckRef="
+        f"{replay.acknowledgment_reference == cancel.acknowledgment_reference} "
+        f"queuedStillCanceled="
+        f"{replay.outcomes[0].status is CancellationItemStatus.CANCELED} (not re-read as NOT_FOUND)"
+    )
+
+    # 3) A host that does NOT acknowledge -> DISABLED, and the queue is left UNTOUCHED (no change).
+    noack_host = FakeEffortlessPromoCancellationPort(
+        queued={"dispatch-097-queued": QueuedWorkState.QUEUED}, acknowledges=False, now=now
+    )
+    disabled = noack_host.request_cancellation(
+        _request("dispatch-097-queued", business_id=biz_b, cancellation_key="cancel-097-B")
+    )
+    print(
+        f"\n3) non-acknowledging host -> acknowledged={disabled.acknowledged} "
+        f"status={disabled.status} reason={disabled.reason} outcomes={len(disabled.outcomes)} "
+        f"queueUntouched={noack_host.queue_state('dispatch-097-queued') is QueuedWorkState.QUEUED}"
+    )
+
+    # 4) The port exposes ONLY request_cancellation — no recall/unsend/provider/send path exists.
+    surface = [n for n in dir(FakeEffortlessPromoCancellationPort) if not n.startswith("_")]
+    forbidden = [
+        n
+        for n in ("recall", "unsend", "send", "send_message", "deliver", "provider", "transmit")
+        if n in surface
+    ]
+    print(
+        f"\n4) port surface (public) = {surface}; forbidden-recall/send-path present = {forbidden}"
+    )
+
+    checks = {
+        "queued_work_canceled": outcomes["dispatch-097-queued"].status
+        is CancellationItemStatus.CANCELED
+        and ack_host.queue_state("dispatch-097-queued") is None,
+        "provider_accepted_labeled_non_recallable": outcomes["dispatch-097-accepted"].status
+        is CancellationItemStatus.NON_RECALLABLE
+        and outcomes["dispatch-097-accepted"].recallable is False
+        and ack_host.queue_state("dispatch-097-accepted") is QueuedWorkState.PROVIDER_ACCEPTED,
+        "unknown_key_not_found": outcomes["dispatch-097-unknown"].status
+        is CancellationItemStatus.NOT_FOUND,
+        "acknowledged_and_not_a_send": cancel.acknowledged is True
+        and cancel.authorizes_send is False,
+        "cancellation_is_idempotent_in_key": replay.acknowledgment_reference
+        == cancel.acknowledgment_reference,
+        "missing_acknowledgment_disables_request": disabled.acknowledged is False
+        and disabled.status == CancellationReceipt.DISABLED
+        and disabled.reason == CancellationDecision.ACKNOWLEDGMENT_NOT_GUARANTEED,
+        "disabled_request_changes_nothing": noack_host.queue_state("dispatch-097-queued")
+        is QueuedWorkState.QUEUED,
+        "no_recall_or_send_path": forbidden == [],
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send, no recall. The DCA can only "
+        "REQUEST cancellation of queued delivery through EffortlessPromo — it holds no recall/send "
+        "path. Already-provider-accepted work is LABELED non-recallable, never pretended away; only "
+        "still-queued work is canceled. A host that does not ACKNOWLEDGE cancellations disables the "
+        "request and leaves the queue untouched, rather than treating an unconfirmable cancel as a "
+        "success. A cancellation request is NOT recipient consent and NOT a send authorization.)"
+    )
+    return {
+        "before": {k: (v.value if v else None) for k, v in before.items()},
+        "acknowledged": cancel.model_dump(mode="json"),
+        "disabled": disabled.model_dump(mode="json"),
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-098",
+    "remove revoked advertising audience members: in isolated synthetic Businesses A/B, seed a "
+    "previously-uploaded advertising audience (Google Customer Match) with one PRESENT member and one "
+    "already-REMOVED member, then request removal (permission withdrawn) through a fake platform host "
+    "that ACKNOWLEDGES — the present member is REMOVED, the already-gone / never-uploaded members are "
+    "NOT_PRESENT, nothing is owed, and a replay returns the same acknowledgment. Then simulate a "
+    "temporary platform FAILURE on a present member — it stays PENDING (visible, owed), the member is "
+    "left in the audience, yet the DCA's view is already WITHDRAWN (the prior upload never overrides the "
+    "withdrawal); a retry after recovery completes it. Then a host that is UNAVAILABLE — the whole "
+    "request is PENDING, every member owed, the audience UNTOUCHED (never a silent success). Prove the "
+    "port has no upload/add/send path. Local synthetic; no AI/paid action, no network, no send, no upload.",
+)
+def _dca_098(ctx: CheckContext) -> dict:
+    """Drive the advertising-audience removal contract + synthetic fake directly (no DB, no network, no
+    send, no upload): an acknowledging host REMOVES present members and reports already-gone members
+    NOT_PRESENT; a per-member temporary failure or an unavailable host leaves the removal PENDING
+    (visible, owed) with the audience untouched, never faked as done; and the withdrawal is authoritative
+    — a member whose removal is still pending reads as WITHDRAWN, so the prior upload never overrides it.
+    The DCA holds no upload/add/send path at all."""
+    from datetime import UTC, datetime
+
+    from app.advertising import (
+        AudienceMemberRef,
+        AudienceMemberState,
+        FakeEffortlessPromoAudienceRemovalPort,
+        RemovalDecision,
+        RemovalItemStatus,
+        RemovalReceipt,
+        RemovalRequest,
+    )
+    from app.compliance.customer_match_eligibility import CUSTOMER_MATCH_CHANNEL
+
+    biz_a = "11111111-1111-1111-1111-11111111a098"
+    biz_b = "22222222-2222-2222-2222-22222222b098"
+    now = datetime.now(UTC)
+
+    def _ref(digest: str) -> AudienceMemberRef:
+        # Hashed digest only, never the raw identifier — no PII and no content carried.
+        return AudienceMemberRef(
+            member_digest=digest,
+            key_type="email",
+            source_membership_id=f"membership-{digest}",
+        )
+
+    def _request(*digests: str, business_id: str, removal_key: str) -> RemovalRequest:
+        return RemovalRequest(
+            business_id=business_id,
+            removal_key=removal_key,
+            withdrawal_reason="consent_withdrawn",
+            audience_channel=CUSTOMER_MATCH_CHANNEL,
+            audience_name="synthetic-prospects",
+            members=tuple(_ref(d) for d in digests),
+        )
+
+    # 1) An ACKNOWLEDGING host over a seeded audience: one present, one already removed.
+    ack_host = FakeEffortlessPromoAudienceRemovalPort(
+        audience={
+            "member-098-present": AudienceMemberState.PRESENT,
+            "member-098-gone": AudienceMemberState.REMOVED,
+        },
+        acknowledges=True,
+        now=now,
+    )
+    before = {
+        "member-098-present": ack_host.audience_state("member-098-present"),
+        "member-098-gone": ack_host.audience_state("member-098-gone"),
+    }
+    removal = ack_host.request_removal(
+        _request(
+            "member-098-present",
+            "member-098-gone",
+            "member-098-never",
+            business_id=biz_a,
+            removal_key="remove-098-A",
+        )
+    )
+    outcomes = {o.member_digest: o for o in removal.outcomes}
+    print(
+        f"\n1) acknowledging host -> acknowledged={removal.acknowledged} status={removal.status} "
+        f"removed={removal.removed_count} notPresent={removal.not_present_count} "
+        f"pending={removal.pending_count} ackRef={removal.acknowledgment_reference!r}"
+    )
+    for digest, o in outcomes.items():
+        print(f"   {digest}: status={o.status.value} removed={o.removed} note={o.note!r}")
+    print(
+        f"   audience after: present-member={ack_host.audience_state('member-098-present')} "
+        f"(actually removed); withdrawalUpheld={removal.withdrawal_upheld}"
+    )
+
+    # 2) A replay under the SAME removal key returns the SAME acknowledgment (idempotent, ledgered).
+    replay = ack_host.request_removal(
+        _request(
+            "member-098-present",
+            "member-098-gone",
+            "member-098-never",
+            business_id=biz_a,
+            removal_key="remove-098-A",
+        )
+    )
+    print(
+        f"\n2) replay same key -> sameAckRef="
+        f"{replay.acknowledgment_reference == removal.acknowledgment_reference} "
+        f"stillRemoved={replay.outcomes[0].status is RemovalItemStatus.REMOVED} (not re-read NOT_PRESENT)"
+    )
+
+    # 3) A per-member TEMPORARY FAILURE -> PENDING (visible, owed); the prior upload does NOT override the
+    #    withdrawal; a retry after recovery completes it.
+    flaky_host = FakeEffortlessPromoAudienceRemovalPort(
+        audience={"member-098-flaky": AudienceMemberState.PRESENT},
+        transient_failures={"member-098-flaky"},
+        now=now,
+    )
+    pending = flaky_host.request_removal(
+        _request("member-098-flaky", business_id=biz_b, removal_key="remove-098-B")
+    )
+    # Snapshot the owed/audience state BEFORE recovery mutates it, for the post-run checks.
+    pending_owed = "member-098-flaky" in flaky_host.owed_removals
+    pending_untouched = flaky_host.audience_state("member-098-flaky") is AudienceMemberState.PRESENT
+    pending_view = flaky_host.membership("member-098-flaky")
+    print(
+        f"\n3) temporary platform failure -> status={pending.status} pending={pending.pending_count} "
+        f"owed={sorted(flaky_host.owed_removals)} "
+        f"audienceUntouched={flaky_host.audience_state('member-098-flaky') is AudienceMemberState.PRESENT} "
+        f"dcaView={flaky_host.membership('member-098-flaky')!r} (prior upload does NOT override withdrawal)"
+    )
+    flaky_host.recover("member-098-flaky")
+    retried = flaky_host.request_removal(
+        _request("member-098-flaky", business_id=biz_b, removal_key="remove-098-B")
+    )
+    print(
+        f"   retry after recovery -> status={retried.status} "
+        f"removed={retried.outcomes[0].status is RemovalItemStatus.REMOVED} "
+        f"owed={sorted(flaky_host.owed_removals)}"
+    )
+
+    # 4) An UNAVAILABLE host -> whole request PENDING, every member owed, audience UNTOUCHED.
+    down_host = FakeEffortlessPromoAudienceRemovalPort(
+        audience={"member-098-down": AudienceMemberState.PRESENT}, available=False, now=now
+    )
+    unavailable = down_host.request_removal(
+        _request("member-098-down", business_id=biz_b, removal_key="remove-098-C")
+    )
+    print(
+        f"\n4) unavailable host -> acknowledged={unavailable.acknowledged} status={unavailable.status} "
+        f"reason={unavailable.reason} pending={unavailable.pending_count} "
+        f"audienceUntouched={down_host.audience_state('member-098-down') is AudienceMemberState.PRESENT} "
+        f"dcaView={down_host.membership('member-098-down')!r}"
+    )
+
+    # 5) The port exposes ONLY request_removal — no upload/add/sync/provider/send path exists.
+    surface = [n for n in dir(FakeEffortlessPromoAudienceRemovalPort) if not n.startswith("_")]
+    forbidden = [
+        n
+        for n in (
+            "upload",
+            "add",
+            "add_member",
+            "sync",
+            "send",
+            "send_message",
+            "provider",
+            "transmit",
+        )
+        if n in surface
+    ]
+    print(
+        f"\n5) port surface (public) = {surface}; forbidden-upload/send-path present = {forbidden}"
+    )
+
+    checks = {
+        "present_member_removed": outcomes["member-098-present"].status is RemovalItemStatus.REMOVED
+        and ack_host.audience_state("member-098-present") is AudienceMemberState.REMOVED,
+        "absent_member_not_present": outcomes["member-098-gone"].status
+        is RemovalItemStatus.NOT_PRESENT
+        and outcomes["member-098-never"].status is RemovalItemStatus.NOT_PRESENT,
+        "completed_and_not_a_send": removal.status == RemovalReceipt.COMPLETED
+        and removal.acknowledged is True
+        and removal.authorizes_send is False,
+        "completed_removal_is_idempotent_in_key": replay.acknowledgment_reference
+        == removal.acknowledgment_reference,
+        "temporary_failure_stays_pending_and_visible": pending.status == RemovalReceipt.PENDING
+        and pending.pending_count == 1
+        and pending_owed
+        and pending_untouched,
+        "prior_upload_does_not_override_withdrawal": pending.withdrawal_upheld is True
+        and pending_view == "withdrawn",
+        "pending_request_not_ledgered_so_retry_succeeds": retried.status == RemovalReceipt.COMPLETED
+        and retried.outcomes[0].status is RemovalItemStatus.REMOVED,
+        "unavailable_host_pending_and_audience_untouched": unavailable.status
+        == RemovalReceipt.PENDING
+        and unavailable.acknowledged is False
+        and unavailable.reason == RemovalDecision.HOST_UNAVAILABLE
+        and down_host.audience_state("member-098-down") is AudienceMemberState.PRESENT,
+        "no_upload_or_send_path": forbidden == [],
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send, no upload. The DCA can only "
+        "REQUEST removal of a revoked, previously-uploaded advertising-audience member through "
+        "EffortlessPromo — it holds no upload/add/send path. A removal that cannot be confirmed (a "
+        "temporary platform failure, or an unavailable/non-acknowledging host) stays PENDING and VISIBLE, "
+        "owed for retry, and the audience is left untouched — never faked as done. The withdrawal is "
+        "authoritative: a member whose removal is still pending reads as WITHDRAWN, so the prior upload "
+        "never overrides the current withdrawal. A removal request is NOT recipient consent and NOT a "
+        "send/upload authorization.)"
+    )
+    return {
+        "before": {k: (v.value if v else None) for k, v in before.items()},
+        "completed": removal.model_dump(mode="json"),
+        "pending_temporary_failure": pending.model_dump(mode="json"),
+        "unavailable": unavailable.model_dump(mode="json"),
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-099",
+    "persist durable job requests: in isolated synthetic Businesses A/B, enqueue the SAME logical work "
+    "twice (same type + idempotency key + payload) — it collapses to ONE queued job with a pointer + "
+    "digest and NO raw payload; the same key in B is a SEPARATE job; a reused key for DIFFERENT work is "
+    "a conflict that writes nothing; and raw contact data in the reference/metadata is refused. Jobs are "
+    "persisted QUEUED only — nothing is executed. Local synthetic; no AI/paid action, no network, no send.",
+)
+def _dca_099(ctx: CheckContext) -> dict:
+    """Drive the durable job-request store directly against the ephemeral synthetic DB: enqueue the same
+    logical work twice (one job), the same key in another business (a separate job), a reused key for
+    different work (a conflict that changes nothing), and raw PII in the payload reference (refused). Show
+    the real rows — count, scope and the stored opaque payload references — never a bare PASS."""
+    from datetime import UTC, datetime
+
+    from sqlalchemy import func, select
+
+    from app.db.models import DurableJobRequest, JobRequestStatus
+    from app.jobs.store import (
+        JobEnqueueRequest,
+        JobRequestConflict,
+        JobRequestStore,
+        PayloadContainsPiiError,
+    )
+
+    biz_a = "11111111-1111-1111-1111-11111111a099"
+    biz_b = "22222222-2222-2222-2222-22222222b099"
+    now = datetime.now(UTC)
+
+    def _req(**overrides) -> JobEnqueueRequest:
+        base: dict = {
+            "job_type": "prospect.research",
+            "idempotency_key": "job-key-A",
+            "payload_ref": "dca-payload://synthetic/run-1",
+            "schema_version": 1,
+            "payload_metadata": {"priority": "normal"},
+        }
+        base.update(overrides)
+        return JobEnqueueRequest(**base)
+
+    def _count(business_id: str) -> int:
+        with ctx.session_factory() as session:
+            return session.scalar(
+                select(func.count())
+                .select_from(DurableJobRequest)
+                .where(DurableJobRequest.business_id == business_id)
+            )
+
+    # 1) Enqueue the SAME logical work twice in A -> exactly ONE queued job.
+    with ctx.session_factory() as session:
+        first, created_first = JobRequestStore(session, biz_a).enqueue(_req(), now=now)
+        session.commit()
+        first_id, first_ref, first_digest = first.id, first.payload_ref, first.payload_digest
+    with ctx.session_factory() as session:
+        second, created_second = JobRequestStore(session, biz_a).enqueue(_req(), now=now)
+        session.commit()
+        second_id = second.id
+    print(
+        f"\n1) enqueue same work twice (A) -> createdFirst={created_first} createdSecond={created_second} "
+        f"sameJob={first_id == second_id} count(A)={_count(biz_a)}"
+    )
+    print(
+        f"   stored job: status={JobRequestStatus(first.status).value} payloadRef={first_ref!r} "
+        f"digest={first_digest[:12]}… (pointer + one-way digest only; no raw payload on the row)"
+    )
+
+    # 2) The SAME key in business B is a SEPARATE job (tenant isolation).
+    with ctx.session_factory() as session:
+        b_job, _ = JobRequestStore(session, biz_b).enqueue(_req(), now=now)
+        session.commit()
+        b_job_id = b_job.id
+        # B's lookup of the shared key resolves to B's OWN job, never A's (business-scoped).
+        b_found = JobRequestStore(session, biz_b).find("prospect.research", "job-key-A")
+        b_sees_only_own = b_found is not None and b_found.id == b_job_id and b_found.id != first_id
+    print(
+        f"\n2) same key in B -> separate job id={b_job_id != first_id} count(B)={_count(biz_b)}; "
+        f"B's lookup resolves to B's OWN job, not A's: {b_sees_only_own}"
+    )
+
+    # 3) A reused key for DIFFERENT work is a conflict that writes nothing.
+    count_before = _count(biz_a)
+    conflict_raised = False
+    with ctx.session_factory() as session:
+        try:
+            JobRequestStore(session, biz_a).enqueue(
+                _req(payload_ref="dca-payload://synthetic/run-2"), now=now
+            )
+        except JobRequestConflict:
+            conflict_raised = True
+            session.rollback()
+    print(
+        f"\n3) reused key, different payload (A) -> conflict={conflict_raised} "
+        f"countUnchanged={_count(biz_a) == count_before} (denial left no state change)"
+    )
+
+    # 4) Raw contact data in the reference is refused before any write.
+    pii_refused = False
+    with ctx.session_factory() as session:
+        try:
+            JobRequestStore(session, biz_a).enqueue(
+                _req(idempotency_key="job-key-pii", payload_ref="mailto:person@synthetic.example"),
+                now=now,
+            )
+        except PayloadContainsPiiError:
+            pii_refused = True
+            session.rollback()
+    print(
+        f"\n4) raw email in payload_ref -> refused={pii_refused} "
+        f"countUnchanged={_count(biz_a) == count_before} (no raw PII enters the durable queue)"
+    )
+
+    # Show the actual rows (scope + opaque references), proving no raw payload/PII is stored.
+    with ctx.session_factory() as session:
+        rows = session.scalars(select(DurableJobRequest)).all()
+        print("\npersisted job rows:")
+        for r in rows:
+            print(
+                f"  - business={r.business_id[-4:]} type={r.job_type} key={r.idempotency_key} "
+                f"status={r.status} ref={r.payload_ref!r} attempts={r.attempt_count}/{r.max_attempts}"
+            )
+
+    checks = {
+        "same_work_dedups_to_one_job": created_first
+        and not created_second
+        and first_id == second_id,
+        "job_is_queued_not_executed": JobRequestStatus(first.status) is JobRequestStatus.QUEUED,
+        "no_raw_payload_on_row": first_ref.startswith("dca-payload://") and len(first_digest) == 64,
+        "same_key_other_business_is_separate_job": b_job_id != first_id
+        and _count(biz_b) == 1
+        and b_sees_only_own,
+        "reused_key_different_work_conflicts_no_change": conflict_raised
+        and _count(biz_a) == count_before,
+        "raw_pii_refused_no_change": pii_refused and _count(biz_a) == count_before,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-099 persists durable job "
+        "REQUESTS and deduplicates them by logical intent; it does NOT execute jobs — rows are QUEUED "
+        "only and the queue never stores raw payloads or PII. Enqueuing work is not recipient consent and "
+        "grants no send authority.)"
+    )
+    return {
+        "count_a": _count(biz_a),
+        "count_b": _count(biz_b),
+        "same_job_on_retry": first_id == second_id,
+        "conflict_raised": conflict_raised,
+        "pii_refused": pii_refused,
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-100",
+    "register typed Python job handlers: build the registry, register a test handler with TWO payload "
+    "versions, list all discoverable handlers, then drive the gate — a supported type+version with a valid "
+    "payload prepares a typed runnable WITHOUT executing anything; an unknown job type and an unknown "
+    "version of a known type both fail safely (distinct errors, nothing returned); and an invalid payload "
+    "is rejected with a PII-safe field list and never produces a runnable. Pure in-memory; no DB write, no "
+    "AI/paid action, no network, no send, and no job is ever executed (execution stays a disabled future "
+    "capability).",
+)
+def _dca_100(ctx: CheckContext) -> dict:
+    """Drive the typed job-handler registry directly: register a two-version test handler, show the
+    discoverable bindings, then reproduce the supported result (a validated, typed, UN-executed job) and
+    the three denials (unknown type, unknown version, invalid payload). Show the real registry state and
+    the PII-safe validation issues — never a bare PASS."""
+    from typing import ClassVar, cast
+
+    from pydantic import BaseModel, ConfigDict, Field
+
+    from app.jobs.handlers import (
+        JobHandler,
+        JobHandlerRegistry,
+        JobPayloadValidationError,
+        UnknownJobTypeError,
+        UnsupportedSchemaVersionError,
+        ValidatedJob,
+    )
+
+    class ResearchPayloadV1(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        subject_ref: str = Field(min_length=1)  # a pointer, never raw contact data
+        max_fields: int = Field(ge=1, le=50)
+
+    class ResearchPayloadV2(BaseModel):
+        model_config = ConfigDict(frozen=True, extra="forbid")
+
+        subject_ref: str = Field(min_length=1)
+        max_fields: int = Field(ge=1, le=50)
+        region: str = Field(min_length=2, max_length=2)  # a new required field in v2
+
+    class ResearchHandlerV1(JobHandler):
+        job_type = "prospect.research"
+        schema_version = 1
+        payload_model: ClassVar[type[BaseModel]] = ResearchPayloadV1
+
+        def __init__(self) -> None:
+            self.ran = 0
+
+        def run(self, payload: BaseModel) -> None:  # the registry must NEVER call this
+            self.ran += 1
+
+    class ResearchHandlerV2(JobHandler):
+        job_type = "prospect.research"
+        schema_version = 2
+        payload_model: ClassVar[type[BaseModel]] = ResearchPayloadV2
+
+        def __init__(self) -> None:
+            self.ran = 0
+
+        def run(self, payload: BaseModel) -> None:  # the registry must NEVER call this
+            self.ran += 1
+
+    registry = JobHandlerRegistry()
+    v1 = ResearchHandlerV1()
+    v2 = ResearchHandlerV2()
+    registry.register(v1)
+    registry.register(v2)
+
+    print("\nregistered handlers (all discoverable):")
+    for d in registry.descriptors():
+        print(
+            f"  - jobType={d.job_type} schemaVersion={d.schema_version} "
+            f"handler={d.handler} payloadModel={d.payload_model}"
+        )
+
+    # 1) Supported type + version + valid payload -> a typed, validated runnable; NOTHING is executed.
+    job = registry.prepare("prospect.research", 1, {"subject_ref": "ref://org/42", "max_fields": 5})
+    prepared_payload = cast(ResearchPayloadV1, job.payload)
+    valid_prepared = (
+        isinstance(job, ValidatedJob) and prepared_payload.subject_ref == "ref://org/42"
+    )
+    print(
+        f"\n1) supported (prospect.research v1) + valid payload -> prepared typed job "
+        f"payloadModel={type(job.payload).__name__} subjectRef={prepared_payload.subject_ref!r}; "
+        f"handler executed? ran={v1.ran} (resolve+validate only — execution is disabled)"
+    )
+
+    # 2) Unknown job type -> fails safely, returns nothing.
+    unknown_type = False
+    try:
+        registry.prepare("prospect.unregistered", 1, {"subject_ref": "ref://x", "max_fields": 1})
+    except UnknownJobTypeError as exc:
+        unknown_type = True
+        print(f"\n2) unknown job type -> refused: {exc}")
+
+    # 3) Known type, unknown version -> a DISTINCT failure (not 'unknown type'), returns nothing.
+    unknown_version = False
+    try:
+        registry.prepare("prospect.research", 99, {"subject_ref": "ref://x", "max_fields": 1})
+    except UnsupportedSchemaVersionError as exc:
+        unknown_version = True
+        print(f"\n3) known type, unknown version -> refused: {exc}")
+
+    # 4) Invalid payload -> rejected before execution, with a PII-safe field list (no submitted values).
+    invalid_payload = False
+    pii_safe = True
+    try:
+        registry.prepare(
+            "prospect.research",
+            1,
+            {"subject_ref": "secret://do-not-echo", "max_fields": 999, "surprise": "boom"},
+        )
+    except JobPayloadValidationError as exc:
+        invalid_payload = True
+        pii_safe = "secret://do-not-echo" not in str(exc)
+        issues = ", ".join(f"{e.loc}:{e.issue}" for e in exc.errors)
+        print(f"\n4) invalid payload -> refused (PII-safe) issues=[{issues}]")
+
+    checks = {
+        "all_handlers_discoverable": {
+            (d.job_type, d.schema_version) for d in registry.descriptors()
+        }
+        == {("prospect.research", 1), ("prospect.research", 2)},
+        "valid_payload_prepares_typed_job": valid_prepared,
+        "handler_never_executed": v1.ran == 0,
+        "unknown_job_type_fails_safely": unknown_type,
+        "unknown_version_is_distinct_failure": unknown_version,
+        "invalid_payload_rejected_before_execution": invalid_payload,
+        "validation_error_is_pii_safe": pii_safe,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; pure in-memory registry — no DB write, no AI/paid action, no network, no "
+        "send. DCA-100 REGISTERS typed handlers and VALIDATES payloads before execution; unknown job types "
+        "fail safely and no job is ever executed — execution stays a disabled future capability.)"
+    )
+    return {
+        "discoverable": [(d.job_type, d.schema_version) for d in registry.descriptors()],
+        "handler_runs": v1.ran,
+        "unknown_type_refused": unknown_type,
+        "unknown_version_refused": unknown_version,
+        "invalid_payload_refused": invalid_payload,
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-101",
+    "claim jobs safely across workers: in an isolated synthetic Business A, enqueue two queued jobs, "
+    "then drive the claim path — worker-1 CLAIMS a job in a short transaction (it flips to RUNNING with "
+    "a lease + fencing token and an attempt, but is NOT executed); a second worker cannot take the same "
+    "live claim; worker-2 independently claims the OTHER job (SKIP LOCKED never blocks); once worker-1's "
+    "lease lapses worker-2 RECLAIMS its job and the fencing token advances; and worker-1's now-stale token "
+    "cannot release the reclaimed job (the relevant denial — nothing changes). Local synthetic; no AI/paid "
+    "action, no network, no send, and no job is ever executed (execution stays a disabled future "
+    "capability). Cross-worker row-lock isolation is proven on disposable PostgreSQL in the focused tests.",
+)
+def _dca_101(ctx: CheckContext) -> dict:
+    """Drive the claim store directly against the ephemeral synthetic DB: claim a queued job (leased, not
+    run), show a live lease blocks a second claim, claim a second job independently, reclaim the first
+    after its lease lapses (fencing token bumps), and prove a stale fencing token cannot release the
+    reclaimed job. Show the real rows — status, owner, lease version — never a bare PASS.
+
+    Note: a SQLite ephemeral DB cannot exercise ``FOR UPDATE SKIP LOCKED`` concurrency; this scenario
+    drives the lease/fencing LOGIC serially. The true two-worker row-lock safety runs on a disposable
+    PostgreSQL in ``tests/test_job_claim.py`` (``DCA_TEST_DATABASE_URL``)."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import DurableJobRequest
+    from app.jobs.claim import JobClaimStore
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+
+    biz_a = "11111111-1111-1111-1111-11111111a101"
+    now = datetime.now(UTC)
+
+    def _enqueue(key: str) -> str:
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, biz_a).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                ),
+                now=now,
+            )
+            session.commit()
+            return row.id
+
+    job1 = _enqueue("job-A")
+    job2 = _enqueue("job-B")
+    print(f"\nenqueued two queued jobs: {job1[:8]}…, {job2[:8]}…")
+
+    # 1) worker-1 claims a job in a short transaction -> RUNNING + lease + fence token; NOT executed.
+    with ctx.session_factory() as session:
+        c1 = JobClaimStore(session, biz_a).claim_next("worker-1", now=now, lease_seconds=60)
+    print(
+        f"\n1) worker-1 claim -> job={c1.job_id[:8]}… fence={c1.fence_token} attempts={c1.attempt_count} "
+        f"(leased RUNNING, handler NOT run — execution is a disabled future capability)"
+    )
+
+    # 2) A second worker cannot take worker-1's live claim; it claims the OTHER job instead.
+    with ctx.session_factory() as session:
+        c2 = JobClaimStore(session, biz_a).claim_next(
+            "worker-2", now=now + timedelta(seconds=1), lease_seconds=60
+        )
+    second_is_other_job = c2 is not None and c2.job_id != c1.job_id
+    print(
+        f"\n2) worker-2 claim -> job={c2.job_id[:8]}… fence={c2.fence_token}; "
+        f"it is the OTHER job (never worker-1's live claim): {second_is_other_job}"
+    )
+
+    # 3) Once worker-1's lease lapses, worker-2 RECLAIMS worker-1's job; the fencing token advances.
+    later = now + timedelta(seconds=120)
+    with ctx.session_factory() as session:
+        c3 = JobClaimStore(session, biz_a).claim_next("worker-2", now=later, lease_seconds=60)
+    reclaimed = c3 is not None and c3.job_id == c1.job_id and c3.fence_token > c1.fence_token
+    print(
+        f"\n3) after worker-1's lease lapses -> worker-2 reclaims job={c3.job_id[:8]}… "
+        f"fence {c1.fence_token}→{c3.fence_token} attempts={c3.attempt_count} (reclaimed={reclaimed})"
+    )
+
+    # 4) worker-1's now-stale fencing token cannot release the reclaimed job -> refused, no change.
+    with ctx.session_factory() as session:
+        store = JobClaimStore(session, biz_a)
+        w1_still_current = store.holds_current_lease(c1.job_id, "worker-1", c1.fence_token)
+        stale_release_denied = (
+            store.release(c1.job_id, "worker-1", c1.fence_token, now=later) is False
+        )
+    print(
+        f"\n4) worker-1 stale fence -> holdsCurrentLease={w1_still_current} "
+        f"staleReleaseDenied={stale_release_denied} (fencing stops a lapsed worker stomping the job)"
+    )
+
+    # Show the actual rows (status, owner, lease version) — never a bare PASS.
+    with ctx.session_factory() as session:
+        rows = session.scalars(
+            select(DurableJobRequest).order_by(DurableJobRequest.idempotency_key)
+        ).all()
+        print("\njob rows after the scenario:")
+        for r in rows:
+            print(
+                f"  - key={r.idempotency_key} status={r.status} owner={r.lease_owner} "
+                f"leaseVersion={r.lease_version} attempts={r.attempt_count}/{r.max_attempts}"
+            )
+
+    checks = {
+        "claim_leases_without_executing": c1 is not None
+        and c1.fence_token == 1
+        and c1.attempt_count == 1,
+        "live_lease_blocks_same_claim_second_worker_gets_other": second_is_other_job,
+        "expired_lease_is_reclaimed_and_fence_advances": reclaimed,
+        "stale_fence_cannot_release_no_change": stale_release_denied and not w1_still_current,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-101 CLAIMS durable jobs "
+        "safely across workers using a short PostgreSQL transaction (FOR UPDATE SKIP LOCKED) with a "
+        "lease + monotonic fencing token, releasing the row lock before any handler I/O; it LEASES work "
+        "but EXECUTES nothing — execution stays a disabled future capability. Claiming a job grants no "
+        "send authority and is not recipient consent.)"
+    )
+    return {
+        "job1": job1,
+        "job2": job2,
+        "worker1_fence": c1.fence_token,
+        "reclaim_fence": c3.fence_token if c3 else None,
+        "stale_release_denied": stale_release_denied,
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-102",
+    "renew a running job lease: in an isolated synthetic Business A, worker-1 CLAIMS a job (leased "
+    "RUNNING with a lease + fencing token, NOT executed), then HEARTBEATS it — a live lease is extended "
+    "WITHOUT bumping the fencing token (the same claim continues). Then drive every bounded-extension "
+    "denial, each of which changes NOTHING: a renewal is refused once the lease has LAPSED (an expired "
+    "worker must let the job be reclaimed, not self-renew); a REPLACED worker whose job was reclaimed "
+    "cannot renew with its stale old fence; and a heartbeat can never push the lease past the row's "
+    "absolute lease_deadline (a stuck/looping worker cannot renew forever). Local synthetic; no AI/paid "
+    "action, no network, no send, and no job is ever executed (execution stays a disabled future "
+    "capability). The durable-row behaviour across short transactions is proven on disposable PostgreSQL "
+    "in the focused tests.",
+)
+def _dca_102(ctx: CheckContext) -> dict:
+    """Drive the renewal path directly against the ephemeral synthetic DB: claim a job (leased, not run),
+    heartbeat its LIVE lease (extended, same fencing token), then show each bounded-extension denial —
+    expired-cannot-renew, replaced-worker-stale-fence, and the absolute-deadline ceiling — each leaving
+    the row unchanged. Show the real rows (status, owner, lease version, expiry) — never a bare PASS.
+
+    Note: a SQLite ephemeral DB cannot exercise ``FOR UPDATE SKIP LOCKED`` concurrency; this scenario
+    drives the lease/renewal LOGIC serially. The durable-row renewal contract runs on a disposable
+    PostgreSQL in ``tests/test_job_lease_renewal.py`` (``DCA_TEST_DATABASE_URL``)."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import DurableJobRequest
+    from app.jobs.claim import (
+        MAX_LEASE_LIFETIME_SECONDS,
+        MAX_LEASE_SECONDS,
+        JobClaimStore,
+    )
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+
+    biz_a = "11111111-1111-1111-1111-11111111a102"
+    now = datetime.now(UTC)
+
+    def _enqueue(key: str) -> str:
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, biz_a).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                ),
+                now=now,
+            )
+            session.commit()
+            return row.id
+
+    def _expiry(job_id: str) -> datetime | None:
+        with ctx.session_factory() as session:
+            row = session.get(DurableJobRequest, job_id)
+            return row.lease_expires_at if row else None
+
+    def _naive(value: datetime | None) -> datetime | None:
+        # SQLite reads datetimes back naive; compare tz-naively.
+        return value.replace(tzinfo=None) if value is not None else None
+
+    live = _enqueue("job-live")
+
+    # 1) worker-1 claims a job -> RUNNING + lease + fence token; NOT executed.
+    with ctx.session_factory() as session:
+        c1 = JobClaimStore(session, biz_a).claim_next("worker-1", now=now, lease_seconds=60)
+    assert c1 is not None and c1.lease_expires_at is not None and c1.lease_deadline is not None
+    # c1's lease datetimes are the aware values the claim computed from ``now`` (not DB-roundtripped).
+    print(
+        f"\n1) worker-1 claim -> job={c1.job_id[:8]}… fence={c1.fence_token} "
+        f"leaseExpiry=+{int((c1.lease_expires_at - now).total_seconds())}s "
+        f"deadline=+{int((c1.lease_deadline - now).total_seconds())}s "
+        f"(leased RUNNING, handler NOT run — execution is a disabled future capability)"
+    )
+
+    # 2) worker-1 HEARTBEATS a LIVE lease -> extended, SAME fencing token (the same claim continues).
+    with ctx.session_factory() as session:
+        r = JobClaimStore(session, biz_a).renew(
+            c1.job_id, "worker-1", c1.fence_token, now=now + timedelta(seconds=30), lease_seconds=60
+        )
+    assert r is not None
+    renew_extends_same_fence = r.fence_token == c1.fence_token and _naive(
+        r.lease_expires_at
+    ) == _naive(now + timedelta(seconds=90))
+    print(
+        f"\n2) worker-1 heartbeat (live) -> fence={r.fence_token} (unchanged) "
+        f"leaseExpiry +60s→+90s renewExtendsSameClaim={renew_extends_same_fence}"
+    )
+
+    # 3) EXPIRED worker: once the lease has lapsed, a self-renew is refused (job must be reclaimable).
+    expired_at = now + timedelta(seconds=200)  # past the +90s expiry from step 2
+    before = _expiry(c1.job_id)
+    with ctx.session_factory() as session:
+        refused_expired = (
+            JobClaimStore(session, biz_a).renew(
+                c1.job_id, "worker-1", c1.fence_token, now=expired_at, lease_seconds=60
+            )
+            is None
+        )
+    expired_no_change = refused_expired and _naive(_expiry(c1.job_id)) == _naive(before)
+    print(
+        f"\n3) worker-1 heartbeat AFTER lease lapsed -> refused={refused_expired} "
+        f"rowUnchanged={expired_no_change} (an expired worker may not self-renew)"
+    )
+
+    # 4) REPLACED worker: worker-2 reclaims the now-lapsed job (fence bumps); worker-1's old fence is
+    #    stale. Driven on the SAME job-live row (the only job in play), so the reclaim is unambiguous.
+    later = now + timedelta(seconds=200)  # past job-live's +90s expiry -> reclaimable
+    with ctx.session_factory() as session:
+        c2 = JobClaimStore(session, biz_a).claim_next("worker-2", now=later, lease_seconds=60)
+    assert c2 is not None
+    reclaimed = c2.job_id == c1.job_id and c2.fence_token > c1.fence_token
+    with ctx.session_factory() as session:
+        refused_replaced = (
+            JobClaimStore(session, biz_a).renew(
+                c1.job_id, "worker-1", c1.fence_token, now=later + timedelta(seconds=1)
+            )
+            is None
+        )
+    print(
+        f"\n4) worker-2 reclaims job={c2.job_id[:8]}… fence {c1.fence_token}→{c2.fence_token} "
+        f"(reclaimed={reclaimed}); worker-1 stale-fence renew -> refused={refused_replaced}"
+    )
+
+    # 5) ABSOLUTE DEADLINE: heartbeat a fresh claim up to the ceiling; it clamps, then is refused.
+    ceil_job = _enqueue("job-ceiling")
+    with ctx.session_factory() as session:
+        cc = JobClaimStore(session, biz_a).claim_next(
+            "worker-1", now=now, lease_seconds=MAX_LEASE_SECONDS
+        )
+    assert cc is not None
+    deadline = now + timedelta(seconds=MAX_LEASE_LIFETIME_SECONDS)
+    # March in-window heartbeats up toward the ceiling (step < lease window so the lease stays live).
+    step = timedelta(seconds=MAX_LEASE_SECONDS - 60)
+    t = now + step
+    while t < deadline:
+        with ctx.session_factory() as session:
+            JobClaimStore(session, biz_a).renew(
+                cc.job_id, "worker-1", cc.fence_token, now=t, lease_seconds=MAX_LEASE_SECONDS
+            )
+        t += step
+    with ctx.session_factory() as session:
+        clamped = JobClaimStore(session, biz_a).renew(
+            cc.job_id,
+            "worker-1",
+            cc.fence_token,
+            now=deadline - timedelta(seconds=30),
+            lease_seconds=MAX_LEASE_SECONDS,
+        )
+    clamped_to_deadline = clamped is not None and _naive(clamped.lease_expires_at) == _naive(
+        deadline
+    )
+    with ctx.session_factory() as session:
+        refused_ceiling = (
+            JobClaimStore(session, biz_a).renew(
+                cc.job_id, "worker-1", cc.fence_token, now=deadline, lease_seconds=60
+            )
+            is None
+        )
+    print(
+        f"\n5) heartbeat near ceiling -> clampedToDeadline={clamped_to_deadline}; "
+        f"at the deadline -> refused={refused_ceiling} (no forever-renewal)"
+    )
+
+    # Show the actual rows (status, owner, lease version, expiry) — never a bare PASS.
+    with ctx.session_factory() as session:
+        rows = session.scalars(
+            select(DurableJobRequest).order_by(DurableJobRequest.idempotency_key)
+        ).all()
+        print("\njob rows after the scenario:")
+        for row in rows:
+            print(
+                f"  - key={row.idempotency_key} status={row.status} owner={row.lease_owner} "
+                f"leaseVersion={row.lease_version} attempts={row.attempt_count}/{row.max_attempts}"
+            )
+
+    checks = {
+        "live_lease_renews_without_bumping_fence": renew_extends_same_fence,
+        "expired_worker_cannot_renew_no_change": expired_no_change,
+        "replaced_worker_stale_fence_cannot_renew": reclaimed and refused_replaced,
+        "renewal_clamps_then_stops_at_absolute_deadline": clamped_to_deadline and refused_ceiling,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-102 RENEWS a running job "
+        "lease via a bounded heartbeat fenced on the current (worker, lease_version): a LIVE lease is "
+        "extended without bumping the fencing token, while an expired/replaced/over-running worker is "
+        "refused and nothing changes. Renewing keeps a claim alive but EXECUTES nothing — execution "
+        "stays a disabled future capability, and a claim grants no send authority and is not consent.)"
+    )
+    return {
+        "live_job": live,
+        "ceiling_job": ceil_job,
+        "worker1_fence": c1.fence_token,
+        "reclaim_fence": c2.fence_token if c2 else None,
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-103",
+    "commit a fenced job result: in an isolated synthetic Business A, worker-1 CLAIMS a job and COMMITS a "
+    "result — the running row flips to SUCCEEDED, the lease is cleared and an OPAQUE result pointer+digest "
+    "is recorded (the handler is NOT run). Then drive the two acceptance denials, each of which changes "
+    "NOTHING: a REPLACED worker whose job was reclaimed by worker-2 cannot commit with its stale old fence; "
+    "and a worker whose SOURCE RIGHTS changed (a platform operator revoked the authorization revision it "
+    "relied on) cannot commit even while its lease is still live. Local synthetic; no AI/paid action, no "
+    "network, no send, and no job is ever executed (execution stays a disabled future capability). The "
+    "commit-vs-reclaim race across short transactions is proven on disposable PostgreSQL in the focused "
+    "tests.",
+)
+def _dca_103(ctx: CheckContext) -> dict:
+    """Drive the fenced-completion path directly against the ephemeral synthetic DB: a happy commit (a
+    fenced result, handler NOT run), a REPLACED-worker stale-fence denial after a reclaim, and a
+    SOURCE-RIGHTS-CHANGED denial after an operator revokes the relied-upon authorization revision. Each
+    denial leaves the row unchanged. Show the real rows (status, owner, result, completed_at) — never a
+    bare PASS.
+
+    Note: a SQLite ephemeral DB cannot exercise ``FOR UPDATE`` / concurrency; this scenario drives the
+    completion LOGIC serially. The commit-vs-reclaim race across short transactions runs on a disposable
+    PostgreSQL in ``tests/test_job_completion.py`` (``DCA_TEST_DATABASE_URL``)."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import DurableJobRequest
+    from app.jobs.claim import JobClaimStore
+    from app.jobs.complete import (
+        JobCompletionOutcome,
+        JobCompletionStore,
+        SourceAuthorizationRef,
+    )
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_revocation import RevokerPrincipal, SourceRevocationStore
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-11111111a103"
+    source_key = "mca_master_data"
+    now = datetime.now(UTC)
+    result_ref = "dca-result://synthetic/observation-batch-1"
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    revoker = RevokerPrincipal(subject="op-001", roles=("platform_operator",))
+
+    def _enqueue(key: str) -> str:
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, biz_a).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                ),
+                now=now,
+            )
+            session.commit()
+            return row.id
+
+    def _claim(worker: str, *, at: datetime, lease_seconds: int = 60):
+        with ctx.session_factory() as session:
+            return JobClaimStore(session, biz_a).claim_next(
+                worker, now=at, lease_seconds=lease_seconds
+            )
+
+    def _complete(job_id: str, worker: str, fence: int, *, at: datetime, **kwargs):
+        with ctx.session_factory() as session:
+            return JobCompletionStore(session, biz_a).complete(
+                job_id, worker, fence, now=at, **kwargs
+            )
+
+    def _show(job_id: str) -> str:
+        with ctx.session_factory() as session:
+            row = session.get(DurableJobRequest, job_id)
+            return (
+                f"status={row.status} owner={row.lease_owner} leaseVersion={row.lease_version} "
+                f"resultRef={row.result_ref} completedAt={'set' if row.completed_at else None}"
+            )
+
+    # Seed an in-force source-rights approval (platform operator) — the authorization revision a worker
+    # operates against. The source is not enabled/entitled; completion only re-checks the approval.
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "display": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        session.commit()
+    auth = [SourceAuthorizationRef(source_key, 1)]
+
+    # 1) HAPPY PATH: worker-1 claims, then COMMITS a fenced result with an in-force authorization.
+    ok_job = _enqueue("job-ok")
+    ok_claim = _claim("worker-1", at=now, lease_seconds=600)
+    assert ok_claim is not None
+    ok_result = _complete(
+        ok_job,
+        "worker-1",
+        ok_claim.fence_token,
+        at=now + timedelta(seconds=5),
+        result_ref=result_ref,
+        authorizations=auth,
+    )
+    print(
+        f"\n1) worker-1 claim+commit -> committed={ok_result.committed} "
+        f"outcome={ok_result.outcome.value} row[{_show(ok_job)}] "
+        f"(SUCCEEDED, lease cleared, result recorded — handler NOT run)"
+    )
+
+    # 2) REPLACED worker: worker-1 claims, lapses; worker-2 reclaims (fence bumps); worker-1's stale
+    #    commit is refused and nothing changes (worker-2's live claim stays intact).
+    reclaim_job = _enqueue("job-reclaimed")
+    first = _claim("worker-1", at=now, lease_seconds=60)
+    assert first is not None
+    later = now + timedelta(seconds=120)
+    second = _claim("worker-2", at=later, lease_seconds=60)
+    assert second is not None
+    stale = _complete(
+        reclaim_job,
+        "worker-1",
+        first.fence_token,
+        at=later + timedelta(seconds=1),
+        result_ref=result_ref,
+    )
+    print(
+        f"\n2) worker-2 reclaims (fence {first.fence_token}->{second.fence_token}); worker-1 stale "
+        f"commit -> committed={stale.committed} outcome={stale.outcome.value} row[{_show(reclaim_job)}]"
+    )
+
+    # 3) SOURCE RIGHTS CHANGED: worker-1 claims relying on the approval; a platform operator revokes it;
+    #    worker-1's commit — while its lease is STILL LIVE — is refused and nothing changes.
+    rights_job = _enqueue("job-rights")
+    rights_claim = _claim("worker-1", at=now, lease_seconds=600)
+    assert rights_claim is not None
+    with ctx.session_factory() as session:
+        SourceRevocationStore(session).revoke(
+            source_key, 1, revoker, reason="rights_withdrawn_by_licensor", now=now
+        )
+        session.commit()
+    rights = _complete(
+        rights_job,
+        "worker-1",
+        rights_claim.fence_token,
+        at=now + timedelta(seconds=30),
+        result_ref=result_ref,
+        authorizations=auth,
+    )
+    print(
+        f"\n3) operator revokes {source_key}@v1; worker-1 commit (lease still live) -> "
+        f"committed={rights.committed} outcome={rights.outcome.value} detail={rights.detail} "
+        f"row[{_show(rights_job)}]"
+    )
+
+    with ctx.session_factory() as session:
+        rows = session.scalars(
+            select(DurableJobRequest).order_by(DurableJobRequest.idempotency_key)
+        ).all()
+        print("\njob rows after the scenario:")
+        for row in rows:
+            print(
+                f"  - key={row.idempotency_key} status={row.status} owner={row.lease_owner} "
+                f"leaseVersion={row.lease_version} resultRef={row.result_ref}"
+            )
+
+    checks = {
+        "current_holder_commits_fenced_result": ok_result.committed
+        and ok_result.outcome is JobCompletionOutcome.COMMITTED,
+        "replaced_worker_cannot_commit_after_reclaim": (not stale.committed)
+        and stale.outcome is JobCompletionOutcome.STALE_LEASE,
+        "source_rights_changed_refuses_commit": (not rights.committed)
+        and rights.outcome is JobCompletionOutcome.SOURCE_RIGHTS_CHANGED,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-103 COMMITS a fenced job "
+        "result — the running row flips to SUCCEEDED and records an opaque result pointer — ONLY after "
+        "re-checking the current lease fence AND that the authorization revisions the worker relied on are "
+        "still in force; a replaced worker or one whose source rights changed is refused and nothing "
+        "changes. Committing a result records a terminal status but EXECUTES nothing — execution stays a "
+        "disabled future capability, and a committed result grants no send authority and is not consent.)"
+    )
+    return {
+        "ok_job": ok_job,
+        "reclaim_job": reclaim_job,
+        "rights_job": rights_job,
+        "checks": checks,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

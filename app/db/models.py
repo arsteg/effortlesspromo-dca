@@ -128,6 +128,30 @@ class InboxStatus(str, Enum):
     PROCESSED = "processed"
 
 
+class JobRequestStatus(str, Enum):
+    """Lifecycle state of a durable job request (DCA-099).
+
+    ``QUEUED`` — the job has been persisted and is waiting to be picked up. DCA-099 persists durable job
+    *requests* and deliberately does not execute them; the claim path (DCA-101) flips a row to ``RUNNING``
+    and the fenced-completion path (DCA-103) flips a running row to ``SUCCEEDED``, but no path here ever
+    EXECUTES a job — the states model the lifecycle, the handler body stays a disabled future capability:
+
+    - ``RUNNING`` — claimed by a worker and in progress (the DCA-101 lease capability).
+    - ``SUCCEEDED`` — completed: a worker COMMITTED a fenced result (DCA-103), guarded by the current lease
+      and a re-check of the authorization revisions it relied on. Terminal; the lease is cleared.
+    - ``FAILED`` — a retriable attempt failed; it will be retried while ``attempt_count < max_attempts``.
+    - ``DEAD_LETTER`` — retries were exhausted (or the job was non-retriable); parked for inspection.
+    - ``CANCELLED`` — the request was withdrawn before it ran.
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+    CANCELLED = "cancelled"
+
+
 class ProfileStatus(str, Enum):
     """Lifecycle state of a business-profile row (DCA-036).
 
@@ -2849,3 +2873,160 @@ class RestrictedIdentityTombstone(TenantOwned, Base):
     created_by: Mapped[str] = mapped_column(String(128), default="", server_default="")
     created_by_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class DispatchRecheckConsumption(TenantOwned, Base):
+    """DCA-095 — the durable "this dispatch slot was consumed" ledger row.
+
+    An activation reference (DCA-094) proves the DCA's gates were clear for a context when it was
+    *issued*. Immediately before a host dispatches, it must RE-ASK the DCA — permission, suppression
+    and version state may have moved since issuance. This row is what makes that recheck a *consume*
+    rather than a read: a definitive grant records exactly ONE row per ``(business_id,
+    idempotency_key)``, and the unique constraint turns a concurrent or retried consume of the same
+    dispatch into a single consumption the database itself serialises (why the focused tests use a real
+    PostgreSQL, not SQLite).
+
+    **Grants only.** A row exists ONLY for a dispatch the recheck definitively allowed. A denied
+    recheck (a withdrawal recorded since issuance, a stale version, an unavailable authority, an
+    expired/altered reference) writes NOTHING — a rejection leaves no state, so the denial reproduces
+    with no change. A later retry under the SAME key replays this recorded grant verbatim (the dispatch
+    already completed); a fresh key after a withdrawal is re-evaluated and blocked.
+
+    **No raw recipient.** Like the reference it answers, the row binds a one-way ``recipient_digest``
+    and a ``reference_fingerprint`` (a digest of the consumed reference token), never the address or the
+    token itself — safe to keep and inspect. Tenant-owned: it inherits the ``business_id`` column +
+    RLS like every other tenant table, so a consumption can never be read or matched across tenants.
+
+    This records that the DCA re-cleared its OWN blockers for exactly one dispatch; it is NOT recipient
+    consent and NOT a send authorization — the one send pipeline owns and performs the actual send,
+    which stays a disabled future capability.
+    """
+
+    __tablename__ = "dispatch_recheck_consumptions"
+    __table_args__ = (tenant_unique("idempotency_key", name="uq_dispatch_recheck_idempotency"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The host-supplied consume-once key: one logical dispatch attempt within the business. The unique
+    # constraint above is the serialisation point that makes a retried/concurrent consume idempotent.
+    idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
+    # The channel the dispatch is on (e.g. "email") — part of the matched binding on a replay.
+    channel: Mapped[str] = mapped_column(String(32))
+    # The business's OWN resolved contact point id the reference was minted for (opaque row key).
+    contact_point_id: Mapped[str] = mapped_column(String(36))
+    # One-way digest of the recipient value — never the raw address. Matched on a replay.
+    recipient_digest: Mapped[str] = mapped_column(String(64))
+    # A digest of the consumed reference token itself (never the token) — so a replay can confirm the
+    # SAME reference is being re-presented, and a different reference under a reused key is a conflict.
+    reference_fingerprint: Mapped[str] = mapped_column(String(64))
+    # Provenance of the grant: the sending provider identity + the campaign revision + the permission /
+    # source versions the recheck confirmed were still current at consume time (opaque short strings).
+    provider: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    campaign_revision: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    permission_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The suppression snapshot version the recheck cleared against (provenance for audit/repro).
+    suppression_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # When the dispatch slot was consumed (the authoritative grant moment).
+    consumed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class DurableJobRequest(TenantOwned, Base):
+    """DCA-099 — a durable, tenant-owned record of ONE requested unit of background work.
+
+    This is the job *store*, not a job *runner*: it persists the intent to do some work so that intent
+    survives a restart and can be deduplicated and audited. DCA-099 deliberately does NOT execute jobs —
+    rows are only ever created :class:`JobRequestStatus.QUEUED`, and the attempt/status columns are
+    bookkeeping scaffolding for a later (currently-disabled) worker capability, never driven here.
+
+    **Deduplicated by logical intent.** ``(business_id, job_type, idempotency_key)`` is unique: the same
+    logical work enqueued twice within a business collapses to exactly ONE row. The unique constraint is
+    the serialisation point the writer (:class:`~app.jobs.store.JobRequestStore`) relies on, so a retried
+    or concurrent enqueue of the same intent resolves to the one job rather than creating duplicates —
+    which is why the focused tests exercise it on a real PostgreSQL, not SQLite.
+
+    **No raw PII on the row.** The job carries only a ``payload_ref`` (an opaque pointer to where the
+    real payload lives) and a ``payload_digest`` (a one-way fingerprint of that payload), never the
+    payload itself. The digest lets a replay confirm the SAME work is being re-enqueued; a *different*
+    payload under a reused key is a conflict (rejected, nothing written), never silently re-homed onto
+    the first job. ``payload_metadata`` holds only small, non-identifying control fields.
+
+    **Claimed safely across workers (DCA-101).** The ``lease_owner`` / ``lease_expires_at`` /
+    ``lease_version`` columns let a worker CLAIM a queued job in a short transaction
+    (:class:`~app.jobs.claim.JobClaimStore`): ``SELECT ... FOR UPDATE SKIP LOCKED`` picks one row, the
+    row flips to RUNNING with a lease + an incremented fencing token, and the transaction COMMITS —
+    releasing the row lock before any handler I/O. A live lease stops a second worker claiming the same
+    row; an expired lease lets a crashed worker's job be reclaimed (fencing token bumped again), and a
+    stale token is refused. Claiming leases a job; it still EXECUTES nothing — the handler body
+    (:meth:`~app.jobs.handlers.JobHandler.run`) is a disabled future capability.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 row-level-security
+    policy like every other tenant table, so a job can never be read or matched across tenants. Creating
+    a job grants nothing and sends nothing — the DCA has no send path (a disabled future capability).
+    """
+
+    __tablename__ = "durable_job_requests"
+    # One job per logical intent within a business: the same job_type + idempotency key collapses to one
+    # row; two tenants (or two job types) may reuse a key without colliding.
+    __table_args__ = (tenant_unique("job_type", "idempotency_key", name="uq_durable_job_request"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the payload contract this job was enqueued under — so a later reader knows how to
+    # interpret the referenced payload across contract changes (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The logical kind of work (e.g. "prospect.research"). Part of the dedup key; opaque to the store.
+    job_type: Mapped[str] = mapped_column(String(64), index=True)
+    # The caller-supplied consume-once key for one logical unit of work within the business. The unique
+    # constraint above is the serialisation point that makes a retried/concurrent enqueue idempotent.
+    idempotency_key: Mapped[str] = mapped_column(String(200), index=True)
+    # An opaque pointer to where the real payload lives (NEVER the payload itself, NEVER raw PII).
+    payload_ref: Mapped[str] = mapped_column(String(300))
+    # A one-way digest (sha256 hex) of the logical payload — matched on a replay to confirm the SAME
+    # work; a different digest under a reused key is a conflict. A fingerprint, never the data.
+    payload_digest: Mapped[str] = mapped_column(String(64))
+    # Small, non-identifying control fields only (never contact data) — e.g. a priority label.
+    payload_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Always "queued" here — DCA-099 persists requests, it does not run them.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=JobRequestStatus.QUEUED.value,
+        server_default=JobRequestStatus.QUEUED.value,
+    )
+    # Attempt bookkeeping for a future worker: how many times a run has been attempted, the ceiling
+    # before dead-lettering, and the earliest moment the job may run. The claim path (DCA-101)
+    # increments attempt_count as it leases a job; completion/retry stays a disabled future capability.
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, default=5, server_default="5")
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # DCA-101 lease/fencing. A claim is a SHORT PostgreSQL transaction (SELECT ... FOR UPDATE SKIP
+    # LOCKED, then a flip to RUNNING) whose row lock is released at COMMIT — BEFORE any handler I/O —
+    # so slow external work never holds a database lock. The lease then marks the claim at the
+    # application level (independent of the DB lock): ``lease_owner`` is the worker that holds it and
+    # ``lease_expires_at`` is when the claim lapses so a crashed/stalled worker's job can be reclaimed.
+    # ``lease_version`` is a monotonic FENCING TOKEN bumped on every (re)claim: a worker holds the
+    # token it was handed, and a stale holder (whose lease was superseded) is rejected by a fence check,
+    # so two workers can never hold the SAME current claim even across a lease handover. All three are
+    # NULL/zero on an unclaimed QUEUED row; nothing here executes a job.
+    lease_owner: Mapped[str | None] = mapped_column(String(128), default=None)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    lease_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # DCA-102 bounded-extension ceiling. Stamped at the moment a worker CLAIMS (or reclaims) the row:
+    # the absolute latest a heartbeat (:meth:`~app.jobs.claim.JobClaimStore.renew`) may push this claim's
+    # ``lease_expires_at`` out to. A renewal can keep a long-but-live job leased, but never past this
+    # deadline — so a stuck/looping worker cannot heartbeat a claim forever and starve a reclaim. A
+    # reclaim resets it (the new holder gets a fresh lifetime budget); NULL on an unclaimed/legacy row
+    # (treated as "no DCA-102 ceiling recorded"). Nothing here executes a job.
+    lease_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # The last failure note a future worker recorded; always NULL here (nothing runs).
+    last_error: Mapped[str | None] = mapped_column(Text, default=None)
+    # DCA-103 fenced completion. When a worker COMMITS a result (:meth:`~app.jobs.complete.JobCompletionStore.complete`)
+    # the job flips to ``SUCCEEDED`` and its lease is cleared, and these record the committed result — an
+    # OPAQUE pointer + one-way digest, NEVER raw PII (screened with the same rule as ``payload_ref``), plus
+    # the moment it was committed. All NULL on a queued/running row: a commit is guarded by the current
+    # lease fence AND a re-check of the authorization revisions the worker relied on, so a stale/replaced
+    # worker (reclaimed job) or one whose source rights changed cannot commit. Committing a result records
+    # the terminal status; it still EXECUTES nothing — the handler body stays a disabled future capability.
+    result_ref: Mapped[str | None] = mapped_column(String(300), default=None)
+    result_digest: Mapped[str | None] = mapped_column(String(64), default=None)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

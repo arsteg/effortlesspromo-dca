@@ -18,6 +18,7 @@ from app.api.routes import (
     authz,
     budget,
     deletion_propagation,
+    dispatch_recheck,
     eligibility,
     grievances,
     health,
@@ -135,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(records.router)
     app.include_router(eligibility.router)
     app.include_router(activation_references.router)
+    app.include_router(dispatch_recheck.router)
     app.include_router(targeting.router)
     app.include_router(auth.router)
     app.include_router(authz.router)

@@ -71,6 +71,8 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "data_erasure_journals",
         "external_deletion_propagations",
         "restricted_identity_tombstones",
+        "dispatch_recheck_consumptions",
+        "durable_job_requests",
     }
 
 
@@ -345,6 +347,54 @@ def test_privacy_grievance_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_GRIEVANCE, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_JOB = (
+    "INSERT INTO durable_job_requests "
+    "(id, business_id, schema_version, job_type, idempotency_key, payload_ref, payload_digest, "
+    "payload_metadata, status, attempt_count, max_attempts, available_at, created_at, updated_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'prospect.research', 'job-key-1', 'ref://x', 'digest-x', "
+    "'{}', 'queued', 0, 5, now(), now(), now())"
+)
+
+
+@requires_pg
+def test_durable_job_request_is_tenant_isolated(rls_db):
+    """DCA-099 — a job request is tenant-owned: each tenant can read only its OWN queued jobs (RLS on
+    real Postgres), so one business can never enumerate another's durable job requests."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_JOB, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_JOB, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM durable_job_requests").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM durable_job_requests").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_durable_job_request_write_check_rejects_foreign_owner(rls_db):
+    """A job request can never be stamped for another tenant: writing a B-owned row while scoped to A
+    violates the WITH CHECK clause (defence-in-depth beneath the store's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_JOB, (B,))
         conn.rollback()
     finally:
         conn.close()

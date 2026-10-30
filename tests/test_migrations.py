@@ -63,6 +63,8 @@ DCA_TABLES = {
     "data_erasure_journals",
     "external_deletion_propagations",
     "restricted_identity_tombstones",
+    "dispatch_recheck_consumptions",
+    "durable_job_requests",
 }
 
 
@@ -1337,6 +1339,250 @@ def test_0033_creates_data_erasure_journals_table_on_a_preexisting_database(clea
         }
     eng.dispose()
     assert policies == {"data_erasure_journals"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0037_creates_durable_job_requests_on_a_preexisting_database(clean_schema):
+    """DCA-099 — the 0037 create branch (for a DB migrated before ``durable_job_requests`` existed).
+
+    ``durable_job_requests`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001)
+    with RLS from 0002, and 0037 is a no-op there. To exercise 0037's real job, upgrade to head, drop
+    the table, stamp history back to 0036, then upgrade to head again — 0037 must recreate the table
+    (with its unique dedup constraint) AND add its tenant-isolation RLS policy, so the queue is
+    protected exactly like every other tenant table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "durable_job_requests" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0036_dispatch_recheck")  # pretend we predate the job-request table
+    command.upgrade(cfg, "head")  # 0037 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "durable_job_requests" in tables
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("durable_job_requests", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'durable_job_requests' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_durable_job_request" in uniques  # the per-intent dedup constraint travelled with it
+    assert policies == {"durable_job_requests"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0038_adds_lease_columns_on_a_preexisting_database(clean_schema):
+    """DCA-101 — the 0038 add-column branch (for a DB migrated before the lease/fencing columns).
+
+    A fresh DB gets ``durable_job_requests`` WITH ``lease_owner``/``lease_expires_at``/``lease_version``
+    from the metadata baseline (0001), so 0038 is a no-op there. To exercise 0038's real job, upgrade to
+    head, DROP the three columns, seed one pre-existing queued row, stamp history back to 0037, then
+    upgrade to head again — 0038 must re-add exactly those columns and backfill the existing row's
+    ``lease_version`` to 0 (never claimed), with no new table and the tenant RLS policy intact.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "durable_job_requests" DROP COLUMN "lease_version", '
+                'DROP COLUMN "lease_expires_at", DROP COLUMN "lease_owner"'
+            )
+        )
+        # Seed one pre-existing (pre-lease) queued row to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO durable_job_requests "
+                "(id, business_id, schema_version, job_type, idempotency_key, payload_ref, "
+                "payload_digest, payload_metadata, status, attempt_count, max_attempts, "
+                "available_at, created_at, updated_at) VALUES "
+                "('job-legacy', 'biz-legacy', 1, 'prospect.research', 'legacy-key', 'ref://x', "
+                "'digest-x', '{}', 'queued', 0, 5, now(), now(), now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0037_durable_job_requests")  # pretend we predate the lease columns
+    command.upgrade(cfg, "head")  # 0038 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("durable_job_requests", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT lease_owner, lease_expires_at, lease_version FROM durable_job_requests "
+                "WHERE id = 'job-legacy'"
+            )
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'durable_job_requests' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert {"lease_owner", "lease_expires_at", "lease_version"}.issubset(cols)  # columns re-added
+    assert backfilled == (None, None, 0)  # pre-existing row backfilled to "never claimed"
+    assert policy is not None  # tenant RLS policy intact (unchanged by the add-column migration)
+
+
+@requires_pg
+def test_0039_adds_lease_deadline_on_a_preexisting_database(clean_schema):
+    """DCA-102 — the 0039 add-column branch (for a DB migrated before the ``lease_deadline`` ceiling).
+
+    A fresh DB gets ``durable_job_requests`` WITH ``lease_deadline`` from the metadata baseline (0001),
+    so 0039 is a no-op there. To exercise 0039's real job, upgrade to head, DROP ``lease_deadline``, seed
+    one pre-existing running row (claimed before the ceiling existed), stamp history back to 0038, then
+    upgrade to head again — 0039 must re-add exactly that column as NULLABLE, leave the pre-existing row's
+    ``lease_deadline`` NULL (no backfill — renewal falls back to the per-call bound), add no new table, and
+    leave the tenant RLS policy intact.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('ALTER TABLE "durable_job_requests" DROP COLUMN "lease_deadline"'))
+        # Seed one pre-existing (pre-ceiling) running row to prove it simply reads NULL after the add.
+        conn.execute(
+            text(
+                "INSERT INTO durable_job_requests "
+                "(id, business_id, schema_version, job_type, idempotency_key, payload_ref, "
+                "payload_digest, payload_metadata, status, attempt_count, max_attempts, "
+                "lease_owner, lease_expires_at, lease_version, "
+                "available_at, created_at, updated_at) VALUES "
+                "('job-preceiling', 'biz-legacy', 1, 'prospect.research', 'preceiling-key', 'ref://x', "
+                "'digest-x', '{}', 'running', 1, 5, 'worker-1', now(), 1, now(), now(), now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0038_durable_job_request_lease")  # pretend we predate the ceiling column
+    command.upgrade(cfg, "head")  # 0039 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("durable_job_requests", schema=clean_schema)}
+    deadline_col = next(
+        c
+        for c in insp.get_columns("durable_job_requests", schema=clean_schema)
+        if c["name"] == "lease_deadline"
+    )
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        existing = conn.execute(
+            text("SELECT lease_deadline FROM durable_job_requests WHERE id = 'job-preceiling'")
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'durable_job_requests' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "lease_deadline" in cols  # column re-added
+    assert deadline_col["nullable"] is True  # nullable: no backfill, pre-existing rows read NULL
+    assert existing == (None,)  # pre-existing row has no DCA-102 ceiling recorded
+    assert policy is not None  # tenant RLS policy intact (unchanged by the add-column migration)
+
+
+@requires_pg
+def test_0040_adds_result_columns_on_a_preexisting_database(clean_schema):
+    """DCA-103 — the 0040 add-column branch (for a DB migrated before the fenced-result columns).
+
+    A fresh DB gets ``durable_job_requests`` WITH ``result_ref``/``result_digest``/``completed_at`` from
+    the metadata baseline (0001), so 0040 is a no-op there. To exercise 0040's real job, upgrade to head,
+    DROP the three columns, seed one pre-existing running row (claimed before the result columns existed),
+    stamp history back to 0039, then upgrade to head again — 0040 must re-add exactly those columns as
+    NULLABLE, leave the pre-existing row's values NULL (no backfill — a commit only ever writes them on a
+    successful fenced completion), add no new table, and leave the tenant RLS policy intact.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "durable_job_requests" DROP COLUMN "result_ref", '
+                'DROP COLUMN "result_digest", DROP COLUMN "completed_at"'
+            )
+        )
+        # Seed one pre-existing (pre-result) running row to prove it simply reads NULL after the add.
+        conn.execute(
+            text(
+                "INSERT INTO durable_job_requests "
+                "(id, business_id, schema_version, job_type, idempotency_key, payload_ref, "
+                "payload_digest, payload_metadata, status, attempt_count, max_attempts, "
+                "lease_owner, lease_expires_at, lease_version, lease_deadline, "
+                "available_at, created_at, updated_at) VALUES "
+                "('job-preresult', 'biz-legacy', 1, 'prospect.research', 'preresult-key', 'ref://x', "
+                "'digest-x', '{}', 'running', 1, 5, 'worker-1', now(), 1, now(), now(), now(), now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0039_job_request_lease_deadline")  # pretend we predate the result columns
+    command.upgrade(cfg, "head")  # 0040 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    columns = {c["name"]: c for c in insp.get_columns("durable_job_requests", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        existing = conn.execute(
+            text(
+                "SELECT result_ref, result_digest, completed_at FROM durable_job_requests "
+                "WHERE id = 'job-preresult'"
+            )
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'durable_job_requests' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert {"result_ref", "result_digest", "completed_at"}.issubset(columns)  # columns re-added
+    assert all(
+        columns[c]["nullable"] is True for c in ("result_ref", "result_digest", "completed_at")
+    )
+    assert existing == (None, None, None)  # pre-existing row has no committed result
+    assert policy is not None  # tenant RLS policy intact (unchanged by the add-column migration)
 
 
 @requires_pg
