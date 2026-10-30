@@ -80,6 +80,14 @@ class Scope(str, Enum):
     SOURCE_APPROVE = "source.approve"  # administrator: approve a data source
     POLICY_APPROVE = "policy.approve"  # administrator: approve a compliance policy
     BUDGET_MANAGE = "budget.manage"  # administrator: change spend budgets
+    # store a per-business recurring schedule — a durable record of a recurring intent, pinned to the
+    # confirmed ICP / profile versions it targets (DCA-107). An ADMINISTRATOR scope: configuring the
+    # agent's automation cadence is an administration action, so an ordinary acting user and a read-only
+    # viewer both lack it — only a business administrator holds it. It is a business-plane scope, so a
+    # platform operator (holding no membership) can never store a client's schedule with their global
+    # rights alone. Storing a schedule runs nothing and sends nothing (the DCA has no send path);
+    # advancing a due schedule and enqueuing its cycle stays a separate, disabled future capability.
+    SCHEDULE_MANAGE = "schedule.manage"
 
     # --- platform plane (granted to platform operators only) ---
     PLATFORM_OPS_READ = "platform.ops.read"  # operator: read platform-wide operational state
@@ -129,6 +137,8 @@ _ADMIN_SCOPES = frozenset(
         Scope.SOURCE_APPROVE,
         Scope.POLICY_APPROVE,
         Scope.BUDGET_MANAGE,
+        # configuring the agent's recurring-schedule cadence is an administrator action (DCA-107).
+        Scope.SCHEDULE_MANAGE,
     }
 )
 # The scopes an ordinary acting (non-admin, non-viewer) business user holds.

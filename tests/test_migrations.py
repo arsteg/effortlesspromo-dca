@@ -66,6 +66,7 @@ DCA_TABLES = {
     "dispatch_recheck_consumptions",
     "durable_job_requests",
     "identity_merges",
+    "recurring_schedules",
 }
 
 
@@ -1631,6 +1632,53 @@ def test_0041_creates_identity_merges_table_on_a_preexisting_database(clean_sche
     eng.dispose()
     assert "uq_identity_merge_pair" in uniques  # one merge per (business, subject, directed pair)
     assert policies == {"identity_merges"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0042_creates_recurring_schedules_on_a_preexisting_database(clean_schema):
+    """DCA-107 — the 0042 create branch (for a DB migrated before ``recurring_schedules`` existed).
+
+    ``recurring_schedules`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0042 is a no-op there. To exercise 0042's real job, upgrade to head, drop the
+    table, stamp history back to 0041, then upgrade to head again — 0042 must recreate the table (with
+    its per-(business, schedule_key) uniqueness constraint) and add its tenant-isolation RLS policy, so a
+    schedule is protected exactly like every other tenant table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "recurring_schedules" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0041_identity_merges")  # pretend we predate the recurring-schedule table
+    command.upgrade(cfg, "head")  # 0042 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "recurring_schedules" in tables
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("recurring_schedules", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'recurring_schedules' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_recurring_schedule_key" in uniques  # one schedule per (business, schedule_key)
+    assert policies == {"recurring_schedules"}  # tenant-owned: RLS applied
 
 
 @requires_pg

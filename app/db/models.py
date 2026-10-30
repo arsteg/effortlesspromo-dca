@@ -152,6 +152,22 @@ class JobRequestStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class ScheduleStatus(str, Enum):
+    """Lifecycle state of a stored per-business recurring schedule (DCA-107).
+
+    ``ACTIVE`` — the schedule is a live, durable record of a recurring intent: it carries a persisted
+    ``next_run_at`` (the due time) that survives a process restart. ``PAUSED`` — a schedule a future
+    (currently-disabled) capability may suspend. DCA-107 persists active schedules ONLY; it never runs
+    them. Storing a schedule neither enqueues a job nor starts any per-tenant process — advancing a due
+    schedule and enqueuing its cycle is the SEPARATE next story (DCA-108), so these states model the
+    lifecycle while execution stays a disabled future capability: a stored schedule implies NO endless
+    per-tenant model process.
+    """
+
+    ACTIVE = "active"
+    PAUSED = "paused"
+
+
 class ProfileStatus(str, Enum):
     """Lifecycle state of a business-profile row (DCA-036).
 
@@ -3145,3 +3161,71 @@ class IdentityMerge(TenantOwned, Base):
     # When the reviewer approved the merge, and when this row was recorded in the service.
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class RecurringSchedule(TenantOwned, Base):
+    """DCA-107 — a durable, tenant-owned record of ONE per-business recurring schedule (RLS-protected).
+
+    One row is one *active recurring intent* for a business: the logical recurring work
+    (``schedule_key``), how often it recurs (``interval_seconds``) and — the load-bearing field — the
+    persisted DUE time (``next_run_at``). The schedule is just durable DATA: it is stored in PostgreSQL
+    so that it **survives a process restart** (a restarted scheduler re-reads the same ``next_run_at``),
+    and it **never implies an endless per-tenant model process** — storing a schedule starts no thread,
+    opens no loop, and enqueues no job. Advancing a due schedule and uniquely enqueuing each cycle is the
+    SEPARATE next story (DCA-108), which stays a disabled future capability; nothing here executes.
+
+    **Only for a confirmed, entitled business, with versioned profile references.** The single sanctioned
+    writer (:class:`~app.services.schedule_store.RecurringScheduleStore`) refuses to store a schedule
+    unless, at creation time, the business has a CONFIRMED active ICP (DCA-040) AND a currently-entitled
+    cached snapshot (DCA-023). The schedule pins the exact versions it was created against:
+    ``icp_version`` snapshots the confirmed active ICP version, and ``profile_version`` optionally links
+    the DCA-036 business-profile draft version it was authored against — so a schedule always records
+    WHICH versioned profile it targets, and a later targeting change can be told apart from the version
+    this schedule was stored for.
+
+    **Authorized; a denial changes nothing.** A schedule may only be stored by a business user whose
+    membership roles grant :attr:`~app.identity.permissions.Scope.SCHEDULE_MANAGE` (an administrator
+    scope). Authority is checked FIRST, and every gate (authority, shape, confirmed, entitled) raises
+    BEFORE the session is mutated, so a refused create stages no row. ``actor_id`` / ``actor_type`` record
+    WHO stored it (an opaque subject id, never a name/email), on the atomic DCA-026 audit entry in the
+    SAME unit of work as the row.
+
+    **One schedule per logical key per business.** ``(business_id, schedule_key)`` is unique; re-creating
+    an existing key is a conflict rejected before any write (updating/advancing it is DCA-108), never a
+    silent overwrite. Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS
+    policy like every other tenant table, so a schedule can never be read or matched across tenants.
+    Storing a schedule grants nothing and sends nothing — the DCA has no send path.
+    """
+
+    __tablename__ = "recurring_schedules"
+    # One schedule per logical key within a business: two tenants may reuse a key without colliding.
+    __table_args__ = (tenant_unique("schedule_key", name="uq_recurring_schedule_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the schedule-record contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The logical kind of recurring work (e.g. "prospect.discovery"). Opaque; part of the dedup key.
+    schedule_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The cadence in seconds — how often the schedule recurs. Positive (validated by the store).
+    interval_seconds: Mapped[int] = mapped_column(Integer)
+    # The persisted DUE time — the one field that must survive a restart. A future (disabled) capability
+    # (DCA-108) advances it as it enqueues each cycle; nothing here advances it.
+    next_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # active | paused — ACTIVE on every row written here; pausing is a future (disabled) capability.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=ScheduleStatus.ACTIVE.value,
+        server_default=ScheduleStatus.ACTIVE.value,
+        index=True,
+    )
+    # Versioned profile references the schedule was created against. ``icp_version`` is the confirmed
+    # active ICP version (DCA-040) snapshotted at creation; ``profile_version`` optionally links the
+    # DCA-036 business-profile draft version (NULL when not linked).
+    icp_version: Mapped[int] = mapped_column(Integer)
+    profile_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # WHO stored this schedule — an opaque subject id (never a name/email) plus its kind, screened by the
+    # audit sink in the SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

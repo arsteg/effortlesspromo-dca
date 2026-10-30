@@ -16617,6 +16617,218 @@ def _dca_106(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-107",
+    "store per-business recurring schedules: in isolated synthetic Businesses, store an ACTIVE schedule "
+    "for a CONFIRMED + ENTITLED business A (pinned to the confirmed ICP version); then simulate a "
+    "scheduler RESTART by opening a BRAND-NEW engine over the same durable DB and show the persisted "
+    "next-run time is re-read UNCHANGED, and that NO durable job was enqueued (storing a schedule implies "
+    "no running per-tenant process). Then the relevant denials, each changing NOTHING: an unauthorized "
+    "actor, an UN-confirmed business, an UN-entitled business, and a duplicate schedule key. Local "
+    "synthetic; no AI/paid action, no network, no send. Advancing a due schedule and enqueuing its cycle "
+    "stays a disabled future capability (DCA-108).",
+)
+def _dca_107(ctx: CheckContext) -> dict:
+    """Drive the DCA-107 recurring-schedule store directly against the ephemeral synthetic DB and print
+    the real rows (schedule key, cadence, persisted next-run time, pinned ICP version, status) and every
+    denial — never a bare PASS. The 'restart' uses a fresh engine over the same file DB, proving the
+    schedule is durable state, not an in-memory process."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import func, select
+
+    from app.db.base import make_engine, make_session_factory
+    from app.db.models import (
+        DurableJobRequest,
+        EntitlementProjection,
+        IcpConfirmation,
+        RecurringSchedule,
+    )
+    from app.services.schedule_store import (
+        RecurringScheduleStore,
+        ScheduleAuthorizationError,
+        ScheduleConflict,
+        ScheduleError,
+        ScheduleInput,
+        ScheduleManager,
+    )
+
+    biz_a = "11111111-1111-1111-1111-11111111a107"  # confirmed + entitled
+    biz_unconf = "22222222-2222-2222-2222-2222222c107"  # entitled but NOT confirmed
+    biz_unent = "33333333-3333-3333-3333-3333333e107"  # confirmed but NOT entitled
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
+    next_run = now + timedelta(hours=1)
+
+    admin = ScheduleManager(subject="op-admin", roles=("owner",), actor_type="user")
+    viewer = ScheduleManager(subject="op-viewer", roles=("viewer",), actor_type="user")
+
+    def _schedule_input(**kw) -> ScheduleInput:
+        base: dict = {
+            "schedule_key": "prospect.discovery",
+            "interval_seconds": 3600,
+            "next_run_at": next_run,
+            "profile_version": None,
+        }
+        base.update(kw)
+        return ScheduleInput(**base)
+
+    def _confirm(session, business_id: str, version: int) -> None:
+        session.add(
+            IcpConfirmation(
+                business_id=business_id, version=version, actor_id="seed", actor_type="user"
+            )
+        )
+
+    def _entitle(session, business_id: str) -> None:
+        session.add(
+            EntitlementProjection(
+                business_id=business_id,
+                status="active",
+                plan="synthetic",
+                capabilities=[],
+                limits={},
+                expires_at=None,
+                captured_at=now,
+                version="v1",
+            )
+        )
+
+    def _count(business_id: str) -> int:
+        with ctx.session_factory() as session:
+            return session.scalar(
+                select(func.count())
+                .select_from(RecurringSchedule)
+                .where(RecurringSchedule.business_id == business_id)
+            )
+
+    # Seed the preconditions for all three synthetic businesses.
+    with ctx.session_factory() as session:
+        _confirm(session, biz_a, version=3)
+        _entitle(session, biz_a)
+        _entitle(session, biz_unconf)  # entitled, not confirmed
+        _confirm(session, biz_unent, version=1)  # confirmed, not entitled
+        session.commit()
+
+    # 1) Store an ACTIVE schedule for the confirmed + entitled business A.
+    with ctx.session_factory() as session:
+        row = RecurringScheduleStore(session, biz_a).create(_schedule_input(), admin, now=now)
+        session.commit()
+        sched_id = row.id
+    with ctx.session_factory() as session:
+        stored = RecurringScheduleStore(session, biz_a).by_key("prospect.discovery")
+        assert stored is not None
+        print("\n1) stored schedule for a CONFIRMED + ENTITLED business A:")
+        print(
+            f"   id={stored.id[-8:]} key={stored.schedule_key} status={stored.status} "
+            f"interval={stored.interval_seconds}s nextRunAt={stored.next_run_at} "
+            f"icpVersion={stored.icp_version} (pinned confirmed ICP) profileVersion={stored.profile_version}"
+        )
+
+    # 2) Simulate a scheduler RESTART: a brand-new engine over the SAME durable DB re-reads the row.
+    db_url = str(ctx.engine.url)  # type: ignore[attr-defined]  # ctx.engine is a SQLAlchemy Engine
+    restarted = make_engine(db_url)
+    try:
+        restarted_factory = make_session_factory(restarted)
+        with restarted_factory() as session:
+            after = RecurringScheduleStore(session, biz_a).by_key("prospect.discovery")
+            assert after is not None
+            persisted = after.next_run_at
+            if persisted.tzinfo is None:
+                persisted = persisted.replace(tzinfo=UTC)
+            due_now = RecurringScheduleStore(session, biz_a).due(next_run)
+            survived = after.id == sched_id and persisted == next_run
+        print("\n2) RESTART (fresh engine over the same durable DB) -> persisted next-run re-read:")
+        print(
+            f"   sameRow={after.id == sched_id} nextRunAt={persisted} survivedRestart={survived} "
+            f"dueAtNextRun={[s.schedule_key for s in due_now]}"
+        )
+    finally:
+        restarted.dispose()
+
+    # 3) Storing a schedule enqueued NO durable job (no running per-tenant process).
+    with ctx.session_factory() as session:
+        job_count = session.scalar(select(func.count()).select_from(DurableJobRequest))
+    print(f"\n3) durable jobs enqueued by storing the schedule: {job_count} (nothing runs)")
+
+    # 4) Denials — each refuses before any write, so the schedule count stays put.
+    denials: dict = {}
+
+    def _denial(label: str, business_id: str, fn) -> None:
+        before = _count(business_id)
+        code = None
+        with ctx.session_factory() as session:
+            try:
+                fn(session)
+            except (ScheduleAuthorizationError, ScheduleConflict, ScheduleError) as exc:
+                code = exc.code
+                session.rollback()
+        after = _count(business_id)
+        denials[label] = {"code": code, "changed": after != before}
+        print(f"   - {label}: code={code} changed={after != before}")
+
+    print("\n4) denials (each leaves state unchanged):")
+    _denial(
+        "unauthorized_viewer",
+        biz_a,
+        lambda s: RecurringScheduleStore(s, biz_a).create(
+            _schedule_input(schedule_key="other.work"), viewer, now=now
+        ),
+    )
+    _denial(
+        "business_not_confirmed",
+        biz_unconf,
+        lambda s: RecurringScheduleStore(s, biz_unconf).create(_schedule_input(), admin, now=now),
+    )
+    _denial(
+        "business_not_entitled",
+        biz_unent,
+        lambda s: RecurringScheduleStore(s, biz_unent).create(_schedule_input(), admin, now=now),
+    )
+    _denial(
+        "duplicate_schedule_key",
+        biz_a,
+        lambda s: RecurringScheduleStore(s, biz_a).create(
+            _schedule_input(interval_seconds=7200), admin, now=now
+        ),
+    )
+
+    checks = {
+        "schedule_stored_active": stored.status == "active" and stored.icp_version == 3,
+        "survives_restart_unchanged": survived,
+        "no_job_enqueued": job_count == 0,
+        "unauthorized_refused_no_change": denials["unauthorized_viewer"]["code"]
+        == "schedule_not_authorized"
+        and not denials["unauthorized_viewer"]["changed"],
+        "unconfirmed_refused_no_change": denials["business_not_confirmed"]["code"]
+        == "schedule_business_not_confirmed"
+        and not denials["business_not_confirmed"]["changed"],
+        "unentitled_refused_no_change": denials["business_not_entitled"]["code"]
+        == "schedule_business_not_entitled"
+        and not denials["business_not_entitled"]["changed"],
+        "duplicate_key_conflict_no_change": denials["duplicate_schedule_key"]["code"]
+        == "schedule_already_exists"
+        and not denials["duplicate_schedule_key"]["changed"],
+        "count_a_is_one": _count(biz_a) == 1,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-107 persists per-business "
+        "recurring SCHEDULES — a durable row with a next-run due time, pinned to the confirmed ICP / "
+        "profile versions, stored only for a confirmed + entitled business by an authorized administrator. "
+        "A schedule is DATA: it survives a restart and implies NO endless per-tenant model process — "
+        "storing it runs nothing and enqueues nothing. Advancing a due schedule and enqueuing its cycle "
+        "is the SEPARATE next story (DCA-108) and stays a disabled future capability.)"
+    )
+    return {
+        "schedule_id": sched_id,
+        "count_a": _count(biz_a),
+        "survived_restart": survived,
+        "job_count": job_count,
+        "denials": denials,
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
