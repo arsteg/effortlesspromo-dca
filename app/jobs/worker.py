@@ -64,8 +64,27 @@ isolation / RLS and the single-current-claim guarantee are fully preserved — a
 touches jobs of the tenant it is scoped to. And execution stays the SAME disabled future capability: a
 fairly-claimed job is PARKED ``DEAD_LETTER`` exactly as before, never run and never sent.
 
-Scope note: hierarchical emergency-stop enforcement (DCA-111) is the next, separate story and is
-deliberately NOT implemented here.
+HIERARCHICAL emergency stops (DCA-111) — the load-bearing guarantee this module now enforces.
+------------------------------------------------------------------------------------------------
+Before it claims/advances a business's jobs OR runs that business's maintenance ticks, the worker now
+consults the :class:`~app.services.emergency_stop.EmergencyStopResolver` at its checkpoints
+(:meth:`DurableJobWorker.is_claiming_blocked`). The stop is a two-tier kill switch where the higher tier
+DOMINATES the lower (acceptance: "a pause stops new relevant side effects at checkpoints while unrelated
+allowed business work can continue"):
+
+- **Platform-wide stop (top tier).** While it is active NO tenant's jobs are claimed/advanced and NO due
+  schedule is enqueued for ANY business — it dominates every per-business state.
+- **Per-business stop (lower tier).** While a business's own stop is active only THAT business is paused;
+  every other, un-stopped business keeps working normally in the same pass.
+
+The gate lives in exactly one place — :meth:`DurableJobWorker._claim_and_handle_one`, the single step both
+drains share — so a stopped scope's claim simply returns ``None`` (like nothing-due); the maintenance loop
+additionally skips a stopped business's recovery/schedule ticks. The gate only ever ADDS a block (a stop
+makes the worker do LESS), so it can never cause a job to run or a send to occur, and clearing a stop
+resumes the scope on the next pass. Setting/clearing a stop is authority-gated and audited in
+:mod:`app.services.emergency_stop`; this module only READS the effective state. Execution stays the SAME
+disabled future capability — a claimable (un-stopped) job is still PARKED ``DEAD_LETTER``, never run, never
+sent.
 """
 
 from __future__ import annotations
@@ -94,6 +113,7 @@ from app.jobs.handlers import (
 )
 from app.jobs.recovery import JobLeaseRecoveryStore, LeaseRecoveryReport
 from app.jobs.retry import FailureSignal, JobFailureCategory, JobRetryScheduler
+from app.services.emergency_stop import EmergencyStopResolver
 from app.services.schedule_tick import DueScheduleEnqueuer, ScheduleTickReport
 
 log = logging.getLogger("dca.jobworker")
@@ -231,6 +251,10 @@ class DurableJobWorker:
     Execution is a DISABLED future capability (:data:`EXECUTION_ENABLED` is ``False``): the worker claims
     and drives the lifecycle but never runs a handler, performs I/O or sends. A claimed job is parked
     (``DEAD_LETTER``) safely; a shutdown relinquishes held work back to the queue.
+
+    DCA-111: every pass consults the hierarchical emergency stop
+    (:meth:`is_claiming_blocked`) at its checkpoints, so a platform-wide stop pauses every business and a
+    per-business stop pauses only that business, while un-stopped businesses keep working.
     """
 
     def __init__(
@@ -314,6 +338,19 @@ class DurableJobWorker:
         with self._factory() as session:
             return DueScheduleEnqueuer(session, business_id).tick(now=now)
 
+    # ---------------------------------------------------------------- emergency-stop gate (DCA-111)
+    def is_claiming_blocked(self, business_id: str) -> bool:
+        """Is this business's background work PAUSED by a hierarchical emergency stop (DCA-111)?
+
+        The worker's checkpoint read: it opens its own short session and asks the
+        :class:`~app.services.emergency_stop.EmergencyStopResolver` whether the PLATFORM-WIDE stop is
+        active (dominates every tenant) OR this business's OWN stop is active. A stop can only ADD a
+        block — it never enables work — so this is the fail-closed gate consulted before claiming/advancing
+        a job or running a tenant's maintenance ticks. A business with no stop (and no platform stop) is
+        never blocked, so unrelated allowed work continues untouched. Reads no payload; touches nothing."""
+        with self._factory() as session:
+            return EmergencyStopResolver(session).is_claiming_blocked(business_id)
+
     # ---------------------------------------------------------------- claim + drive
     def claim_one(self, business_id: str, *, now: datetime) -> JobClaim | None:
         """Claim the next due job for one tenant (DCA-101), or ``None``. A real lifecycle mechanic."""
@@ -392,10 +429,15 @@ class DurableJobWorker:
         :meth:`drain_fair` build on, so the shutdown-race / relinquish discipline lives in exactly one
         place. Shutdown is honoured at two checkpoints: BEFORE the claim (stop NEW claims → ``None``), and
         immediately AFTER a claim that raced the shutdown (relinquish the active work back to the queue
-        and return a ``RELINQUISHED`` record). Every claim is tenant-scoped (DCA-101), so this never
-        touches another tenant's job; nothing here runs a handler or sends."""
+        and return a ``RELINQUISHED`` record). It is ALSO the DCA-111 emergency-stop checkpoint: if a
+        hierarchical stop (platform-wide, or this business's own) is active, no new claim is made
+        (returns ``None``, exactly like nothing-due) — so a paused scope never has a job claimed or
+        advanced while an un-stopped business keeps working. Every claim is tenant-scoped (DCA-101), so
+        this never touches another tenant's job; nothing here runs a handler or sends."""
         if self._shutdown.is_set():
             return None  # graceful: stop claiming NEW work
+        if self.is_claiming_blocked(business_id):
+            return None  # DCA-111: an emergency stop pauses this scope — claim/advance nothing
         claim = self.claim_one(business_id, now=now)
         if claim is None:
             return None  # nothing more due for this tenant
@@ -532,6 +574,11 @@ class DurableJobWorker:
             if self._shutdown.is_set():
                 stopped_early = True
                 break
+            # DCA-111: a hierarchical emergency stop (platform-wide, or this business's own) pauses this
+            # business's background work — skip BOTH its maintenance ticks (recovery sweep + due-schedule
+            # enqueue, a new side effect) this pass. An un-stopped business is unaffected and continues.
+            if self.is_claiming_blocked(business_id):
+                continue
             recovered[business_id] = self.recover(business_id, now=moment)
             if self._shutdown.is_set():
                 stopped_early = True

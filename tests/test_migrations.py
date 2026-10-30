@@ -67,6 +67,8 @@ DCA_TABLES = {
     "durable_job_requests",
     "identity_merges",
     "recurring_schedules",
+    "business_emergency_stops",
+    "platform_emergency_stops",
 }
 
 
@@ -1679,6 +1681,65 @@ def test_0042_creates_recurring_schedules_on_a_preexisting_database(clean_schema
     eng.dispose()
     assert "uq_recurring_schedule_key" in uniques  # one schedule per (business, schedule_key)
     assert policies == {"recurring_schedules"}  # tenant-owned: RLS applied
+
+
+@requires_pg
+def test_0043_creates_emergency_stops_on_a_preexisting_database(clean_schema):
+    """DCA-111 — the 0043 create branch (for a DB migrated before the emergency-stop tables existed).
+
+    0043 adds two tables: ``business_emergency_stops`` (tenant-owned → RLS policy + per-business version
+    constraint) and ``platform_emergency_stops`` (platform control-plane → NO RLS policy, like
+    ``platform_source_restrictions``). A fresh DB gets both from the metadata baseline (0001), with RLS
+    for only the tenant-owned one from 0002, so 0043 is a no-op there. To exercise 0043's real job,
+    upgrade to head, drop both tables, stamp history back to 0042, then upgrade to head again — 0043 must
+    recreate both (with their version constraints) and add the tenant-isolation RLS policy to ONLY the
+    tenant-owned table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "business_emergency_stops" CASCADE'))
+        conn.execute(text('DROP TABLE IF EXISTS "platform_emergency_stops" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0042_recurring_schedules")  # pretend we predate the emergency-stop tables
+    command.upgrade(cfg, "head")  # 0043 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "business_emergency_stops" in tables
+    assert "platform_emergency_stops" in tables
+    biz_uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("business_emergency_stops", schema=clean_schema)
+    }
+    plat_uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("platform_emergency_stops", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename IN ('business_emergency_stops', 'platform_emergency_stops') "
+                    "AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_business_emergency_stop_version" in biz_uniques  # one version per business
+    assert "uq_platform_emergency_stop_version" in plat_uniques  # one version per platform scope
+    # RLS applied to ONLY the tenant-owned table; the control-plane platform table has none.
+    assert policies == {"business_emergency_stops"}
 
 
 @requires_pg

@@ -17326,6 +17326,206 @@ def _dca_110(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-111",
+    "hierarchical emergency stops: a PER-BUSINESS stop pauses only that business (an unrelated business "
+    "keeps working); the PLATFORM-WIDE stop DOMINATES and halts every business even one whose own stop "
+    "is cleared; clearing resumes. Set/clear is authority-gated; execution stays disabled (parked, never "
+    "run/sent).",
+)
+def _dca_111(ctx: CheckContext) -> dict:
+    """Drive the DCA-111 kill switch directly against the ephemeral synthetic DB and print the REAL
+    resulting row states + resolver readings - never a bare PASS. Shows the hierarchy end to end: a
+    business stop on A pauses only A while B is still driven in the same pass; the platform-wide stop then
+    halts BOTH (dominating even A's cleared business state); clearing everything resumes. Every job the
+    worker does drive is PARKED dead_letter (no handler run, no AI/network, no send)."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.db.models import DurableJobRequest, JobRequestStatus, TenantAgent
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+    from app.jobs.worker import DurableJobWorker
+    from app.services.emergency_stop import (
+        REASON_NOT_AUTHORIZED,
+        BusinessEmergencyStopStore,
+        BusinessStopPrincipal,
+        EmergencyStopAuthorizationError,
+        EmergencyStopResolver,
+        PlatformEmergencyStopStore,
+        PlatformStopPrincipal,
+    )
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz_a = "11111111-1111-1111-1111-11111111a111"
+    biz_b = "22222222-2222-2222-2222-22222222b111"
+    admin = "00000000-0000-4000-9000-0000000a0111"
+    operator = "00000000-0000-4000-9000-00000090e111"
+    viewer_p = BusinessStopPrincipal(subject=admin, roles=("viewer",))
+    admin_p = BusinessStopPrincipal(subject=admin, roles=("admin",))
+    operator_p = PlatformStopPrincipal(subject=operator, roles=("platform_operator",))
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
+
+    def _enable(business_id: str) -> None:
+        with factory() as session:
+            session.add(TenantAgent(business_id=business_id, country="IN", enabled=True))
+            session.commit()
+
+    def _enqueue(business_id: str, key: str) -> None:
+        with factory() as session:
+            JobRequestStore(session, business_id).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                ),
+                now=now,
+            )
+            session.commit()
+
+    def _counts(business_id: str) -> dict[str, int]:
+        with factory() as session:
+            rows = session.scalars(
+                select(DurableJobRequest.status).where(DurableJobRequest.business_id == business_id)
+            ).all()
+        out: dict[str, int] = {}
+        for status in rows:
+            out[status] = out.get(status, 0) + 1
+        return out
+
+    def _blocked(business_id: str) -> bool:
+        with factory() as session:
+            return EmergencyStopResolver(session).is_claiming_blocked(business_id)
+
+    def _requeue_all() -> None:
+        # Reset parked rows back to QUEUED between stages so each stage starts from claimable work
+        # (a manual-check convenience only; the real recovery path is the operator requeue, DCA-105).
+        with factory() as session:
+            for row in session.scalars(select(DurableJobRequest)).all():
+                row.status = JobRequestStatus.QUEUED.value
+                row.lease_owner = None
+                row.lease_expires_at = None
+                row.lease_deadline = None
+                row.attempt_count = 0
+                row.available_at = now
+            session.commit()
+
+    _enable(biz_a)
+    _enable(biz_b)
+    _enqueue(biz_a, "a-1")
+    _enqueue(biz_b, "b-1")
+    worker = DurableJobWorker(factory, ctx.settings, clock=lambda: now)
+
+    print(f"\nworker id: {worker.worker_id}")
+    print(f"enabled businesses: A={biz_a[-4:]}  B={biz_b[-4:]}")
+
+    # 0) Authority: an unauthorized caller (a read-only viewer) cannot set a business stop — refused,
+    #    and nothing changes.
+    refused = "no"
+    with factory() as session:
+        try:
+            BusinessEmergencyStopStore(session, biz_a).set_stop(viewer_p, reason="pause", now=now)
+        except EmergencyStopAuthorizationError as exc:
+            refused = exc.code
+            session.rollback()
+    print("\n0) authority gate:")
+    print(
+        f"   viewer tries to pause A -> refused with code '{refused}' (REASON={REASON_NOT_AUTHORIZED})"
+    )
+    print(
+        f"   A blocked after the refused attempt? {_blocked(biz_a)}  (unchanged - denial changed nothing)"
+    )
+
+    # 1) PER-BUSINESS stop: an admin pauses A. A is blocked; B is not.
+    with factory() as session:
+        BusinessEmergencyStopStore(session, biz_a).set_stop(admin_p, reason="manual_pause", now=now)
+        session.commit()
+    print("\n1) per-business stop (admin pauses A):")
+    print(f"   blocked? A={_blocked(biz_a)}  B={_blocked(biz_b)}  (only A is paused)")
+    report1 = worker.run_pass(now=now)
+    driven1 = sorted({"A" if h.business_id == biz_a else "B" for h in report1.handled})
+    print(f"   one worker pass drove businesses: {driven1}  (A skipped; B serviced)")
+    print(f"   rows -> A: {_counts(biz_a)}   B: {_counts(biz_b)}")
+
+    # 2) PLATFORM stop DOMINATES: clear A's own stop, but an operator sets the platform-wide stop.
+    _requeue_all()
+    with factory() as session:
+        BusinessEmergencyStopStore(session, biz_a).clear_stop(admin_p, reason="resume_a", now=now)
+        PlatformEmergencyStopStore(session).set_stop(operator_p, reason="incident", now=now)
+        session.commit()
+    with factory() as session:
+        a_own = BusinessEmergencyStopStore(session, biz_a).is_stopped()
+        plat = PlatformEmergencyStopStore(session).is_stopped()
+    # Capture the stage-2 block states NOW (before stage 3 clears the platform stop) for the checks.
+    stage2_a_blocked = _blocked(biz_a)
+    stage2_b_blocked = _blocked(biz_b)
+    print("\n2) platform-wide stop DOMINATES (A's own stop is cleared, platform stop is active):")
+    print(f"   A's OWN stop active? {a_own}   platform stop active? {plat}")
+    print(
+        f"   blocked? A={stage2_a_blocked}  B={stage2_b_blocked}  (platform dominates -> BOTH halted)"
+    )
+    report2 = worker.run_pass(now=now)
+    print(
+        f"   one worker pass drove: {[h.business_id for h in report2.handled]}  (nothing claimed)"
+    )
+    print(f"   rows -> A: {_counts(biz_a)}   B: {_counts(biz_b)}  (all left QUEUED)")
+
+    # 3) CLEAR the platform stop → both resume; the worker drives each job safely (parked, never sent).
+    with factory() as session:
+        PlatformEmergencyStopStore(session).clear_stop(operator_p, reason="resolved", now=now)
+        session.commit()
+    print("\n3) clear the platform stop -> resume:")
+    print(f"   blocked? A={_blocked(biz_a)}  B={_blocked(biz_b)}  (both resumed)")
+    report3 = worker.run_pass(now=now)
+    print(
+        f"   one worker pass drove businesses: "
+        f"{sorted({'A' if h.business_id == biz_a else 'B' for h in report3.handled})}"
+    )
+    print(f"   rows -> A: {_counts(biz_a)}   B: {_counts(biz_b)}  (each job parked dead_letter)")
+
+    checks = {
+        "unauthorized_refused_no_change": refused == REASON_NOT_AUTHORIZED,
+        "business_stop_pauses_only_A": driven1 == ["B"],
+        "platform_stop_dominates_cleared_business": (not a_own)
+        and plat
+        and stage2_a_blocked
+        and stage2_b_blocked,
+        "platform_stop_halts_all": report2.handled == (),
+        "clear_resumes_both": sorted(
+            {"A" if h.business_id == biz_a else "B" for h in report3.handled}
+        )
+        == ["A", "B"],
+        "driven_jobs_all_parked": report3.parked_count == len(report3.handled)
+        and report3.relinquished_count == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-111 enforces a HIERARCHICAL "
+        "emergency stop: a per-business stop pauses only that business at the worker's claim/maintenance "
+        "checkpoints while an unrelated business keeps working, and the PLATFORM-WIDE stop DOMINATES - it "
+        "halts every business even one whose own stop is cleared. Set/clear is authority-gated (platform "
+        "scope for the platform stop, business-admin scope for a business stop) and a business set/clear "
+        "is audited atomically; the ledgers are append-only (clearing inserts a version, deleting no "
+        "history). Handler EXECUTION stays a DISABLED future capability: a claimable job is PARKED "
+        "dead_letter, never run or sent.)"
+    )
+    return {
+        "worker_id": worker.worker_id,
+        "unauthorized_code": refused,
+        "stage1_business_stop_drove": driven1,
+        "stage2_a_own_stop_active": a_own,
+        "stage2_platform_stop_active": plat,
+        "stage2_pass_drove": [h.business_id for h in report2.handled],
+        "stage3_resumed_drove": sorted(
+            {"A" if h.business_id == biz_a else "B" for h in report3.handled}
+        ),
+        "final_rows": {"A": _counts(biz_a), "B": _counts(biz_b)},
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest

@@ -75,6 +75,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "durable_job_requests",
         "identity_merges",
         "recurring_schedules",
+        "business_emergency_stops",
     }
 
 
@@ -94,6 +95,8 @@ def test_platform_catalog_tables_are_excluded():
     assert "compliance_policy_approvals" not in tenant_owned_tables()
     # The DCA-078 platform-wide source removals are platform control-plane data, also outside tenant RLS.
     assert "platform_source_restrictions" not in tenant_owned_tables()
+    # The DCA-111 platform-wide emergency stop is platform control-plane data, also outside tenant RLS.
+    assert "platform_emergency_stops" not in tenant_owned_tables()
 
 
 # --- Postgres-backed RLS behaviour ----------------------------------------------------------------
@@ -445,6 +448,67 @@ def test_recurring_schedule_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_SCHEDULE, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_BUSINESS_STOP = (
+    "INSERT INTO business_emergency_stops "
+    "(id, business_id, version, state, authority_plane, authority_scope, authorized_by, "
+    "authorized_by_type, reason, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'active', 'business', 'emergency.stop', 'admin-1', "
+    "'user', 'manual_pause', now())"
+)
+
+
+@requires_pg
+def test_business_emergency_stop_is_tenant_isolated(rls_db):
+    """DCA-111 — a per-business emergency stop is tenant-owned: each tenant can read only its OWN stop
+    rows (RLS on real Postgres), so one business can never see or infer another's pause state."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_BUSINESS_STOP, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_BUSINESS_STOP, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM business_emergency_stops").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM business_emergency_stops").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_business_emergency_stop_write_check_rejects_foreign_owner(rls_db):
+    """A per-business stop can never be stamped for another tenant: writing a B-owned row while scoped to
+    A violates the WITH CHECK clause (defence-in-depth beneath the store's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_BUSINESS_STOP, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_platform_emergency_stop_is_separate_from_the_app_role(rls_db):
+    # The platform-wide stop is control-plane data (like platform_source_restrictions): it is NOT
+    # granted to the app role, so a tenant-plane connection cannot even read it.
+    conn = _app_conn()
+    try:
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute("SELECT count(*) FROM platform_emergency_stops").fetchone()
         conn.rollback()
     finally:
         conn.close()

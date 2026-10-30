@@ -3229,3 +3229,152 @@ class RecurringSchedule(TenantOwned, Base):
     actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class EmergencyStopState(str, Enum):
+    """DCA-111 — the effective state a hierarchical emergency-stop ledger event records.
+
+    An emergency stop is a KILL SWITCH over the DCA's own background-work machinery. Its two ledgers
+    (platform-wide and per-business) are append-only: each set/clear inserts a NEW version, and the
+    CURRENT effective state for a scope is the latest version's ``state`` — so the switch is toggled
+    without ever deleting history (the story's "without deleting existing records").
+
+    - ``ACTIVE`` — the stop is ON: while this is the latest state for the scope, affected background
+      work is PAUSED (no durable job is claimed/advanced, no due schedule is enqueued for the covered
+      business(es)), and any future send/execution is blocked (execution stays a disabled future
+      capability regardless).
+    - ``LIFTED`` — the stop was CLEARED: the scope is resumed (unless a higher scope still dominates — a
+      platform-wide stop dominates every per-business state).
+    """
+
+    ACTIVE = "active"
+    LIFTED = "lifted"
+
+
+class BusinessEmergencyStop(TenantOwned, Base):
+    """DCA-111 — a PER-BUSINESS emergency stop, VERSIONED (tenant-owned, RLS).
+
+    One row is ONE version of a business administrator's decision to PAUSE (or RESUME) all of that
+    business's DCA background work — the lower tier of the hierarchical kill switch. It is the
+    business-plane counterpart of the control-plane :class:`PlatformEmergencyStop`: recorded in the same
+    append-only emergency-stop ledger with authority/version metadata, but scoped to one tenant and
+    governing only that tenant's work.
+
+    The load-bearing guarantees (the DCA-111 acceptance criteria):
+
+    - **A per-business stop affects only that business.** This row is tenant-owned (carries
+      ``business_id``, RLS-protected), so a stop placed for one business pauses ONLY that business's
+      background work; an unrelated, un-stopped business keeps running normally (the acceptance's
+      "unrelated allowed business work can continue"). The PLATFORM-WIDE stop, which dominates every
+      business, is the separate :class:`PlatformEmergencyStop` — it is strictly above this tier in the
+      hierarchy, so a platform stop halts this business even when its own latest state is ``LIFTED``.
+
+    - **Setting/clearing requires the appropriate authority, and a denial changes nothing.** This is the
+      BUSINESS kind: it stamps ``authority_plane = business`` and may only be written by a business
+      administrator holding :attr:`~app.identity.permissions.Scope.EMERGENCY_STOP` (a read-only viewer
+      and an ordinary acting user lack it; a platform operator holds no membership, so their global
+      rights never set a client's business stop). The single sanctioned writer
+      (:class:`~app.services.emergency_stop.BusinessEmergencyStopStore`) checks authority FIRST, so a
+      refused set/clear stages no row and leaves the current effective state untouched.
+
+    **Versioned, insert-only history.** Each set/clear inserts a NEW version at ``max(version) + 1`` for
+    this business; the CURRENT effective stop state is the latest version's ``state``. A who/when/why
+    DCA-026 audit entry is staged in the SAME unit of work (atomic audit). It holds only opaque control
+    metadata — no prospect contact data and no secrets. A stop only ever makes the agent do LESS; it
+    authorizes nothing and sends nothing (the DCA has no send path).
+    """
+
+    __tablename__ = "business_emergency_stops"
+    # One version ordinal per business: the same business's next set/clear is max(version)+1; two tenants
+    # may hold the same version number without colliding.
+    __table_args__ = (tenant_unique("version", name="uq_business_emergency_stop_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # 1-based version ordinal within this business; a new set/clear is max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # active (paused) | lifted (resumed) — the effective state AFTER this event; the latest version's
+    # state is the business's current effective stop state.
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    # Always 'business' for a per-business stop — the authority plane recorded on the row.
+    authority_plane: Mapped[str] = mapped_column(
+        String(16),
+        default=RestrictionAuthorityPlane.BUSINESS.value,
+        server_default=RestrictionAuthorityPlane.BUSINESS.value,
+    )
+    # The explicit business scope the administrator held (e.g. "emergency.stop").
+    authority_scope: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHO set/cleared the stop — an opaque subject id (never a name/email) plus its kind.
+    authorized_by: Mapped[str] = mapped_column(String(128))
+    authorized_by_type: Mapped[str] = mapped_column(
+        String(32), default="user", server_default="user"
+    )
+    # A short opaque reason code / explanation (required by the store; screened like an audit reference).
+    reason: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PlatformEmergencyStop(Base):
+    """DCA-111 — the PLATFORM-WIDE emergency stop, VERSIONED (control-plane, NOT tenant-owned).
+
+    One row is ONE version of a platform operator's decision to PAUSE (or RESUME) ALL DCA background
+    work across every tenant — the TOP tier of the hierarchical kill switch, which DOMINATES every
+    per-business :class:`BusinessEmergencyStop`. It is the platform-plane counterpart of the tenant-owned
+    business stop: recorded in the same append-only emergency-stop ledger with authority/version
+    metadata, but on the platform control plane with no single business scope.
+
+    The load-bearing guarantees (the DCA-111 acceptance criteria):
+
+    - **The platform stop dominates the whole hierarchy.** While the latest platform-stop state is
+      ``ACTIVE`` the worker claims/advances NO tenant's durable jobs and enqueues NO due schedule for ANY
+      business — regardless of each business's own latest state. Clearing it (``LIFTED``) resumes every
+      business EXCEPT those still paused by their own per-business stop. It is control-plane (NOT
+      tenant-owned, carries no ``business_id`` and is OUTSIDE tenant RLS, like
+      :class:`PlatformSourceRestriction`).
+
+    - **Setting/clearing requires platform authority, and a denial changes nothing.** This is the
+      PLATFORM kind: it stamps ``authority_plane = platform`` and may only be written by a platform
+      operator holding :attr:`~app.identity.permissions.Scope.PLATFORM_EMERGENCY_STOP`. A business
+      administrator holds only business-plane scopes, so their roles never authorize a platform-wide stop
+      — it is refused before any state is touched. The single sanctioned writer
+      (:class:`~app.services.emergency_stop.PlatformEmergencyStopStore`) checks authority FIRST and
+      requires a non-empty ``reason``, so a refused set/clear stages no row.
+
+    **Versioned, insert-only history.** Each set/clear inserts a NEW version at ``max(version) + 1`` for
+    the fixed platform ``scope_key``; the CURRENT effective platform state is the latest version's
+    ``state``. The row itself is the durable who/when/why record (like the DCA-050 revocation and the
+    DCA-078 platform source removal), so there is no separate tenant audit entry — the audit sink is
+    tenant-scoped and a platform-wide action has no single business scope. It holds only opaque
+    control-plane metadata — no prospect contact data and no secrets. A stop only ever makes the agent do
+    LESS; it authorizes nothing and sends nothing (the DCA has no send path).
+    """
+
+    __tablename__ = "platform_emergency_stops"
+    # A version is unique per scope_key across the platform (there is one logical platform scope).
+    __table_args__ = (
+        UniqueConstraint("scope_key", "version", name="uq_platform_emergency_stop_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The single logical platform scope this ledger versions. Fixed to 'platform' (there is one
+    # platform-wide switch); carried as a column so versioning is uniform with the other ledgers.
+    scope_key: Mapped[str] = mapped_column(
+        String(32), default="platform", server_default="platform"
+    )
+    # 1-based version ordinal within scope_key; a new set/clear is max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # active (paused) | lifted (resumed) — the effective state AFTER this event; the latest version's
+    # state is the platform's current effective stop state.
+    state: Mapped[str] = mapped_column(String(16), index=True)
+    # Always 'platform' for a platform-wide stop — the authority plane recorded on the row.
+    authority_plane: Mapped[str] = mapped_column(
+        String(16),
+        default=RestrictionAuthorityPlane.PLATFORM.value,
+        server_default=RestrictionAuthorityPlane.PLATFORM.value,
+    )
+    # The explicit platform scope the operator held (e.g. "platform.emergency.stop").
+    authority_scope: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHO set/cleared the stop — an opaque operator subject id (never a name/email).
+    authorized_by: Mapped[str] = mapped_column(String(128))
+    # A short opaque reason code / explanation (required by the store).
+    reason: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

@@ -88,6 +88,16 @@ class Scope(str, Enum):
     # rights alone. Storing a schedule runs nothing and sends nothing (the DCA has no send path);
     # advancing a due schedule and enqueuing its cycle stays a separate, disabled future capability.
     SCHEDULE_MANAGE = "schedule.manage"
+    # set or clear a PER-BUSINESS emergency stop — a kill switch that pauses the DCA's background work
+    # (claiming/advancing durable jobs, enqueuing due schedules) for ONE of this business's own agent
+    # (DCA-111). An ADMINISTRATOR scope: pausing all of a business's agent work is a sensitive
+    # operational decision, so an ordinary acting user and a read-only viewer both lack it — only a
+    # business administrator holds it. It is a business-plane scope, so a platform operator (holding no
+    # membership) can never set a client's business stop with their global rights alone; the
+    # PLATFORM-WIDE stop (which dominates every business) is the separate platform scope below, never
+    # this one. Setting a stop only ever makes the agent do LESS; it grants nothing and sends nothing
+    # (the DCA has no send path — a disabled future capability regardless).
+    EMERGENCY_STOP = "emergency.stop"
 
     # --- platform plane (granted to platform operators only) ---
     PLATFORM_OPS_READ = "platform.ops.read"  # operator: read platform-wide operational state
@@ -120,6 +130,16 @@ class Scope(str, Enum):
     # (``platform.ops.read``) never implies the authority to MUTATE a job's lifecycle, and a business
     # administrator (holding only business-plane scopes) can never requeue a job in any tenant.
     JOB_DEADLETTER_REQUEUE = "platform.job.deadletter.requeue"
+    # operator: set or clear the PLATFORM-WIDE emergency stop — the top of the hierarchical kill switch
+    # (DCA-111). A PLATFORM action on the DCA's OWN background-work machinery that DOMINATES every
+    # business: while it is active no tenant's durable jobs are claimed/advanced and no due schedule is
+    # enqueued, regardless of any per-business stop. The durable job queue is operational infrastructure,
+    # so pausing it platform-wide is a platform-operations decision, never a tenant-admin right. Kept on
+    # the platform plane and distinct from the per-business ``emergency.stop`` business scope precisely so
+    # a business administrator (holding only business-plane scopes) can only pause its OWN agent and can
+    # never pause the platform or another tenant. A stop grants nothing and sends nothing (the DCA has no
+    # send path — a disabled future capability regardless).
+    PLATFORM_EMERGENCY_STOP = "platform.emergency.stop"
 
 
 # Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
@@ -139,6 +159,8 @@ _ADMIN_SCOPES = frozenset(
         Scope.BUDGET_MANAGE,
         # configuring the agent's recurring-schedule cadence is an administrator action (DCA-107).
         Scope.SCHEDULE_MANAGE,
+        # pausing (or resuming) all of a business's own agent work is an administrator action (DCA-111).
+        Scope.EMERGENCY_STOP,
     }
 )
 # The scopes an ordinary acting (non-admin, non-viewer) business user holds.
@@ -176,6 +198,7 @@ PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
             Scope.POLICY_RULEPACK_APPROVE,
             Scope.PLATFORM_SOURCE_RESTRICT,
             Scope.JOB_DEADLETTER_REQUEUE,
+            Scope.PLATFORM_EMERGENCY_STOP,
         }
     ),
 }
