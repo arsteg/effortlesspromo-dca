@@ -16398,6 +16398,225 @@ def _dca_105(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-106",
+    "recover abandoned job leases: in an isolated synthetic Business A, CLAIM a fixture then simulate a "
+    "worker CRASH (the lease lapses), advance time, and run the RECOVERY SWEEP. Shows the acceptance on "
+    "real rows: the abandoned RUNNING lease is reset to QUEUED under a BUMPED fencing token (the crashed "
+    "holder fenced off) and made due again; the crashed worker's later COMMIT is refused as a STALE_LEASE "
+    "(its old process cannot commit); and ANOTHER worker claims the recovered job and completes it to "
+    "SUCCEEDED — the work was not lost. Then the relevant no-ops/denials, each changing NOTHING: a LIVE "
+    "lease is not swept (and its holder can still commit), a job whose crash EXHAUSTED its attempt budget "
+    "is DEAD-LETTERED (not resurrected past the cap), a cross-tenant sweep recovers nothing, and an empty "
+    "sweep changes nothing. Local synthetic; no AI/paid action, no network, no send. The concurrent-sweep "
+    "FOR UPDATE SKIP LOCKED safety is proven on disposable PostgreSQL in the focused tests.",
+)
+def _dca_106(ctx: CheckContext) -> dict:
+    """Drive the DCA-106 recovery sweep directly against the ephemeral synthetic DB and print the real
+    rows (status, fence token, lease fields, last_error) and every denial — never a bare PASS.
+
+    Note: a SQLite ephemeral DB cannot exercise ``FOR UPDATE`` / concurrency; this scenario drives the
+    recovery LOGIC serially. The two-concurrent-sweeps race across short transactions runs on a disposable
+    PostgreSQL in ``tests/test_job_lease_recovery.py`` (``DCA_TEST_DATABASE_URL``). Recovery makes work
+    claimable again; NO job is ever executed (execution stays a disabled future capability)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import DurableJobRequest, JobRequestStatus
+    from app.jobs.claim import JobClaimStore
+    from app.jobs.complete import JobCompletionOutcome, JobCompletionStore
+    from app.jobs.recovery import (
+        RECOVERY_EXHAUSTED_NOTE,
+        RECOVERY_NOTE,
+        JobLeaseRecoveryStore,
+        LeaseRecoveryOutcome,
+    )
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+
+    biz_a = "11111111-1111-1111-1111-11111111a106"
+    biz_b = "22222222-2222-2222-2222-22222222a106"
+    now = datetime.now(UTC)
+    later = now + timedelta(seconds=120)  # past the 60s lease -> the claim is abandoned
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b}
+
+    def _enqueue(key: str, *, max_attempts: int = 5) -> str:
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, biz_a).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                    max_attempts=max_attempts,
+                ),
+                now=now,
+            )
+            session.commit()
+            return row.id
+
+    def _show(job_id: str) -> str:
+        with ctx.session_factory() as session:
+            row = session.get(DurableJobRequest, job_id)
+            return (
+                f"status={row.status} fence={row.lease_version} "
+                f"attempt={row.attempt_count}/{row.max_attempts} owner={row.lease_owner} "
+                f"lastError={row.last_error} resultRef={row.result_ref}"
+            )
+
+    # --- 1) claim then CRASH, advance time, and RECOVER the abandoned lease ------------------------
+    job_id = _enqueue("job-recover")
+    with ctx.session_factory() as session:
+        crashed = JobClaimStore(session, biz_a).claim_next("worker-1", now=now, lease_seconds=60)
+    assert crashed is not None
+    print("\n1) worker-1 claimed a job, then 'crashed' (lease left to lapse):")
+    print(f"   after claim:  {_show(job_id)}  (fence={crashed.fence_token})")
+
+    with ctx.session_factory() as session:
+        report = JobLeaseRecoveryStore(session, biz_a).recover_abandoned(now=later)
+    rec = report.recovered[0]
+    print(f"   after sweep:  {_show(job_id)}")
+    print(
+        f"   recovered: outcome={rec.outcome.value} priorOwner={rec.prior_lease_owner} "
+        f"fence {rec.prior_fence_token} -> {rec.fence_token} (crashed holder fenced off)"
+    )
+
+    # --- 2) the crashed worker cannot commit; another worker completes it --------------------------
+    with ctx.session_factory() as session:
+        stale = JobCompletionStore(session, biz_a).complete(
+            job_id,
+            "worker-1",
+            crashed.fence_token,
+            now=later + timedelta(seconds=1),
+            result_ref="dca-result://synthetic/stale",
+        )
+        session.commit()
+    print(
+        "\n2) the crashed worker-1 tries to commit with its OLD lease -> refused, nothing changes:"
+    )
+    print(f"   completion outcome={stale.outcome.value} committed={stale.committed}")
+    print(f"   row still: {_show(job_id)}")
+
+    with ctx.session_factory() as session:
+        reclaim = JobClaimStore(session, biz_a).claim_next(
+            "worker-2", now=later + timedelta(seconds=2), lease_seconds=300
+        )
+    assert reclaim is not None
+    with ctx.session_factory() as session:
+        done = JobCompletionStore(session, biz_a).complete(
+            job_id,
+            "worker-2",
+            reclaim.fence_token,
+            now=later + timedelta(seconds=3),
+            result_ref="dca-result://synthetic/done",
+        )
+        session.commit()
+    print(
+        "\n3) another worker-2 claims the recovered job and completes it (the work was NOT lost):"
+    )
+    print(f"   reclaim fence={reclaim.fence_token} attempt={reclaim.attempt_count}")
+    print(f"   completion outcome={done.outcome.value} committed={done.committed}")
+    print(f"   row now: {_show(job_id)}")
+
+    denials: dict = {}
+
+    # --- (a) a LIVE lease is not swept, and its holder can still commit ----------------------------
+    live_id = _enqueue("job-live")
+    with ctx.session_factory() as session:
+        live_claim = JobClaimStore(session, biz_a).claim_next(
+            "worker-live", now=now, lease_seconds=300
+        )
+    assert live_claim is not None
+    with ctx.session_factory() as session:
+        live_report = JobLeaseRecoveryStore(session, biz_a).recover_abandoned(
+            now=now + timedelta(seconds=10)
+        )
+    with ctx.session_factory() as session:
+        live_done = JobCompletionStore(session, biz_a).complete(
+            live_id, "worker-live", live_claim.fence_token, now=now + timedelta(seconds=20)
+        )
+        session.commit()
+    denials["live_lease_not_swept"] = {
+        "swept": live_report.total,
+        "holder_still_commits": live_done.committed,
+    }
+
+    # --- (b) a crash that EXHAUSTED the attempt budget is DEAD-LETTERED, not resurrected -----------
+    exh_id = _enqueue("job-exhausted", max_attempts=1)
+    with ctx.session_factory() as session:
+        JobClaimStore(session, biz_a).claim_next("worker-x", now=now, lease_seconds=60)
+    with ctx.session_factory() as session:
+        exh_report = JobLeaseRecoveryStore(session, biz_a).recover_abandoned(now=later)
+    exh_rec = exh_report.recovered[0]
+    denials["exhausted_dead_lettered"] = {
+        "outcome": exh_rec.outcome.value,
+        "status_after": _row_status(ctx, exh_id),
+        "fence": exh_rec.fence_token,
+    }
+
+    # --- (c) a cross-tenant sweep (Business B) recovers nothing of A's ------------------------------
+    cross_id = _enqueue("job-cross")
+    with ctx.session_factory() as session:
+        JobClaimStore(session, biz_a).claim_next("worker-c", now=now, lease_seconds=60)
+    with ctx.session_factory() as session:
+        cross_report = JobLeaseRecoveryStore(session, biz_b).recover_abandoned(now=later)
+    denials["cross_tenant_recovers_nothing"] = {
+        "swept_by_b": cross_report.total,
+        "a_status_after": _row_status(ctx, cross_id),
+    }
+
+    # --- (d) an empty sweep (a scope with no abandoned leases) changes nothing ---------------------
+    # Business B owns no jobs at all, so its sweep is a clean empty run.
+    with ctx.session_factory() as session:
+        empty_scope = JobLeaseRecoveryStore(session, biz_b).recover_abandoned(now=later)
+    denials["empty_sweep_changes_nothing"] = {
+        "b_scope_total": empty_scope.total,
+        "b_scope_changed": empty_scope.changed,
+    }
+
+    print("\n4) the relevant no-ops / denials (each changing nothing):")
+    for label, d in denials.items():
+        print(f"   - {label:<30} {d}")
+
+    checks = {
+        "abandoned_lease_recovered_new_fence": (
+            rec.outcome is LeaseRecoveryOutcome.RECOVERED
+            and rec.fence_token == rec.prior_fence_token + 1
+            and _row_status(ctx, job_id) == JobRequestStatus.SUCCEEDED.value
+        ),
+        "crashed_worker_commit_refused": stale.outcome is JobCompletionOutcome.STALE_LEASE
+        and stale.committed is False,
+        "another_worker_completed_the_work": done.committed is True,
+        "recovered_note_stamped": RECOVERY_NOTE == "lease_recovered_after_abandonment",
+        "live_lease_untouched_holder_commits": denials["live_lease_not_swept"]
+        == {"swept": 0, "holder_still_commits": True},
+        "exhausted_dead_lettered": denials["exhausted_dead_lettered"]["outcome"]
+        == LeaseRecoveryOutcome.DEAD_LETTERED_EXHAUSTED.value
+        and denials["exhausted_dead_lettered"]["status_after"]
+        == JobRequestStatus.DEAD_LETTER.value,
+        "exhausted_note_stamped": RECOVERY_EXHAUSTED_NOTE == "lease_recovery_attempts_exhausted",
+        "cross_tenant_recovers_nothing": denials["cross_tenant_recovers_nothing"]["swept_by_b"] == 0
+        and denials["cross_tenant_recovers_nothing"]["a_status_after"]
+        == JobRequestStatus.RUNNING.value,
+        "empty_scope_sweep_changes_nothing": denials["empty_sweep_changes_nothing"]
+        == {"b_scope_total": 0, "b_scope_changed": False},
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-106 adds a RECOVERY SWEEP "
+        "that finds RUNNING rows whose lease has LAPSED — a crashed/stalled worker — and safely makes the "
+        "work retryable again under a NEW fence: the row is reset to QUEUED (or DEAD_LETTER once its "
+        "attempt budget is spent) with a bumped fencing token, so the crashed process can never later "
+        "commit, renew or fail the job, while the work itself is not lost. A LIVE lease and other tenants' "
+        "rows are never swept. Recovery makes work claimable but EXECUTES nothing — execution stays a "
+        "disabled future capability, the DCA has no send path, and acceptance of a prospect is not "
+        "recipient consent.)"
+    )
+    out["job_id"] = job_id
+    out["recovered"] = {"outcome": rec.outcome.value, "fence": rec.fence_token}
+    out["denials"] = denials
+    out["checks"] = checks
+    return out
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
