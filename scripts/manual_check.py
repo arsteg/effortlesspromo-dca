@@ -16134,6 +16134,279 @@ def _dca_104(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-105",
+    "inspect and requeue a dead-letter job: in an isolated synthetic Business A, DEAD-LETTER a fixture "
+    "(claim it, then report a PERMANENT policy failure), INSPECT its PII-safe safe-reason detail, and have "
+    "an AUTHORIZED platform operator REQUEUE it once. Shows the acceptance on real rows: the SAME row flips "
+    "DEAD_LETTER -> QUEUED in place, PRESERVING its logical side-effect identity (row id + (job_type, "
+    "idempotency_key) dedup key + payload pointer/digest), with the attempt budget reset and a who/when/why "
+    "audit entry staged atomically; the revived job is claimable again but is NEVER executed. Then the "
+    "relevant denials, each changing NOTHING: a tenant administrator (no platform scope) is REFUSED, a "
+    "non-dead-letter job is NOT_DEAD_LETTER, a SECOND requeue is an idempotent no-op, a cross-tenant "
+    "operator is NOT_FOUND, and a missing / PII-bearing reason is refused before the flip. Local synthetic; "
+    "no AI/paid action, no network, no send. The no-double-revive race across short transactions is proven "
+    "on disposable PostgreSQL in the focused tests.",
+)
+def _dca_105(ctx: CheckContext) -> dict:
+    """Drive the DCA-105 operator inspect/requeue path directly against the ephemeral synthetic DB and
+    print the real rows (status, attempt counts, preserved identity, the staged audit entry) and every
+    denial — never a bare PASS.
+
+    Note: a SQLite ephemeral DB cannot exercise ``FOR UPDATE`` / concurrency; this scenario drives the
+    inspect/requeue LOGIC serially. The no-double-revive case across short transactions runs on a
+    disposable PostgreSQL in ``tests/test_job_deadletter.py`` (``DCA_TEST_DATABASE_URL``). Reviving a job
+    makes it claimable; NO job is ever executed (execution stays a disabled future capability)."""
+    import random
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import AuditEvent, DurableJobRequest, JobRequestStatus
+    from app.identity.permissions import PLATFORM_OPERATOR_ROLE
+    from app.jobs.claim import JobClaimStore
+    from app.jobs.deadletter import (
+        AUDIT_ACTION_REQUEUE,
+        JobDeadLetterStore,
+        JobRequeueAuthorizationError,
+        JobRequeueError,
+        RequeueOutcome,
+        RequeuePrincipal,
+    )
+    from app.jobs.retry import FailureSignal, JobFailureCategory, JobRetryScheduler
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+
+    biz_a = "11111111-1111-1111-1111-11111111a105"
+    biz_b = "22222222-2222-2222-2222-22222222a105"
+    now = datetime.now(UTC)
+    requeue_at = now + timedelta(hours=1)
+
+    operator = RequeuePrincipal(subject="op-105-0001", roles=(PLATFORM_OPERATOR_ROLE,))
+    # A tenant administrator holds only business-plane scopes — never a platform scope.
+    business_admin = RequeuePrincipal(subject="admin-105-0001", roles=("admin", "owner"))
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b}
+
+    def _dead_letter(key: str) -> str:
+        """Enqueue → claim → report a PERMANENT failure, leaving the job parked in DEAD_LETTER."""
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, biz_a).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                    payload_metadata={"priority": "normal"},
+                    max_attempts=5,
+                ),
+                now=now,
+            )
+            session.commit()
+            job_id = row.id
+        with ctx.session_factory() as session:
+            claim = JobClaimStore(session, biz_a).claim_next("worker-1", now=now, lease_seconds=600)
+        with ctx.session_factory() as session:
+            JobRetryScheduler(session, biz_a).record_failure(
+                job_id,
+                "worker-1",
+                claim.fence_token,
+                FailureSignal(JobFailureCategory.POLICY_DENIED, error_note="rulepack_denied"),
+                now=now + timedelta(seconds=5),
+                rng=random.Random(7),
+            )
+        return job_id
+
+    def _show(job_id: str) -> str:
+        with ctx.session_factory() as session:
+            row = session.get(DurableJobRequest, job_id)
+            return (
+                f"status={row.status} attempt={row.attempt_count}/{row.max_attempts} "
+                f"key={row.idempotency_key} digest={row.payload_digest[:12]}… "
+                f"owner={row.lease_owner} lastError={row.last_error}"
+            )
+
+    # --- DEAD-LETTER four fixtures up front (each claimed-alone, so the real claim path targets it) --
+    # Creating them back-to-back keeps every prior fixture terminal (DEAD_LETTER, not claimable) while
+    # the next is claimed, so claim_next always picks the just-enqueued job (no lingering QUEUED row to
+    # be mis-claimed). The primary fixture is revived; the other three back the denials.
+    job_id = _dead_letter("job-requeue")
+    dl_admin = _dead_letter("job-admin-denied")
+    dl_cross = _dead_letter("job-cross")
+    dl_noreason = _dead_letter("job-noreason")
+
+    # --- INSPECT the parked primary fixture's safe reason -----------------------------------------
+    with ctx.session_factory() as session:
+        detail = JobDeadLetterStore(session, biz_a).inspect(job_id, operator)
+    print("\n1) dead-lettered a fixture, then INSPECTED it (PII-safe detail — no payload exposed):")
+    print(
+        f"   jobId={detail.job_id} status={detail.status} isDeadLetter={detail.is_dead_letter} "
+        f"safeReason={detail.last_error!r}"
+    )
+    print(
+        f"   logical identity: jobType={detail.job_type} idempotencyKey={detail.idempotency_key!r} "
+        f"payloadRef={detail.payload_ref!r}  attempt={detail.attempt_count}/{detail.max_attempts}"
+    )
+
+    # --- the AUTHORIZED operator REQUEUES it once (identity preserved in place) --------------------
+    with ctx.session_factory() as session:
+        row = session.get(DurableJobRequest, job_id)
+        identity_before = (row.id, row.job_type, row.idempotency_key, row.payload_digest)
+    with ctx.session_factory() as session:
+        result = JobDeadLetterStore(session, biz_a).requeue(
+            job_id, operator, reason="fixed_payload_retry", now=requeue_at
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        row = session.get(DurableJobRequest, job_id)
+        identity_after = (row.id, row.job_type, row.idempotency_key, row.payload_digest)
+        audit = session.scalars(
+            select(AuditEvent).where(AuditEvent.action == AUDIT_ACTION_REQUEUE)
+        ).all()
+    print("\n2) AUTHORIZED operator REQUEUED the parked job (SAME row revived in place):")
+    print(
+        f"   outcome={result.outcome.value} changed={result.changed} "
+        f"priorStatus={result.prior_status} -> status={result.status} "
+        f"attempt {result.prior_attempt_count} -> {result.attempt_count} (budget reset)"
+    )
+    print(f"   row now: {_show(job_id)}")
+    print(
+        f"   logical identity preserved (id, jobType, key, digest): {identity_before == identity_after}"
+    )
+    print(
+        f"   atomic audit entries ({len(audit)}): action={audit[0].action} actor={audit[0].actor_id} "
+        f"actorType={audit[0].actor_type} reason={audit[0].reason!r} "
+        f"authorityScope={audit[0].references.get('authorityScope')}"
+    )
+
+    denials: dict = {}
+
+    # A SECOND requeue of the already-revived job (now QUEUED) -> idempotent no-op (NOT_DEAD_LETTER).
+    with ctx.session_factory() as session:
+        r = JobDeadLetterStore(session, biz_a).requeue(
+            job_id, operator, reason="again", now=requeue_at + timedelta(minutes=1)
+        )
+        session.commit()
+    denials["second_requeue"] = {"outcome": r.outcome.value, "changed": r.changed}
+
+    # Prove the revived job is CLAIMABLE again — but executes NOTHING (it is only leased). At this point
+    # it is the only claimable QUEUED row (the three denial fixtures are terminal DEAD_LETTER).
+    with ctx.session_factory() as session:
+        reclaim = JobClaimStore(session, biz_a).claim_next(
+            "worker-9", now=requeue_at + timedelta(minutes=2), lease_seconds=600
+        )
+    print(
+        f"\n3) a SECOND requeue is an idempotent no-op ({denials['second_requeue']['outcome']}); the "
+        f"revived job is then claimable again: reclaimed="
+        f"{reclaim is not None and reclaim.job_id == job_id} "
+        f"(leased to a worker, NOT executed — execution stays a disabled future capability)"
+    )
+
+    # --- the relevant DENIALS (each refused / no-op, NOTHING changes) ------------------------------
+    # (a) a tenant administrator holds no platform scope -> refused before any state is touched.
+    with ctx.session_factory() as session:
+        try:
+            JobDeadLetterStore(session, biz_a).requeue(
+                dl_admin, business_admin, reason="trying", now=requeue_at
+            )
+            denials["business_admin"] = {"refused": False, "code": None}
+        except JobRequeueAuthorizationError as exc:
+            session.rollback()
+            denials["business_admin"] = {"refused": True, "code": exc.code}
+    denials["business_admin"]["status_after"] = _row_status(ctx, dl_admin)
+
+    # (b) a non-dead-letter (still QUEUED) job -> NOT_DEAD_LETTER, untouched.
+    with ctx.session_factory() as session:
+        q_row, _ = JobRequestStore(session, biz_a).enqueue(
+            JobEnqueueRequest(
+                job_type="prospect.research",
+                idempotency_key="job-still-queued",
+                payload_ref="dca-payload://synthetic/job-still-queued",
+            ),
+            now=now,
+        )
+        session.commit()
+        queued_id = q_row.id
+    with ctx.session_factory() as session:
+        r = JobDeadLetterStore(session, biz_a).requeue(
+            queued_id, operator, reason="x", now=requeue_at
+        )
+        session.commit()
+    denials["not_dead_letter"] = {"outcome": r.outcome.value, "changed": r.changed}
+
+    # (c) a cross-tenant operator (Business B) -> NOT_FOUND, changes nothing.
+    with ctx.session_factory() as session:
+        r = JobDeadLetterStore(session, biz_b).requeue(
+            dl_cross, operator, reason="x", now=requeue_at
+        )
+        session.commit()
+    denials["cross_tenant"] = {
+        "outcome": r.outcome.value,
+        "changed": r.changed,
+        "status_after": _row_status(ctx, dl_cross),
+    }
+
+    # (d) a missing reason -> refused before the flip.
+    with ctx.session_factory() as session:
+        try:
+            JobDeadLetterStore(session, biz_a).requeue(
+                dl_noreason, operator, reason="  ", now=requeue_at
+            )
+            denials["missing_reason"] = {"refused": False, "code": None}
+        except JobRequeueError as exc:
+            session.rollback()
+            denials["missing_reason"] = {"refused": True, "code": exc.code}
+    denials["missing_reason"]["status_after"] = _row_status(ctx, dl_noreason)
+
+    print("\n4) the relevant denials (each refused / no-op, nothing changes):")
+    for label, d in denials.items():
+        print(f"   - {label:<18} {d}")
+
+    checks = {
+        "requeued_in_place_identity_preserved": (
+            result.changed
+            and result.outcome is RequeueOutcome.REQUEUED
+            and identity_before == identity_after
+            and result.attempt_count == 0
+        ),
+        "revived_job_is_claimable_again": reclaim is not None and reclaim.job_id == job_id,
+        "one_atomic_audit_entry": len(audit) == 1
+        and audit[0].references.get("authorityScope") == "platform.job.deadletter.requeue",
+        "business_admin_refused": denials["business_admin"]["refused"] is True
+        and denials["business_admin"]["status_after"] == JobRequestStatus.DEAD_LETTER.value,
+        "non_dead_letter_refused": denials["not_dead_letter"]
+        == {"outcome": "not_dead_letter", "changed": False},
+        "second_requeue_is_no_op": denials["second_requeue"]
+        == {"outcome": "not_dead_letter", "changed": False},
+        "cross_tenant_not_found": denials["cross_tenant"]["outcome"] == "not_found"
+        and denials["cross_tenant"]["status_after"] == JobRequestStatus.DEAD_LETTER.value,
+        "missing_reason_refused": denials["missing_reason"]["refused"] is True
+        and denials["missing_reason"]["status_after"] == JobRequestStatus.DEAD_LETTER.value,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-105 lets an AUTHORIZED "
+        "platform operator INSPECT a dead-lettered job's safe reason and REQUEUE it: the SAME row flips "
+        "DEAD_LETTER -> QUEUED in place, preserving its logical side-effect identity (row id + dedup key "
+        "+ payload pointer/digest) so the revived job is the same logical unit of work, with a who/when/why "
+        "audit entry staged atomically. A tenant administrator / non-operator, a non-dead-letter job, a "
+        "second requeue, a cross-tenant operator and a missing/PII reason are each refused with no state "
+        "change. Reviving a job makes it claimable but EXECUTES nothing — execution stays a disabled future "
+        "capability, the DCA has no send path, and acceptance of a prospect is not recipient consent.)"
+    )
+    out["job_id"] = job_id
+    out["denials"] = denials
+    out["checks"] = checks
+    return out
+
+
+def _row_status(ctx: CheckContext, job_id: str) -> str:
+    """The current status of one durable job row (manual-check helper)."""
+    from app.db.models import DurableJobRequest
+
+    with ctx.session_factory() as session:
+        row = session.get(DurableJobRequest, job_id)
+        return row.status if row is not None else "<missing>"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

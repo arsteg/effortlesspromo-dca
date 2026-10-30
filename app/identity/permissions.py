@@ -105,6 +105,13 @@ class Scope(str, Enum):
     # business administrator can never perform it — a tenant may only place a LOCAL restriction
     # (the ``processing.restrict`` business scope above), never a platform-wide one.
     PLATFORM_SOURCE_RESTRICT = "platform.source.restrict"
+    # operator: requeue a DEAD-LETTERED durable job for another attempt (DCA-105). A PLATFORM action on
+    # the DCA's own background-work machinery — the durable job queue is operational infrastructure, so
+    # recovering a parked job is a platform-operations decision, never a tenant-admin right. Kept on the
+    # platform plane and distinct from the read scope above precisely so that reading platform ops
+    # (``platform.ops.read``) never implies the authority to MUTATE a job's lifecycle, and a business
+    # administrator (holding only business-plane scopes) can never requeue a job in any tenant.
+    JOB_DEADLETTER_REQUEUE = "platform.job.deadletter.requeue"
 
 
 # Business roles → the scopes they grant. Explicit and additive; an administrator is simply a role
@@ -158,6 +165,7 @@ PLATFORM_ROLE_SCOPES: dict[str, frozenset[Scope]] = {
             Scope.SOURCE_TERMS_REVOKE,
             Scope.POLICY_RULEPACK_APPROVE,
             Scope.PLATFORM_SOURCE_RESTRICT,
+            Scope.JOB_DEADLETTER_REQUEUE,
         }
     ),
 }
