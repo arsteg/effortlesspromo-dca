@@ -9041,6 +9041,285 @@ def _dca_069(ctx: CheckContext) -> dict:
 
 
 @register(
+    "DCA-070",
+    "protect user-verified field corrections: into synthetic Business A record a provider field "
+    "observation, then an AUTHORIZED user's PROTECTED correction of that field; show an UNAUTHORIZED "
+    "viewer's correction is REFUSED and stages nothing (the relevant denial); then process a NEWER "
+    "provider observation (a refresh) and compare A's and B's views. Prove the acceptance: the refresh "
+    "changes the raw provider winner yet A still sees the user's protected value "
+    "(refresh_did_not_overwrite), the correction stays business-PRIVATE (Business B, with its own "
+    "subject and no correction, sees the provider value; A's correction id reads as not-found for B), "
+    "the correction is VERSIONED (prior versions preserved), and nothing is deleted",
+)
+def _dca_070(ctx: CheckContext) -> dict:
+    """Exercise the DCA-070 correction store + overlay (manual-test step 2) on local synthetic fixtures.
+
+    Writes provider field observations and an authorized user's correction into an ephemeral synthetic
+    DB (the harness cleans it up), then runs the PURE overlay over the DCA-069 provider selection. The
+    overlay reads only what it is handed and records/mutates/deletes nothing. An unauthorized correction
+    is refused BEFORE any state is touched (the relevant denial). No AI/paid/network path.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.canonical import (
+        ORIGIN_PROVIDER_SELECTION,
+        ORIGIN_USER_CORRECTION,
+        REASON_REFRESH_DID_NOT_OVERWRITE,
+        apply_user_correction,
+        candidates_from_observations,
+        correction_from_row,
+        select_canonical,
+    )
+    from app.db.models import FieldCorrection, FieldObservation
+    from app.identity.permissions import PLATFORM_OPERATOR_ROLE
+    from app.services.field_correction import (
+        FieldCorrectionAuthorizationError,
+        FieldCorrectionInput,
+        FieldCorrector,
+        FieldCorrectionStore,
+    )
+    from app.services.field_observation import FieldObservationInput, FieldObservationStore
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0070", type=ActorType.USER)
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    field_key = "annual_revenue_inr"
+    # An AUTHORIZED acting business user (holds field.correct) and an UNauthorized read-only viewer.
+    user = FieldCorrector(subject="00000000-0000-4000-9000-0000000c0070", roles=("user",))
+    viewer = FieldCorrector(subject="00000000-0000-4000-9000-0000000c0071", roles=("viewer",))
+    operator = FieldCorrector(
+        subject="00000000-0000-4000-9000-0000000c0072", roles=(PLATFORM_OPERATOR_ROLE,)
+    )
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b, "field_key": field_key}
+
+    def _observe(session, business_id, subject, src, ver, value, observed_at):
+        FieldObservationStore(session, business_id).record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=subject,
+                field_key=field_key,
+                field_value=value,
+                inference_label="observed",
+                source_key=src,
+                source_version=ver,
+                provenance_ref="https://synthetic.registry.example/mca/record/42#revenue",
+                observed_at=observed_at,
+                scope="nationwide",
+                rights_basis="source_terms:collect+store;purpose=prospecting",
+            ),
+            actor=actor,
+        )
+
+    def _provider(session, business_id, subject):
+        obs = FieldObservationStore(session, business_id).for_subject("organization", subject)
+        return select_canonical(candidates_from_observations(obs), now=now)
+
+    # --- setup: shared source catalog + per-business subjects + A's correction --------------------
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key="mca_master_data",
+                kind="official",
+                access_method="api",
+                name="MCA Master Data",
+                india_coverage={"nationwide": True},
+            )
+        )
+        terms = SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key="mca_master_data",
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "LIC-1", "kind": "licence", "uri": "file://lic"},
+            )
+        )
+        ver = terms.version
+        subject_a = (
+            OrgObservationStore(session, biz_a)
+            .create(
+                ObservationInput(entity_type="legal_entity", display_name="Synthetic Textiles A"),
+                actor=actor,
+            )
+            .id
+        )
+        subject_b = (
+            OrgObservationStore(session, biz_b)
+            .create(
+                ObservationInput(entity_type="legal_entity", display_name="Synthetic Textiles B"),
+                actor=actor,
+            )
+            .id
+        )
+        # Both businesses observe the SAME provider value for their OWN subject.
+        _observe(
+            session, biz_a, subject_a, "mca_master_data", ver, "120000000", now - timedelta(days=30)
+        )
+        _observe(
+            session, biz_b, subject_b, "mca_master_data", ver, "120000000", now - timedelta(days=30)
+        )
+        # The authorized user corrects A's field (protected by default).
+        correction = FieldCorrectionStore(session, biz_a).record(
+            FieldCorrectionInput(
+                subject_type="organization",
+                subject_id=subject_a,
+                field_key=field_key,
+                corrected_value="155000000",
+                reason="verified_by_customer",
+            ),
+            corrector=user,
+            now=now - timedelta(days=10),
+        )
+        session.commit()
+        correction_id = correction.id
+
+    # --- the relevant DENIAL: an unauthorized correction is refused and stages nothing ------------
+    denials: dict = {}
+    for label, bad in (("read_only_viewer", viewer), ("platform_operator", operator)):
+        with ctx.session_factory() as session:
+            store = FieldCorrectionStore(session, biz_a)
+            try:
+                store.record(
+                    FieldCorrectionInput(
+                        subject_type="organization",
+                        subject_id=subject_a,
+                        field_key=field_key,
+                        corrected_value="1",
+                    ),
+                    corrector=bad,
+                    now=now,
+                )
+                denials[label] = {"refused": False}
+            except FieldCorrectionAuthorizationError as exc:
+                session.rollback()
+                denials[label] = {"refused": True, "code": exc.code}
+        with ctx.session_factory() as session:
+            # The denial staged no new correction row (A still has exactly its one correction).
+            denials[label]["corrections_after"] = len(
+                session.scalars(select(FieldCorrection)).all()
+            )
+
+    # --- the refresh: a NEWER provider observation lands for A ------------------------------------
+    with ctx.session_factory() as session:
+        _observe(
+            session, biz_a, subject_a, "mca_master_data", ver, "999000000", now - timedelta(days=1)
+        )
+        session.commit()
+
+    # --- compare A's and B's views after the refresh ----------------------------------------------
+    with ctx.session_factory() as session:
+        provider_a = _provider(session, biz_a, subject_a)
+        active_a = FieldCorrectionStore(session, biz_a).active_for_field(
+            "organization", subject_a, field_key
+        )
+        outcome_a = apply_user_correction(provider_a, correction_from_row(active_a))
+
+        provider_b = _provider(session, biz_b, subject_b)
+        active_b = FieldCorrectionStore(session, biz_b).active_for_field(
+            "organization", subject_b, field_key
+        )
+        outcome_b = apply_user_correction(provider_b, correction_from_row(active_b))
+
+        history_a = FieldCorrectionStore(session, biz_a).history_for_field(
+            "organization", subject_a, field_key
+        )
+        cross_tenant_read = FieldCorrectionStore(session, biz_b).get(correction_id)
+        total_obs = len(session.scalars(select(FieldObservation)).all())
+        total_corr = len(session.scalars(select(FieldCorrection)).all())
+
+    print("\n1) the relevant denial (unauthorized correction refused, nothing staged):")
+    for label, d in denials.items():
+        print(
+            f"   - {label:<18} refused={d['refused']} code={d.get('code')} "
+            f"corrections_after={d['corrections_after']}"
+        )
+
+    print("\n2) A's correction history (versioned, insert-only):")
+    for row in history_a:
+        print(
+            f"   - version={row.version} value={row.corrected_value} "
+            f"protected={row.protected_from_refresh} actor={row.actor_id}"
+        )
+
+    print("\n3) after the refresh, provider winner vs what each business SEES (overlay outcome):")
+    print(
+        f"   A provider winner (raw)   = {provider_a.winner.value if provider_a.winner else None}"
+    )
+    print(
+        f"   A business SEES           = {outcome_a.value}  origin={outcome_a.origin}  "
+        f"reasons={list(outcome_a.reasons)}"
+    )
+    print(
+        f"   B provider winner (raw)   = {provider_b.winner.value if provider_b.winner else None}"
+    )
+    print(f"   B active correction       = {active_b}  (business-private: B has none)")
+    print(f"   B business SEES           = {outcome_b.value}  origin={outcome_b.origin}")
+    print(f"   A's correction id for B   = {cross_tenant_read}  (cross-tenant read is not-found)")
+    print(
+        f"\n   rows after refresh: field_observations={total_obs}  field_corrections={total_corr} "
+        f"(nothing deleted)"
+    )
+
+    checks = {
+        "unauthorized_refused_no_state_change": all(
+            d["refused"] and d["corrections_after"] == 1 for d in denials.values()
+        ),
+        "refresh_changed_raw_provider_winner": (
+            provider_a.winner is not None and provider_a.winner.value == "999000000"
+        ),
+        "A_still_sees_protected_correction": (
+            outcome_a.value == "155000000" and outcome_a.origin == ORIGIN_USER_CORRECTION
+        ),
+        "refresh_did_not_overwrite_recorded": (
+            REASON_REFRESH_DID_NOT_OVERWRITE in outcome_a.reasons
+        ),
+        "B_sees_provider_value_private": (
+            active_b is None
+            and outcome_b.value == "120000000"
+            and outcome_b.origin == ORIGIN_PROVIDER_SELECTION
+        ),
+        "cross_tenant_correction_not_found": cross_tenant_read is None,
+        "correction_versioned": [r.version for r in history_a] == [1],
+        "nothing_deleted": total_obs == 3 and total_corr == 1,
+    }
+    print(f"\nchecks: {checks}")
+    out["denials"] = denials
+    out["history_a"] = [
+        {"version": r.version, "value": r.corrected_value, "protected": r.protected_from_refresh}
+        for r in history_a
+    ]
+    out["a_sees"] = {
+        "value": outcome_a.value,
+        "origin": outcome_a.origin,
+        "reasons": list(outcome_a.reasons),
+    }
+    out["b_sees"] = {"value": outcome_b.value, "origin": outcome_b.origin, "active": active_b}
+    out["cross_tenant_read"] = cross_tenant_read
+    out["rows"] = {"field_observations": total_obs, "field_corrections": total_corr}
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network. A correction is an AUTHORIZED, "
+        "versioned, business-private override: only a business user holding 'field.correct' may record "
+        "one — a read-only viewer or a platform operator is REFUSED before any state is touched. A "
+        "PROTECTED correction (the default) is kept canonical by the pure overlay over the DCA-069 "
+        "provider selection, so processing a NEWER provider observation (a refresh) does NOT overwrite "
+        "the user's verified value (refresh_did_not_overwrite); the correction stays business-PRIVATE "
+        "(Business B, with its own subject and no correction, sees the provider value, and A's "
+        "correction id reads as not-found for B); prior versions are preserved and nothing is deleted. "
+        "Acting on the canonical value — promoting it into any shared/host record — stays a disabled "
+        "future capability.)"
+    )
+    return out
+
+
+@register(
     "DCA-073",
     "expose SEPARATE quality dimensions: record synthetic field observations for one subject in "
     "Business A (a fresh value + a 400-day-stale value), build the freshness/completeness evidence "
