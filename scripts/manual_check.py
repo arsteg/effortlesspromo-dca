@@ -9478,9 +9478,12 @@ def _dca_071(ctx: CheckContext) -> dict:
         primary_subject_id=org_primary,
         duplicate_subject_id=org_duplicate,
     )
-    _attempt("read_only_viewer", lambda s: s.merge(IdentityMergeInput(**_good), reviewer=viewer, now=now))
     _attempt(
-        "platform_operator", lambda s: s.merge(IdentityMergeInput(**_good), reviewer=operator, now=now)
+        "read_only_viewer", lambda s: s.merge(IdentityMergeInput(**_good), reviewer=viewer, now=now)
+    )
+    _attempt(
+        "platform_operator",
+        lambda s: s.merge(IdentityMergeInput(**_good), reviewer=operator, now=now),
     )
     _attempt(
         "ai_automation_actor",
@@ -9555,20 +9558,24 @@ def _dca_071(ctx: CheckContext) -> dict:
     checks = {
         "org_pair_was_ambiguous_review": org_outcome == "review",
         "two_compatible_merges_persisted": len(merge_rows) == 2,
-        "viewer_refused": denials["read_only_viewer"] == {
+        "viewer_refused": denials["read_only_viewer"]
+        == {
             "refused": True,
             "code": "identity_merge_not_authorized",
         },
         "operator_refused": denials["platform_operator"]["refused"] is True,
-        "ai_actor_refused": denials["ai_automation_actor"] == {
+        "ai_actor_refused": denials["ai_automation_actor"]
+        == {
             "refused": True,
             "code": "identity_merge_ai_actor_forbidden",
         },
-        "conflicting_identifiers_refused": denials["conflicting_identifiers"] == {
+        "conflicting_identifiers_refused": denials["conflicting_identifiers"]
+        == {
             "refused": True,
             "code": "incompatible_identities",
         },
-        "cross_tenant_not_found": cross_tenant == {
+        "cross_tenant_not_found": cross_tenant
+        == {
             "refused": True,
             "code": "subject_not_found",
         },
@@ -9834,7 +9841,9 @@ def _dca_072(ctx: CheckContext) -> dict:
             f"   reverse-audit refs: mergeId={refs['identityMergeId']} "
             f"{refs['previousStatus']} -> {refs['newStatus']} actor={reverse_audits[0].actor_id}"
         )
-    print(f"   the still-ACTIVE person merge = {person_row['status']} (only the org merge was undone)")
+    print(
+        f"   the still-ACTIVE person merge = {person_row['status']} (only the org merge was undone)"
+    )
 
     print("\n2) the relevant denials (each refused, nothing changed):")
     for label, d in denials.items():
@@ -9845,7 +9854,9 @@ def _dca_072(ctx: CheckContext) -> dict:
     )
 
     print("\n3) reversal does NOT resurrect revoked consent (the KEY guarantee):")
-    print(f"   consent receipts before reverse={consent_before}  after={consent_after}  (unchanged)")
+    print(
+        f"   consent receipts before reverse={consent_before}  after={consent_after}  (unchanged)"
+    )
     print(
         f"   person_primary consent actions still = {primary_consent_actions} "
         "(the withdrawal STILL stands; nothing re-granted)"
@@ -9857,24 +9868,29 @@ def _dca_072(ctx: CheckContext) -> dict:
         "nothing_deleted_two_rows_remain": len(merge_rows) == 2,
         "record_audit_preserved": record_audits == 2,
         "one_reverse_audit_appended": len(reverse_audits) == 1,
-        "viewer_refused": denials["read_only_viewer"] == {
+        "viewer_refused": denials["read_only_viewer"]
+        == {
             "refused": True,
             "code": "identity_merge_not_authorized",
         },
         "operator_refused": denials["platform_operator"]["refused"] is True,
-        "ai_actor_refused": denials["ai_automation_actor"] == {
+        "ai_actor_refused": denials["ai_automation_actor"]
+        == {
             "refused": True,
             "code": "identity_merge_ai_actor_forbidden",
         },
-        "unknown_id_not_found": denials["unknown_merge_id"] == {
+        "unknown_id_not_found": denials["unknown_merge_id"]
+        == {
             "refused": True,
             "code": "identity_merge_not_found",
         },
-        "double_reversal_refused": denials["double_reversal"] == {
+        "double_reversal_refused": denials["double_reversal"]
+        == {
             "refused": True,
             "code": "identity_merge_already_reversed",
         },
-        "cross_tenant_not_found": cross_tenant == {
+        "cross_tenant_not_found": cross_tenant
+        == {
             "refused": True,
             "code": "identity_merge_not_found",
         },
@@ -15896,6 +15912,224 @@ def _dca_103(ctx: CheckContext) -> dict:
         "ok_job": ok_job,
         "reclaim_job": reclaim_job,
         "rights_job": rights_job,
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-104",
+    "schedule bounded retries: in an isolated synthetic Business A, worker-1 CLAIMS jobs and reports "
+    "FAILED attempts, and the scheduler — fenced on the current lease — classifies each failure and either "
+    "SCHEDULES a bounded retry or DEAD-LETTERS the job. Shows the four acceptance facets on real rows: a "
+    "TRANSIENT failure schedules a retry (status FAILED, next-run pushed out by capped exponential backoff "
+    "+ jitter, lease cleared); a PERMANENT policy failure is DEAD-LETTERED immediately and NOT retried even "
+    "with attempts remaining; a provider Retry-After floors the next-run time; a TRANSIENT failure at the "
+    "attempt cap is DEAD-LETTERED (cap honoured); and the deterministic backoff schedule (attempts 1..6) is "
+    "printed. Then the fenced denial: a REPLACED worker whose job was reclaimed cannot schedule a retry — "
+    "nothing changes. Local synthetic; no AI/paid action, no network, no send, and NO job is ever executed "
+    "(execution stays a disabled future capability). The failure-vs-reclaim race across short transactions "
+    "is proven on disposable PostgreSQL in the focused tests.",
+)
+def _dca_104(ctx: CheckContext) -> dict:
+    """Drive the retry-scheduling path directly against the ephemeral synthetic DB and print the real rows
+    (status, next-run time, attempt counts, failure class) — never a bare PASS.
+
+    Note: a SQLite ephemeral DB cannot exercise ``FOR UPDATE`` / concurrency; this scenario drives the
+    scheduling LOGIC serially with a SEEDED RNG so the printed backoff delays are reproducible. The
+    failure-vs-reclaim race across short transactions runs on a disposable PostgreSQL in
+    ``tests/test_job_retry.py`` (``DCA_TEST_DATABASE_URL``)."""
+    import random
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import select
+
+    from app.db.models import DurableJobRequest
+    from app.jobs.claim import JobClaimStore
+    from app.jobs.retry import (
+        BASE_BACKOFF_SECONDS,
+        MAX_BACKOFF_SECONDS,
+        FailureSignal,
+        JobFailureCategory,
+        JobRetryScheduler,
+        RetryScheduleOutcome,
+        compute_backoff_seconds,
+    )
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+
+    biz_a = "11111111-1111-1111-1111-11111111a104"
+    now = datetime.now(UTC)
+
+    def _enqueue(key: str, *, max_attempts: int = 5) -> str:
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, biz_a).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                    max_attempts=max_attempts,
+                ),
+                now=now,
+            )
+            session.commit()
+            return row.id
+
+    def _claim(worker: str, *, at: datetime, lease_seconds: int = 600):
+        with ctx.session_factory() as session:
+            return JobClaimStore(session, biz_a).claim_next(
+                worker, now=at, lease_seconds=lease_seconds
+            )
+
+    def _record(job_id: str, worker: str, fence: int, signal, *, at: datetime, seed: int = 7):
+        with ctx.session_factory() as session:
+            return JobRetryScheduler(session, biz_a).record_failure(
+                job_id, worker, fence, signal, now=at, rng=random.Random(seed)
+            )
+
+    def _show(job_id: str) -> str:
+        with ctx.session_factory() as session:
+            row = session.get(DurableJobRequest, job_id)
+            nxt = row.available_at.replace(tzinfo=UTC) if row.available_at else None
+            delay = f"+{(nxt - now).total_seconds():.1f}s" if nxt else None
+            return (
+                f"status={row.status} attempt={row.attempt_count}/{row.max_attempts} "
+                f"owner={row.lease_owner} nextRun={delay} lastError={row.last_error}"
+            )
+
+    # 1) TRANSIENT failure -> a bounded retry is scheduled (FAILED, next-run pushed out, lease cleared).
+    t_job = _enqueue("job-transient", max_attempts=5)
+    t_claim = _claim("worker-1", at=now, lease_seconds=600)
+    assert t_claim is not None
+    t_res = _record(
+        t_job,
+        "worker-1",
+        t_claim.fence_token,
+        FailureSignal(JobFailureCategory.TIMEOUT, error_note="upstream_timeout"),
+        at=now + timedelta(seconds=5),
+    )
+    print(
+        f"\n1) worker-1 transient failure -> outcome={t_res.outcome.value} "
+        f"class={t_res.failure_class.value} delay={t_res.delay_seconds:.1f}s row[{_show(t_job)}] "
+        f"(SCHEDULED a bounded retry — handler NOT run)"
+    )
+
+    # 2) PERMANENT policy failure -> DEAD-LETTERED immediately, NOT retried (4 of 5 attempts remained).
+    p_job = _enqueue("job-permanent", max_attempts=5)
+    p_claim = _claim("worker-1", at=now, lease_seconds=600)
+    assert p_claim is not None
+    p_res = _record(
+        p_job,
+        "worker-1",
+        p_claim.fence_token,
+        FailureSignal(JobFailureCategory.POLICY_DENIED, error_note="rulepack_denied"),
+        at=now + timedelta(seconds=5),
+    )
+    print(
+        f"\n2) worker-1 PERMANENT policy failure -> outcome={p_res.outcome.value} "
+        f"class={p_res.failure_class.value} row[{_show(p_job)}] "
+        f"(DEAD-LETTERED, NOT retried despite attempts remaining)"
+    )
+
+    # 3) Provider Retry-After floors the next-run time even though attempt-1's backoff window is tiny.
+    ra_job = _enqueue("job-retryafter", max_attempts=5)
+    ra_claim = _claim("worker-1", at=now, lease_seconds=600)
+    assert ra_claim is not None
+    ra_res = _record(
+        ra_job,
+        "worker-1",
+        ra_claim.fence_token,
+        FailureSignal(
+            JobFailureCategory.RATE_LIMITED, error_note="throttled", retry_after_seconds=120
+        ),
+        at=now + timedelta(seconds=5),
+    )
+    print(
+        f"\n3) worker-1 rate-limited (Retry-After=120s) -> outcome={ra_res.outcome.value} "
+        f"delay={ra_res.delay_seconds:.1f}s row[{_show(ra_job)}] "
+        f"(next-run FLOORED at the provider Retry-After)"
+    )
+
+    # 4) TRANSIENT failure at the attempt cap (max_attempts=1) -> DEAD-LETTERED (cap honoured).
+    x_job = _enqueue("job-exhausted", max_attempts=1)
+    x_claim = _claim("worker-1", at=now, lease_seconds=600)
+    assert x_claim is not None and x_claim.attempt_count == 1
+    x_res = _record(
+        x_job,
+        "worker-1",
+        x_claim.fence_token,
+        FailureSignal(JobFailureCategory.NETWORK, error_note="conn_reset"),
+        at=now + timedelta(seconds=5),
+    )
+    print(
+        f"\n4) worker-1 transient failure at the cap (1/1) -> outcome={x_res.outcome.value} "
+        f"row[{_show(x_job)}] (DEAD-LETTERED — attempt cap honoured, no more retries)"
+    )
+
+    # 5) The deterministic backoff schedule (capped exponential + equal jitter), attempts 1..6.
+    rng = random.Random(7)
+    schedule = [(a, compute_backoff_seconds(a, rng=rng)) for a in range(1, 7)]
+    print(
+        f"\n5) backoff schedule (BASE={BASE_BACKOFF_SECONDS}s, cap={MAX_BACKOFF_SECONDS}s, equal jitter, "
+        f"seed=7):"
+    )
+    for attempt, delay in schedule:
+        print(f"     attempt {attempt}: next retry in {delay:.1f}s")
+
+    # 6) DENIAL: worker-1 lapses, worker-2 reclaims (fence bumps); worker-1's stale failure is REFUSED.
+    d_job = _enqueue("job-reclaimed", max_attempts=5)
+    first = _claim("worker-1", at=now, lease_seconds=60)
+    assert first is not None
+    later = now + timedelta(seconds=120)
+    second = _claim("worker-2", at=later, lease_seconds=60)
+    assert second is not None
+    d_res = _record(
+        d_job,
+        "worker-1",
+        first.fence_token,
+        FailureSignal(JobFailureCategory.TIMEOUT, error_note="late"),
+        at=later + timedelta(seconds=1),
+    )
+    print(
+        f"\n6) worker-2 reclaims (fence {first.fence_token}->{second.fence_token}); worker-1 stale "
+        f"failure -> outcome={d_res.outcome.value} changed={d_res.changed} row[{_show(d_job)}] "
+        f"(REFUSED — nothing changes, worker-2's live claim intact)"
+    )
+
+    with ctx.session_factory() as session:
+        rows = session.scalars(
+            select(DurableJobRequest).order_by(DurableJobRequest.idempotency_key)
+        ).all()
+        print("\njob rows after the scenario:")
+        for row in rows:
+            print(f"  - key={row.idempotency_key} {_show(row.id)}")
+
+    checks = {
+        "transient_failure_schedules_bounded_retry": t_res.scheduled_retry
+        and t_res.outcome is RetryScheduleOutcome.RETRY_SCHEDULED,
+        "permanent_failure_dead_lettered_not_retried": p_res.dead_lettered
+        and p_res.outcome is RetryScheduleOutcome.DEAD_LETTERED_PERMANENT,
+        "retry_after_floors_next_run": ra_res.scheduled_retry and ra_res.delay_seconds == 120,
+        "transient_at_cap_dead_lettered": x_res.dead_lettered
+        and x_res.outcome is RetryScheduleOutcome.DEAD_LETTERED_EXHAUSTED,
+        "backoff_within_cap": all(0 < d <= MAX_BACKOFF_SECONDS for _, d in schedule),
+        "replaced_worker_stale_failure_refused": (not d_res.changed)
+        and d_res.outcome is RetryScheduleOutcome.STALE_LEASE,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send, and no job is executed. DCA-104 "
+        "classifies a failed attempt and — fenced on the current lease — either SCHEDULES a bounded retry "
+        "(capped exponential backoff + jitter + provider Retry-After floor) or DEAD-LETTERS it; a PERMANENT "
+        "policy/auth failure is NEVER retried as transient and the attempt cap is honoured. A stale/replaced "
+        "worker cannot fail a job that moved on. Scheduling a retry records WHEN a job may next run but "
+        "EXECUTES nothing — execution stays a disabled future capability, and no path re-dispatches a due "
+        "FAILED row. A scheduled retry grants no send authority and is not consent.)"
+    )
+    return {
+        "transient_job": t_job,
+        "permanent_job": p_job,
+        "retry_after_job": ra_job,
+        "exhausted_job": x_job,
+        "reclaimed_job": d_job,
         "checks": checks,
     }
 
