@@ -16,8 +16,11 @@ Public surface is the pure estimator in :mod:`app.cost.estimate`:
 - :func:`~app.cost.estimate.request_model_quote` — the thin seam that obtains a model quote by a
   ``dryRun`` gateway call, which projects cost WITHOUT invoking a paid model.
 
-Nothing here reserves, spends, bills or sends: an estimate is advisory data. Reserving budget and
-accounting actual provider spend are later, still-disabled stories.
+DCA-113 (:mod:`app.cost.reserve`) builds the next capability on top: :class:`~app.cost.reserve.BudgetReservationStore`
+ATOMICALLY RESERVES a precise amount of spend against a business's in-force budget caps so concurrent
+reservations can never collectively overshoot a cap. A reservation is a HOLD, not a charge and not a
+send — the estimator still spends/sends nothing, and settling a hold / recording actual provider spend
+remain later, disabled stories.
 """
 
 from __future__ import annotations
@@ -38,6 +41,25 @@ from app.cost.estimate import (
     estimate_run_cost,
     request_model_quote,
 )
+from app.cost.reserve import (
+    AUDIT_ACTION_RESERVE,
+    PLATFORM_DAILY_CEILING_MINOR,
+    PLATFORM_PER_RESERVATION_CEILING_MINOR,
+    REASON_DAILY_EXCEEDED,
+    REASON_INVALID_AMOUNT,
+    REASON_MONTHLY_EXCEEDED,
+    REASON_NO_BUDGET,
+    REASON_NOT_AUTHORIZED,
+    REASON_PER_RUN_EXCEEDED,
+    REASON_PLATFORM_EXCEEDED,
+    REASON_PROVIDER_EXCEEDED,
+    BudgetReservationStore,
+    ReservationActor,
+    ReservationAuthorizationError,
+    ReservationError,
+    ReservationRequest,
+    ReservationWindow,
+)
 
 __all__ = [
     "DEFAULT_OPERATION_RATE_CARD",
@@ -54,4 +76,22 @@ __all__ = [
     "RunCostEstimate",
     "estimate_run_cost",
     "request_model_quote",
+    # DCA-113 — atomic spend reservation
+    "AUDIT_ACTION_RESERVE",
+    "PLATFORM_DAILY_CEILING_MINOR",
+    "PLATFORM_PER_RESERVATION_CEILING_MINOR",
+    "REASON_DAILY_EXCEEDED",
+    "REASON_INVALID_AMOUNT",
+    "REASON_MONTHLY_EXCEEDED",
+    "REASON_NO_BUDGET",
+    "REASON_NOT_AUTHORIZED",
+    "REASON_PER_RUN_EXCEEDED",
+    "REASON_PLATFORM_EXCEEDED",
+    "REASON_PROVIDER_EXCEEDED",
+    "BudgetReservationStore",
+    "ReservationActor",
+    "ReservationAuthorizationError",
+    "ReservationError",
+    "ReservationRequest",
+    "ReservationWindow",
 ]

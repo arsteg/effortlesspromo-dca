@@ -17708,6 +17708,146 @@ def _dca_112(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-113",
+    "reserve spend atomically: a precise INR-minor-unit HOLD is placed against a business's in-force "
+    "budget caps (per-run/daily/monthly/provider/platform) under a FOR UPDATE lock, so concurrent "
+    "reservations can never overshoot a cap. A hold that would exceed the remaining budget is REFUSED "
+    "(changes nothing, no external call); the reservation is idempotent on its key; authority (budget."
+    "manage) is checked FIRST. A reservation holds budget - it spends and sends nothing (disabled).",
+)
+def _dca_113(ctx: CheckContext) -> dict:
+    """Drive the DCA-113 reservation store directly against the ephemeral synthetic DB and PRINT the
+    REAL before/after budget + reservation rows - never a bare PASS. Shows: authority denial changes
+    nothing; each accepted hold decrements the remaining daily budget; an over-budget hold is REFUSED
+    with a stable code and leaves every total exactly as it was; and a same-key replay returns the
+    existing hold (no second row). Nothing is spent or sent (the DCA has no such path)."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.cost.reserve import (
+        REASON_DAILY_EXCEEDED,
+        REASON_NOT_AUTHORIZED,
+        BudgetReservationStore,
+        ReservationActor,
+        ReservationAuthorizationError,
+        ReservationError,
+        ReservationRequest,
+    )
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz = "11111111-1111-1111-1111-11111111b113"
+    admin = ReservationActor(subject="00000000-0000-4000-9000-0000000a0113", roles=("admin",))
+    viewer = ReservationActor(subject="00000000-0000-4000-9000-0000000v0113", roles=("viewer",))
+    budget_actor = AuditActor(id="00000000-0000-4000-9000-0000000b0113", type=ActorType.USER)
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)  # 2026-10-31 14:30 IST
+
+    # Seed the in-force caps: Rs 50 daily, Rs 10,000 monthly, Rs 50 per-run (in paise).
+    with factory() as session:
+        BudgetLimitStore(session, biz).save(
+            BudgetLimitInput(daily_cap_minor=5_000, monthly_cap_minor=1_000_000, per_run_cap_minor=5_000),
+            budget_actor,
+        )
+        session.commit()
+
+    def _window() -> dict:
+        with factory() as session:
+            w = BudgetReservationStore(session, biz).window(now=now)
+        return {
+            "day": w.day_key,
+            "daily_cap": w.daily_cap_minor,
+            "reserved": w.day_reserved_minor,
+            "remaining": w.daily_remaining_minor,
+        }
+
+    def _rows() -> list[dict]:
+        with factory() as session:
+            rows = BudgetReservationStore(session, biz).active()
+            return [
+                {"id": r.id[:8], "key": r.idempotency_key, "amount": r.amount_minor, "day": r.day_key}
+                for r in rows
+            ]
+
+    def _reserve(key: str, amount: int, actor: ReservationActor) -> str:
+        with factory() as session:
+            try:
+                r = BudgetReservationStore(session, biz).reserve(
+                    ReservationRequest(idempotency_key=key, amount_minor=amount), actor, now=now
+                )
+                session.commit()
+                return f"admitted id={r.id[:8]} amount={r.amount_minor}"
+            except ReservationAuthorizationError as exc:
+                session.rollback()
+                return f"refused({exc.code})"
+            except ReservationError as exc:
+                session.rollback()
+                return f"refused({exc.code})"
+
+    print(f"\nbusiness: ...{biz[-4:]}   in-force caps (paise): daily=5000 monthly=1_000_000 per_run=5000")
+    print(f"initial window: {_window()}")
+
+    # 0) Authority FIRST: a read-only viewer cannot reserve — refused, and nothing changes.
+    auth = _reserve("v-attempt", 1_000, viewer)
+    print("\n0) authority gate:")
+    print(f"   viewer tries to reserve Rs 10 -> {auth}  (REASON={REASON_NOT_AUTHORIZED})")
+    print(f"   window after refused attempt: {_window()}  rows={_rows()}  (unchanged)")
+
+    # 1) Two accepted holds each decrement the remaining daily budget.
+    print("\n1) accepted holds decrement the remaining budget:")
+    print(f"   reserve run-1 Rs 20 -> {_reserve('run-1', 2_000, admin)}")
+    print(f"   window: {_window()}")
+    print(f"   reserve run-2 Rs 20 -> {_reserve('run-2', 2_000, admin)}")
+    print(f"   window: {_window()}   rows={_rows()}")
+
+    # 2) The over-budget hold is REFUSED and changes nothing (4000 held; +2000 would exceed 5000).
+    before = _window()
+    over = _reserve("run-3", 2_000, admin)
+    after = _window()
+    print("\n2) over-budget reservation is refused (no external call, no state change):")
+    print(f"   reserve run-3 Rs 20 -> {over}  (REASON={REASON_DAILY_EXCEEDED})")
+    print(f"   window before={before}")
+    print(f"   window after ={after}   rows={_rows()}  (unchanged)")
+
+    # 3) Idempotent: replaying run-1's key returns the existing hold, no second row.
+    replay = _reserve("run-1", 2_000, admin)
+    print("\n3) idempotent replay (same key):")
+    print(f"   reserve run-1 again -> {replay}   rows={_rows()}  (still 2 holds)")
+
+    final = _window()
+    checks = {
+        "authority_refused_no_change": auth == f"refused({REASON_NOT_AUTHORIZED})",
+        "two_holds_decrement_remaining": final["reserved"] == 4_000 and final["remaining"] == 1_000,
+        "over_budget_refused_no_change": over == f"refused({REASON_DAILY_EXCEEDED})"
+        and before == after,
+        "idempotent_no_second_row": replay.startswith("admitted") and len(_rows()) == 2,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no spend, no send. DCA-113 ATOMICALLY "
+        "RESERVES spend against a business's in-force budget caps - per-run, daily, monthly, an optional "
+        "provider cap and a platform hard ceiling - in PRECISE INR minor units. A reservation takes a FOR "
+        "UPDATE lock on the business's latest budget-limit row before summing existing ACTIVE holds, so "
+        "concurrent reservations SERIALIZE and the total reserved can never overshoot a cap (proven on "
+        "real Postgres in tests/test_budget_reserve.py). A hold that would exceed the remaining budget is "
+        "REFUSED with a stable code and changes nothing; the reservation is idempotent on its key; "
+        "authority (budget.manage) is checked FIRST. A reservation only HOLDS budget - releasing/settling "
+        "a hold and recording actual provider spend are later, still-disabled stories.)"
+    )
+    return {
+        "initial_remaining": 5_000,
+        "authority_attempt": auth,
+        "final_window": final,
+        "over_budget_result": over,
+        "replay_result": replay,
+        "rows": _rows(),
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest

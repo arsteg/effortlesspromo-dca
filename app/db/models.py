@@ -674,6 +674,102 @@ class BudgetLimit(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class ReservationStatus(str, Enum):
+    """DCA-113 — the lifecycle state of one budget reservation.
+
+    A reservation is a HOLD against a business's spend caps, not a charge: while it is ``ACTIVE`` its
+    amount counts toward the daily / monthly / provider / platform totals, so a later reservation sees
+    less remaining budget and a reservation that would overshoot any cap is refused. ``RELEASED`` is a
+    DISABLED future capability (releasing / settling a hold when a run finishes or is abandoned is a
+    later story, DCA-114+); nothing here ever writes it, and the cap sums count ONLY ``ACTIVE`` rows so
+    a future release path drops out of the totals automatically (expand→migrate→contract, BR-201).
+    """
+
+    ACTIVE = "active"
+    RELEASED = "released"
+
+
+class BudgetReservation(TenantOwned, Base):
+    """DCA-113 — one atomic HOLD of spend against a business's budget caps (tenant-owned, RLS-protected).
+
+    One row is one reservation: a precise INR **minor-unit (paise)** amount held against the business's
+    in-force spending caps (:class:`BudgetLimit`) for the civil day / month those caps are pinned to. A
+    reservation is NOT a charge and NOT a send — the DCA has no spend or send path — it only RESERVES
+    headroom so concurrent reservations cannot collectively overshoot a cap.
+
+    The load-bearing guarantees (the DCA-113 acceptance criteria), enforced by the single sanctioned
+    writer :class:`~app.cost.reserve.BudgetReservationStore`:
+
+    - **No reservation can overshoot any cap.** A reservation is accepted only if, under the caps in
+      force, the amount fits within the per-run cap, the platform per-reservation ceiling, the day's
+      remaining daily cap, the month's remaining monthly cap, an optional provider cap, and the platform
+      daily ceiling. A request that would exceed ANY of these is refused BEFORE any row is staged, so a
+      denial changes nothing (no hold, no audit) and makes no external call (there is none to make).
+
+    - **Concurrent reservations serialize (transaction-safe).** The writer takes a ``FOR UPDATE`` lock on
+      the business's latest :class:`BudgetLimit` row before it sums existing ``ACTIVE`` reservations and
+      decides, so two concurrent reservations for the same business are serialized by PostgreSQL: the
+      second reads the first's committed hold and can never both be admitted past a cap. The total
+      reserved therefore never exceeds the limit even under a race (proven on real Postgres).
+
+    - **Idempotent on a key.** ``(business_id, idempotency_key)`` is unique: re-submitting the same key
+      returns the EXISTING reservation and stages no second row and no second hold — a retry is safe.
+
+    ``day_key`` / ``month_key`` are the civil-day / civil-month the reservation was counted in, computed
+    in the caps' own ``timezone`` (India: ``Asia/Kolkata``), so the windowed cap sums are a simple,
+    index-friendly equality match. ``budget_version`` pins WHICH :class:`BudgetLimit` version the hold was
+    taken against. ``actor_id`` / ``actor_type`` record WHO reserved it (an opaque subject id, never a
+    name/email), on the atomic DCA-026 audit entry in the SAME unit of work as the row. Tenant-owned: it
+    inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant table,
+    so a reservation can never be read or summed across tenants. Reserving holds budget; it spends and
+    sends nothing (releasing/settling a hold and recording actual provider spend are later, disabled
+    stories).
+    """
+
+    __tablename__ = "budget_reservations"
+    # One reservation per idempotency key within a business: a retry with the same key is a replay, never
+    # a second hold; two tenants may reuse a key without colliding.
+    __table_args__ = (tenant_unique("idempotency_key", name="uq_budget_reservation_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the reservation-record contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The caller's opaque idempotency token for this logical reservation (the per-business dedup key).
+    idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
+    # The held amount in INR MINOR units (paise) — integer, exact, never a float. Positive (validated).
+    amount_minor: Mapped[int] = mapped_column(BigInteger)
+    # India-only: always "INR" (matches the business's BudgetLimit currency).
+    currency: Mapped[str] = mapped_column(String(3), default="INR", server_default="INR")
+    # The provider/cost-bucket this hold is attributed to (e.g. "platform"). Opaque; part of the optional
+    # per-provider cap window. Defaults to the platform bucket.
+    provider: Mapped[str] = mapped_column(
+        String(64), default="platform", server_default="platform", index=True
+    )
+    # The BudgetLimit version the hold was taken against (pins WHICH caps were in force at reserve time).
+    budget_version: Mapped[int] = mapped_column(Integer)
+    # The civil day / month (in the caps' timezone) this reservation is counted in — the windowed cap
+    # sums match on these, so the daily/monthly ceilings are evaluated in India-local civil time.
+    day_key: Mapped[str] = mapped_column(String(10), index=True)
+    month_key: Mapped[str] = mapped_column(String(7), index=True)
+    # The IANA zone whose civil day/month bounded the windows (India: "Asia/Kolkata"), copied from the caps.
+    timezone: Mapped[str] = mapped_column(
+        String(64), default="Asia/Kolkata", server_default="Asia/Kolkata"
+    )
+    # active (held, counts toward the caps) | released (a disabled future capability). Only ACTIVE is ever
+    # written here; the cap sums count only ACTIVE rows.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=ReservationStatus.ACTIVE.value,
+        server_default=ReservationStatus.ACTIVE.value,
+        index=True,
+    )
+    # WHO reserved this — an opaque subject id (never a name/email) plus its kind, screened by the audit
+    # sink in the SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class DiscoveryRun(TenantOwned, Base):
     """One agent cycle for one tenant — the explainability record of what happened and why."""
 

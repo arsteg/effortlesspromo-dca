@@ -69,6 +69,7 @@ DCA_TABLES = {
     "recurring_schedules",
     "business_emergency_stops",
     "platform_emergency_stops",
+    "budget_reservations",
 }
 
 
@@ -1740,6 +1741,53 @@ def test_0043_creates_emergency_stops_on_a_preexisting_database(clean_schema):
     assert "uq_platform_emergency_stop_version" in plat_uniques  # one version per platform scope
     # RLS applied to ONLY the tenant-owned table; the control-plane platform table has none.
     assert policies == {"business_emergency_stops"}
+
+
+@requires_pg
+def test_0044_creates_budget_reservations_on_a_preexisting_database(clean_schema):
+    """DCA-113 — the 0044 create branch (for a DB migrated before ``budget_reservations`` existed).
+
+    ``budget_reservations`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0044 is a no-op there. To exercise 0044's real job, upgrade to head, drop the
+    table, stamp history back to 0043, then upgrade to head again — 0044 must recreate the table (with
+    its per-(business, idempotency_key) uniqueness constraint) and add its tenant-isolation RLS policy, so
+    a reservation is protected (and summed) exactly like every other tenant table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "budget_reservations" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0043_emergency_stops")  # pretend we predate the budget-reservation table
+    command.upgrade(cfg, "head")  # 0044 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "budget_reservations" in tables
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("budget_reservations", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'budget_reservations' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_budget_reservation_key" in uniques  # one hold per (business, idempotency_key)
+    assert policies == {"budget_reservations"}  # tenant-owned: RLS applied
 
 
 @requires_pg
