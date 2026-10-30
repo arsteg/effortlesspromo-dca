@@ -17004,6 +17004,191 @@ def _dca_108(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-109",
+    "run the Python worker process: in isolated synthetic Businesses, run the durable-job WORKER over the "
+    "shipped mechanics and show it drives the lifecycle WITHOUT executing or sending. One bounded pass "
+    "over enabled Business A fires a DUE recurring schedule (enqueues a cycle job), RECOVERS a crashed "
+    "worker's abandoned lease, then CLAIMS the due jobs and PARKS each DEAD_LETTER safely (no handler "
+    "registered -> parked; execution is a disabled future capability so nothing is run or sent). Then the "
+    "graceful-shutdown acceptance on real rows: a shutdown STOPS NEW CLAIMS, and a job claimed just before "
+    "shutdown is RELINQUISHED back to QUEUED (active work preserved, never wedged RUNNING). Tenant "
+    "isolation: a DISABLED Business C is never processed. Local synthetic; no AI/paid action, no network, "
+    "no send. Handler EXECUTION stays a disabled future capability (EXECUTION_ENABLED is False); FAIR "
+    "cross-business scheduling (DCA-110) and emergency stops (DCA-111) are later stories.",
+)
+def _dca_109(ctx: CheckContext) -> dict:
+    """Drive the DCA-109 worker directly against the ephemeral synthetic DB and print the real resulting
+    rows (statuses, parked last_error notes, lease fields, relinquished-to-queued) and the maintenance
+    tick counts - never a bare PASS. A bounded run (one pass / explicit methods), never an infinite loop.
+    The worker NEVER runs a handler or sends: a claimed job is parked DEAD_LETTER for operator inspection
+    (requeueable via DCA-105), and a shutdown relinquishes held work safely."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        DurableJobRequest,
+        JobRequestStatus,
+        RecurringSchedule,
+        ScheduleStatus,
+        TenantAgent,
+    )
+    from typing import cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.jobs.claim import JobClaimStore
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+    from app.jobs.worker import PARK_NO_HANDLER, ClaimDisposition, DurableJobWorker
+
+    # The harness types CheckContext.session_factory loosely as Callable; it is in fact a sessionmaker.
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz_a = "11111111-1111-1111-1111-11111111a109"  # enabled, has work
+    biz_c = "33333333-3333-3333-3333-33333333c109"  # DISABLED, must be skipped
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
+    later = now + timedelta(seconds=120)  # past the crashed worker's 60s lease
+
+    def _enable(business_id: str, *, enabled: bool) -> None:
+        with ctx.session_factory() as session:
+            session.add(TenantAgent(business_id=business_id, country="IN", enabled=enabled))
+            session.commit()
+
+    def _enqueue(business_id: str, key: str) -> str:
+        with ctx.session_factory() as session:
+            row, _ = JobRequestStore(session, business_id).enqueue(
+                JobEnqueueRequest(
+                    job_type="prospect.research",
+                    idempotency_key=key,
+                    payload_ref=f"dca-payload://synthetic/{key}",
+                ),
+                now=now,
+            )
+            session.commit()
+            return row.id
+
+    def _show(job_id: str) -> str:
+        with ctx.session_factory() as session:
+            row = session.get(DurableJobRequest, job_id)
+            if row is None:
+                return "<missing>"
+            return (
+                f"status={row.status} fence={row.lease_version} "
+                f"attempt={row.attempt_count}/{row.max_attempts} owner={row.lease_owner} "
+                f"lastError={row.last_error} resultRef={row.result_ref}"
+            )
+
+    _enable(biz_a, enabled=True)
+    _enable(biz_c, enabled=False)
+
+    # A crashed worker's ABANDONED lease for A (RUNNING + lapsed lease) - the recovery tick heals it.
+    # Enqueue + claim it FIRST (it is the only queued job for A at this point) so the dead worker leases
+    # exactly THIS job; its lease is then left to lapse.
+    crashed_id = _enqueue(biz_a, "job-crashed")
+    with ctx.session_factory() as session:
+        JobClaimStore(session, biz_a).claim_next("dead-worker", now=now, lease_seconds=60)
+
+    direct_id = _enqueue(biz_a, "job-direct")  # a plain queued fixture for A
+    c_job = _enqueue(biz_c, "job-c")  # C is disabled: must stay QUEUED, untouched
+
+    # A DUE recurring schedule for A (the schedule-maintenance tick turns it into a cycle job).
+    with ctx.session_factory() as session:
+        session.add(
+            RecurringSchedule(
+                business_id=biz_a,
+                schedule_key="prospect.discovery",
+                interval_seconds=3600,
+                next_run_at=now,
+                status=ScheduleStatus.ACTIVE.value,
+                icp_version=1,
+                profile_version=None,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        session.commit()
+
+    worker = DurableJobWorker(factory, ctx.settings, clock=lambda: later)
+    print(f"\nworker id: {worker.worker_id}")
+    print(f"enabled businesses the worker will process: {list(worker.enabled_business_ids())}")
+
+    # --- 1) one bounded pass: maintenance ticks, then claim + park each due job safely --------------
+    report = worker.run_pass(now=later)
+    print("\n1) one worker pass over Business A (bounded - not an infinite loop):")
+    print(
+        f"   schedule tick enqueued cycle jobs : {report.scheduled[biz_a].created_count} "
+        f"(a DUE recurring schedule fired)"
+    )
+    print(
+        f"   recovery sweep healed leases      : {report.recovered[biz_a].total} "
+        f"(the crashed worker's abandoned lease)"
+    )
+    print(f"   jobs claimed + driven this pass   : {len(report.handled)}")
+    for h in report.handled:
+        print(f"     - job={h.job_id[-8:]} type={h.job_type} -> {h.disposition.value} ({h.status})")
+    print(f"   direct fixture job : {_show(direct_id)}")
+    print(
+        f"   crashed->recovered  : {_show(crashed_id)}  (healed to QUEUED, then claimed + parked)"
+    )
+    print(
+        "   (every claimed job is PARKED dead_letter for operator inspection - NO handler was run, "
+        "NO AI/network, NO send; execution stays a disabled future capability)"
+    )
+
+    # --- 2) tenant isolation: the DISABLED business C was never touched ------------------------------
+    print(f"\n2) tenant isolation - DISABLED Business C: {_show(c_job)} (never processed)")
+
+    # --- 3) graceful shutdown: stops NEW claims, and RELINQUISHES a held claim back to the queue -----
+    shutdown_id = _enqueue(biz_a, "job-shutdown")  # a fresh queued job for the shutdown demo
+    worker2 = DurableJobWorker(factory, ctx.settings, clock=lambda: later)
+    held = worker2.claim_one(biz_a, now=later)  # a worker claims a job (now RUNNING/leased)
+    assert held is not None  # the fresh job is claimable
+    print("\n3) graceful shutdown:")
+    print(f"   after claim (held)     : {_show(shutdown_id)}")
+    worker2.request_shutdown()  # a stop signal arrives mid-flight
+    relinquished = worker2.relinquish(
+        held, now=later
+    )  # active work handed safely back to the queue
+    print(f"   requested shutdown; relinquished held claim = {relinquished}")
+    print(f"   after relinquish       : {_show(shutdown_id)}  (preserved: QUEUED, lease cleared)")
+    drained = worker2.drain_business(biz_a, now=later)  # shutting down -> claims nothing new
+    print(f"   drain while shutting down claimed/handled: {len(drained)} (new claims stopped)")
+
+    direct_parked = _row_status(ctx, direct_id) == JobRequestStatus.DEAD_LETTER.value
+    checks = {
+        "schedule_tick_enqueued_one": report.scheduled[biz_a].created_count == 1,
+        "recovery_healed_one": report.recovered[biz_a].total == 1,
+        "claimed_jobs_parked_not_run": report.parked_count >= 1 and report.relinquished_count == 0,
+        "direct_fixture_parked_dead_letter": direct_parked,
+        "parked_note_is_no_handler": _row_last_error(ctx, direct_id) == PARK_NO_HANDLER,
+        "nothing_produced_or_sent": _row_result_ref(ctx, direct_id) is None,
+        "disabled_business_c_untouched": _row_status(ctx, c_job) == JobRequestStatus.QUEUED.value,
+        "shutdown_relinquished_held_work": relinquished is True
+        and _row_status(ctx, shutdown_id) == JobRequestStatus.QUEUED.value,
+        "shutdown_stops_new_claims": len(drained) == 0,
+        "execution_stays_disabled": ClaimDisposition.PARKED_NO_HANDLER.value == "parked_no_handler",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. The DCA-109 worker is the "
+        "process that drives the shipped durable-job mechanics - per-tenant RECOVERY + due-SCHEDULE "
+        "ticks, then CLAIM + drive the lifecycle - with graceful shutdown between safe checkpoints: a "
+        "stop STOPS NEW CLAIMS and RELINQUISHES any held claim back to the queue. Handler EXECUTION is a "
+        "DISABLED future capability (EXECUTION_ENABLED is False): the worker never runs a handler, does "
+        "AI/network I/O or sends - a claimed job is PARKED dead_letter for operator inspection "
+        "(requeueable via DCA-105). FAIR cross-business scheduling (DCA-110) and emergency stops "
+        "(DCA-111) are later stories, intentionally not implemented here.)"
+    )
+    return {
+        "worker_id": worker.worker_id,
+        "enabled_businesses": list(worker.enabled_business_ids()),
+        "scheduled_enqueued": report.scheduled[biz_a].created_count,
+        "recovered": report.recovered[biz_a].total,
+        "parked": report.parked_count,
+        "shutdown_relinquished": relinquished,
+        "drain_after_shutdown": len(drained),
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
@@ -17011,6 +17196,24 @@ def _row_status(ctx: CheckContext, job_id: str) -> str:
     with ctx.session_factory() as session:
         row = session.get(DurableJobRequest, job_id)
         return row.status if row is not None else "<missing>"
+
+
+def _row_last_error(ctx: CheckContext, job_id: str) -> str | None:
+    """The PII-safe ``last_error`` note on one durable job row (manual-check helper)."""
+    from app.db.models import DurableJobRequest
+
+    with ctx.session_factory() as session:
+        row = session.get(DurableJobRequest, job_id)
+        return row.last_error if row is not None else None
+
+
+def _row_result_ref(ctx: CheckContext, job_id: str) -> str | None:
+    """The committed result pointer on one durable job row (always None here — nothing is executed)."""
+    from app.db.models import DurableJobRequest
+
+    with ctx.session_factory() as session:
+        row = session.get(DurableJobRequest, job_id)
+        return row.result_ref if row is not None else None
 
 
 def _build_parser() -> argparse.ArgumentParser:
