@@ -73,6 +73,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "restricted_identity_tombstones",
         "dispatch_recheck_consumptions",
         "durable_job_requests",
+        "identity_merges",
     }
 
 

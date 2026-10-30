@@ -38,6 +38,16 @@ class Scope(str, Enum):
     # operator (holding no membership) can never correct a client's field; delegated client-support
     # correction would be a separate, scoped, expiring grant (a later story), never an operator right.
     FIELD_CORRECT = "field.correct"
+    # approve an ambiguous identity merge — record that two of THIS business's observed identities
+    # (two OrgObservations or two PersonObservations) are the SAME, on top of a reviewed COMPATIBLE
+    # matcher conclusion (DCA-071). A WRITE scope: an ordinary acting business user holds it (approving
+    # a surfaced merge candidate is a normal reviewing action, not admin-only), a read-only viewer does
+    # NOT. It is a business-plane scope, so a platform operator (holding no membership) can never merge a
+    # client's identities with their global rights alone. A merge is a HUMAN review ACTION: the pure
+    # matchers (DCA-067/068) only ever conclude MATCH/REVIEW and merge nothing, so an AI suggestion /
+    # automation actor can never execute one even if it somehow carried a role — the reviewer must be a
+    # human user. Acting on a merged identity downstream stays a disabled future capability.
+    IDENTITY_MERGE = "identity.merge"
     # withdraw (restrict) ONE permission scope the agent holds for one of this business's contact
     # points (DCA-076). A WRITE scope: an ordinary acting business user holds it (honouring an opt-out
     # is a normal operating action, never admin-only), a read-only viewer does NOT. It is a
@@ -103,6 +113,7 @@ _ADMIN_SCOPES = frozenset(
     {
         Scope.CANDIDATE_READ,
         Scope.FIELD_CORRECT,
+        Scope.IDENTITY_MERGE,
         Scope.CONSENT_WITHDRAW,
         Scope.PROCESSING_RESTRICT,
         Scope.GRIEVANCE_READ,
@@ -118,6 +129,7 @@ _ACTING_USER_SCOPES = frozenset(
     {
         Scope.CANDIDATE_READ,
         Scope.FIELD_CORRECT,
+        Scope.IDENTITY_MERGE,
         Scope.CONSENT_WITHDRAW,
         Scope.PROCESSING_RESTRICT,
         Scope.GRIEVANCE_READ,

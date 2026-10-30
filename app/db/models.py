@@ -3030,3 +3030,118 @@ class DurableJobRequest(TenantOwned, Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class IdentityMergeStatus(str, Enum):
+    """DCA-071 — the lifecycle state of a reviewed identity-merge record (controlled vocabulary).
+
+    - ``ACTIVE`` — a reviewer approved the merge; it is the current link between the two identities.
+    - ``REVERSED`` — the merge was later undone. This story records only ``ACTIVE`` merges; reversal
+      (flipping an ``ACTIVE`` merge to ``REVERSED``) is the SEPARATE next story (DCA-072), so the column
+      exists purely as the lineage DCA-072 will drive — nothing here ever writes ``REVERSED``.
+    """
+
+    ACTIVE = "active"
+    REVERSED = "reversed"
+
+
+class IdentityMerge(TenantOwned, Base):
+    """DCA-071 — a reviewed, evidenced identity-merge record (tenant-owned, RLS-protected).
+
+    One row is ONE reviewer's approval that two of THIS business's observed identities — two
+    :class:`OrgObservation` rows or two :class:`PersonObservation` rows — are the SAME real-world
+    entity. It is the human review ACTION that sits on top of a pure matcher *conclusion*: the
+    DCA-067/068 matchers only ever return ``MATCH`` / ``NO_MATCH`` / ``REVIEW`` / ``INSUFFICIENT`` and
+    merge, transfer and record NOTHING (``auto_merged`` is always ``False``). A merge is never an
+    automatic collapse — it is this deliberate, authorized, evidenced record.
+
+    The load-bearing guarantees (the DCA-071 acceptance criteria):
+
+    - **Only a REVIEWED, COMPATIBLE pair is recorded.** The single sanctioned writer
+      (:class:`~app.services.identity_merge.IdentityMergeStore`) re-runs the relevant matcher over the
+      two STORED observations and refuses unless the conclusion is compatible — a ``MATCH`` or a
+      ``REVIEW`` candidate (the "ambiguous" merge a human approves). A ``NO_MATCH`` (a conflicting typed
+      registration identifier) or an ``INSUFFICIENT`` pair (no linking evidence at all) is refused BEFORE
+      the session is mutated, so an incompatible merge stages no row. ``match_outcome`` /
+      ``match_confidence`` / ``evidence`` snapshot exactly the conclusion that justified the merge.
+
+    - **Consent/permission scopes stay SEPARATE.** Recording a merge links two IDENTITIES only; it never
+      creates, modifies or transfers any :class:`ConsentReceipt` or :class:`ProcessingRestriction`. The
+      two identities' permission state remains exactly as it was — merging identity is not merging
+      consent, suppression or restrictions (mirrors the DCA-068 guarantee that identity resolution never
+      moves one person's permission onto another).
+
+    - **Authorized by a HUMAN reviewer; an AI suggestion can never execute a merge.** A merge may only be
+      recorded by a business user whose membership roles grant
+      :attr:`~app.identity.permissions.Scope.IDENTITY_MERGE` AND who is a human user actor — a read-only
+      viewer, a non-member, a platform operator and an AI/automation (``service`` / ``system``) actor are
+      each refused before any state is read or written (the relevant denial). ``reviewer_id`` /
+      ``reviewer_type`` record WHO approved it (an opaque subject id, never a name/email), on the atomic
+      DCA-026 audit entry staged in the SAME unit of work as the row.
+
+    - **Business-private, tenant-scoped.** The row is owned by exactly one ``business_id`` and read only
+      within it (DCA-017/018). Both merged subjects are resolved WITHIN this business, so a cross-tenant
+      or unknown subject reads as not-found and a merge can never link another tenant's identity; a by-id
+      read of another business's merge resolves to not-found.
+
+    **Insert-only, idempotent-safe lineage.** ``(business_id, subject_type, primary_subject_id,
+    duplicate_subject_id)`` is unique: a pair is merged at most once per business, and re-approving an
+    already-merged pair (in either direction) returns the existing row rather than inserting a duplicate.
+    The record stores both subject references, the direction (``primary`` = the surviving identity,
+    ``duplicate`` = the merged-away one), the justifying evidence and the reviewer — enough that the
+    SEPARATE next story (DCA-072) can reverse it by flipping ``status`` to ``reversed``. Reversal is NOT
+    implemented here. Acting on a merged identity anywhere downstream (collapsing observations, combining
+    records, sending) stays a DISABLED future capability — the record is a reviewed conclusion, nothing
+    is sent or granted.
+    """
+
+    __tablename__ = "identity_merges"
+    # A directed pair is merged at most once PER business; the reverse direction and re-approval are
+    # collapsed to the existing row by the store, so a pair is never recorded twice.
+    __table_args__ = (
+        tenant_unique(
+            "subject_type",
+            "primary_subject_id",
+            "duplicate_subject_id",
+            name="uq_identity_merge_pair",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the merge-record contract this row was written under — so a later reader can
+    # interpret the stored evidence/direction across contract changes (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # organization | person — the kind of identity being merged (both subjects share it). A merge is
+    # always within ONE kind: an organization is never merged with a person.
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    # The SURVIVING identity (an OrgObservation.id or PersonObservation.id in THIS business) the merge
+    # keeps as canonical.
+    primary_subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The MERGED-AWAY identity (also in THIS business) recorded as the same entity as the primary.
+    duplicate_subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The matcher conclusion that justified the merge: "match" or "review" (an "ambiguous" candidate a
+    # human approved). A "no_match"/"insufficient" pair is refused by the store and never stored here.
+    match_outcome: Mapped[str] = mapped_column(String(16), index=True)
+    # How strongly the evidence supported the conclusion (the matcher's confidence grade).
+    match_confidence: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # A snapshot of the evidence signals the matcher produced (kind/strength/relation/detail) — company
+    # facts / mailbox domains only, never a raw personal contact value (the matchers keep these opaque).
+    # RLS-protected here; only an opaque signal COUNT is ever written to the audit trail.
+    evidence: Mapped[list] = mapped_column(JSON, default=list)
+    # active | reversed — ACTIVE on every row written here; reversal to "reversed" is DCA-072 (lineage).
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=IdentityMergeStatus.ACTIVE.value,
+        server_default=IdentityMergeStatus.ACTIVE.value,
+        index=True,
+    )
+    # A short opaque justification for the merge (e.g. "same_cin_verified"); never free-form contact
+    # data — screened by the audit sink. Optional.
+    reason: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # WHO approved the merge — an opaque human-user subject id (never a name/email) plus its kind,
+    # screened by the audit sink in the SAME unit of work as the row.
+    reviewer_id: Mapped[str] = mapped_column(String(128))
+    reviewer_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    # When the reviewer approved the merge, and when this row was recorded in the service.
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

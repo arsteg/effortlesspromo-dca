@@ -65,6 +65,7 @@ DCA_TABLES = {
     "restricted_identity_tombstones",
     "dispatch_recheck_consumptions",
     "durable_job_requests",
+    "identity_merges",
 }
 
 
@@ -1583,6 +1584,53 @@ def test_0040_adds_result_columns_on_a_preexisting_database(clean_schema):
     )
     assert existing == (None, None, None)  # pre-existing row has no committed result
     assert policy is not None  # tenant RLS policy intact (unchanged by the add-column migration)
+
+
+@requires_pg
+def test_0041_creates_identity_merges_table_on_a_preexisting_database(clean_schema):
+    """DCA-071 — the 0041 create branch (for a DB migrated before the identity-merge table existed).
+
+    ``identity_merges`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0041 is a no-op there. To exercise 0041's real job, upgrade to head, drop the
+    table, stamp history back to 0040, then upgrade to head again — 0041 must recreate the table (with
+    its per-(business, subject, pair) uniqueness constraint) and add its tenant-isolation RLS policy, so
+    a merge is protected exactly like every other tenant table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "identity_merges" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0040_durable_job_request_result")  # pretend we predate the merge table
+    command.upgrade(cfg, "head")  # 0041 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "identity_merges" in tables
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("identity_merges", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'identity_merges' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_identity_merge_pair" in uniques  # one merge per (business, subject, directed pair)
+    assert policies == {"identity_merges"}  # tenant-owned: RLS applied
 
 
 @requires_pg

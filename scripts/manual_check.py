@@ -9320,6 +9320,291 @@ def _dca_070(ctx: CheckContext) -> dict:
 
 
 @register(
+    "DCA-071",
+    "approve an ambiguous identity merge: into synthetic Business A record two same-named legal-entity "
+    "observations (an ambiguous REVIEW candidate) and have an AUTHORIZED human reviewer approve the "
+    "merge; show the relevant denials — a read-only viewer, a platform operator and an AI/automation "
+    "actor are each REFUSED and stage nothing, and a CONFLICTING-identifier pair (same name, different "
+    "CINs -> NO_MATCH) is refused. Then merge two same-named PERSON identities each carrying a consent "
+    "receipt and prove unrelated consent scopes stay SEPARATE (no receipt created/transferred). Prove "
+    "the acceptance: only the reviewed compatible merges persist, Business B cannot merge A's subjects "
+    "(cross-tenant not-found), and the matchers themselves merge nothing",
+)
+def _dca_071(ctx: CheckContext) -> dict:
+    """Exercise the DCA-071 review-only identity-merge store (manual-test step 2) on local synthetic
+    fixtures. A merge is the HUMAN review ACTION on top of a pure DCA-067/068 conclusion (which merge
+    nothing): only a business user holding 'identity.merge' — and who is a human user actor — may record
+    one, only for a reviewed COMPATIBLE pair, and it never touches consent/restriction state. The
+    harness cleans up the ephemeral DB. No AI/paid/network path.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import ConsentReceipt, IdentityMerge, ProcessingRestriction
+    from app.identity.permissions import PLATFORM_OPERATOR_ROLE
+    from app.services.contact_point import ContactPointStore, PersonInput
+    from app.services.identity_merge import (
+        IdentityMergeAuthorizationError,
+        IdentityMergeError,
+        IdentityMergeInput,
+        IdentityMergeStore,
+        IdentityReviewer,
+    )
+    from app.services.org_observation import ExternalIdInput, ObservationInput, OrgObservationStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0071", type=ActorType.USER)
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    cin_one = "U72900MH2010PTC123456"
+    cin_two = "U72900KA2011PTC654321"
+
+    reviewer = IdentityReviewer(subject="00000000-0000-4000-9000-0000000c0071", roles=("user",))
+    viewer = IdentityReviewer(subject="00000000-0000-4000-9000-0000000c0072", roles=("viewer",))
+    operator = IdentityReviewer(
+        subject="00000000-0000-4000-9000-0000000c0073", roles=(PLATFORM_OPERATOR_ROLE,)
+    )
+    ai_actor = IdentityReviewer(
+        subject="00000000-0000-4000-9000-0000000c0074", roles=("user",), actor_type="service"
+    )
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b}
+
+    def _org(session, business_id, name, cin=None):
+        ext = [ExternalIdInput(scheme="cin", value=cin)] if cin else []
+        return (
+            OrgObservationStore(session, business_id)
+            .create(
+                ObservationInput(entity_type="legal_entity", display_name=name, external_ids=ext),
+                actor=actor,
+            )
+            .id
+        )
+
+    def _person(session, business_id, name):
+        return (
+            ContactPointStore(session, business_id)
+            .create_person(PersonInput(display_name=name), actor=actor)
+            .id
+        )
+
+    # --- setup: an ambiguous org pair, a conflicting org pair, and two person identities ----------
+    with ctx.session_factory() as session:
+        org_primary = _org(session, biz_a, "Synthetic Textiles Pvt Ltd")
+        org_duplicate = _org(session, biz_a, "Synthetic Textiles Pvt Ltd")
+        conflict_primary = _org(session, biz_a, "Acme Industries Ltd", cin=cin_one)
+        conflict_duplicate = _org(session, biz_a, "Acme Industries Ltd", cin=cin_two)
+        person_primary = _person(session, biz_a, "Anil Kumar Sharma")
+        person_duplicate = _person(session, biz_a, "Anil Kumar Sharma")
+        # A consent receipt per person + one unrelated processing restriction (to prove separation).
+        for subj, cp in ((person_primary, "cp-1"), (person_duplicate, "cp-2")):
+            session.add(
+                ConsentReceipt(
+                    business_id=biz_a,
+                    brand_key="synthetic_brand",
+                    subject_type="person",
+                    subject_id=subj,
+                    contact_point_id=cp,
+                    channel="email",
+                    purpose="marketing_email",
+                    action="grant",
+                    notice_version="notice-v1",
+                    form_version="form-v1",
+                    language="en",
+                    evidence_id="evidence-" + subj,
+                    collected_at=now,
+                )
+            )
+        session.add(
+            ProcessingRestriction(
+                business_id=biz_a,
+                scope_channel="email",
+                scope_purpose="marketing_email",
+                version=1,
+                authorized_by=reviewer.subject,
+            )
+        )
+        session.commit()
+
+    consent_before = None
+    with ctx.session_factory() as session:
+        consent_before = len(session.scalars(select(ConsentReceipt)).all())
+
+    # --- the approved, reviewed COMPATIBLE merges (org REVIEW + person REVIEW) ---------------------
+    with ctx.session_factory() as session:
+        store = IdentityMergeStore(session, biz_a)
+        org_eval = store.evaluate("organization", org_primary, org_duplicate)
+        org_merge = store.merge(
+            IdentityMergeInput(
+                subject_type="organization",
+                primary_subject_id=org_primary,
+                duplicate_subject_id=org_duplicate,
+                reason="same_name_reviewed",
+            ),
+            reviewer=reviewer,
+            now=now,
+        )
+        person_merge = store.merge(
+            IdentityMergeInput(
+                subject_type="person",
+                primary_subject_id=person_primary,
+                duplicate_subject_id=person_duplicate,
+            ),
+            reviewer=reviewer,
+            now=now,
+        )
+        session.commit()
+        org_merge_id = org_merge.id
+        person_merge_id = person_merge.id
+        org_outcome = org_eval.outcome
+
+    # --- the relevant DENIALS (each refused, nothing staged) --------------------------------------
+    denials: dict = {}
+
+    def _attempt(label, fn):
+        with ctx.session_factory() as session:
+            store = IdentityMergeStore(session, biz_a)
+            try:
+                fn(store)
+                denials[label] = {"refused": False, "code": None}
+            except (IdentityMergeAuthorizationError, IdentityMergeError) as exc:
+                session.rollback()
+                denials[label] = {"refused": True, "code": exc.code}
+
+    _good = dict(
+        subject_type="organization",
+        primary_subject_id=org_primary,
+        duplicate_subject_id=org_duplicate,
+    )
+    _attempt("read_only_viewer", lambda s: s.merge(IdentityMergeInput(**_good), reviewer=viewer, now=now))
+    _attempt(
+        "platform_operator", lambda s: s.merge(IdentityMergeInput(**_good), reviewer=operator, now=now)
+    )
+    _attempt(
+        "ai_automation_actor",
+        lambda s: s.merge(IdentityMergeInput(**_good), reviewer=ai_actor, now=now),
+    )
+    _attempt(
+        "conflicting_identifiers",
+        lambda s: s.merge(
+            IdentityMergeInput(
+                subject_type="organization",
+                primary_subject_id=conflict_primary,
+                duplicate_subject_id=conflict_duplicate,
+            ),
+            reviewer=reviewer,
+            now=now,
+        ),
+    )
+
+    # Business B cannot merge A's subjects (cross-tenant not-found).
+    cross_tenant: dict[str, object] = {"refused": False, "code": None}
+    with ctx.session_factory() as session:
+        store_b = IdentityMergeStore(session, biz_b)
+        try:
+            store_b.merge(IdentityMergeInput(**_good), reviewer=reviewer, now=now)
+        except IdentityMergeError as exc:
+            session.rollback()
+            cross_tenant = {"refused": True, "code": exc.code}
+
+    # --- inspect the resulting state --------------------------------------------------------------
+    with ctx.session_factory() as session:
+        merges = session.scalars(select(IdentityMerge)).all()
+        merge_rows = [
+            {
+                "id": m.id,
+                "subject_type": m.subject_type,
+                "primary": m.primary_subject_id,
+                "duplicate": m.duplicate_subject_id,
+                "outcome": m.match_outcome,
+                "confidence": m.match_confidence,
+                "status": m.status,
+                "signals": len(m.evidence),
+                "reviewer": m.reviewer_id,
+            }
+            for m in merges
+        ]
+        receipts = session.scalars(select(ConsentReceipt)).all()
+        receipt_subjects = sorted(r.subject_id for r in receipts)
+        consent_after = len(receipts)
+        restrictions_after = len(session.scalars(select(ProcessingRestriction)).all())
+
+    print("\n1) reviewed COMPATIBLE merges that PERSISTED (ambiguous REVIEW candidates):")
+    for row in merge_rows:
+        print(
+            f"   - {row['subject_type']:<12} outcome={row['outcome']} conf={row['confidence']} "
+            f"status={row['status']} signals={row['signals']} reviewer={row['reviewer']}"
+        )
+
+    print("\n2) the relevant denials (each refused, nothing staged):")
+    for label, d in denials.items():
+        print(f"   - {label:<24} refused={d['refused']} code={d['code']}")
+    print(
+        f"   - {'cross_tenant (B->A subjects)':<24} refused={cross_tenant['refused']} "
+        f"code={cross_tenant['code']}"
+    )
+
+    print("\n3) consent stays SEPARATE (merging identity did not combine/transfer consent):")
+    print(f"   consent receipts before={consent_before}  after={consent_after}  (unchanged)")
+    print(f"   receipt subjects still separate = {receipt_subjects}")
+    print(f"   processing restrictions after merge = {restrictions_after}  (untouched)")
+    print(f"\n   total identity_merges rows = {len(merge_rows)} (only the compatible pairs)")
+
+    checks = {
+        "org_pair_was_ambiguous_review": org_outcome == "review",
+        "two_compatible_merges_persisted": len(merge_rows) == 2,
+        "viewer_refused": denials["read_only_viewer"] == {
+            "refused": True,
+            "code": "identity_merge_not_authorized",
+        },
+        "operator_refused": denials["platform_operator"]["refused"] is True,
+        "ai_actor_refused": denials["ai_automation_actor"] == {
+            "refused": True,
+            "code": "identity_merge_ai_actor_forbidden",
+        },
+        "conflicting_identifiers_refused": denials["conflicting_identifiers"] == {
+            "refused": True,
+            "code": "incompatible_identities",
+        },
+        "cross_tenant_not_found": cross_tenant == {
+            "refused": True,
+            "code": "subject_not_found",
+        },
+        "consent_not_combined_or_transferred": (
+            consent_after == consent_before == 2
+            and receipt_subjects == sorted([person_primary, person_duplicate])
+            and restrictions_after == 1
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    out["merges"] = merge_rows
+    out["denials"] = {**denials, "cross_tenant": cross_tenant}
+    out["consent"] = {
+        "before": consent_before,
+        "after": consent_after,
+        "subjects": receipt_subjects,
+        "restrictions": restrictions_after,
+    }
+    out["ids"] = {"org_merge": org_merge_id, "person_merge": person_merge_id}
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network. A merge is a reviewed, evidenced, "
+        "AUTHORIZED human ACTION on top of a pure matcher conclusion — the DCA-067/068 matchers merge "
+        "nothing. Within one business two observations can never share a strong identifier/personal "
+        "value, so a same-business merge is inherently the AMBIGUOUS REVIEW case this story approves. "
+        "Only a business user holding 'identity.merge' who is a HUMAN user actor may record one, only "
+        "for a reviewed COMPATIBLE pair: a read-only viewer, a platform operator, an AI/automation "
+        "actor, a conflicting-identifier (NO_MATCH) pair and a cross-tenant subject are each refused "
+        "with no state change. Merging IDENTITY never combines or transfers consent/suppression/"
+        "restrictions. Acting on a merged identity downstream — and reversing a merge (DCA-072) — stay "
+        "disabled future capabilities.)"
+    )
+    return out
+
+
+@register(
     "DCA-073",
     "expose SEPARATE quality dimensions: record synthetic field observations for one subject in "
     "Business A (a fresh value + a 400-day-stale value), build the freshness/completeness evidence "
