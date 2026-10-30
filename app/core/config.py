@@ -198,6 +198,18 @@ class Settings(BaseSettings):
     # --- worker/scheduler (24/7 loop) — OFF by default ---
     worker_enabled: bool = False
     worker_interval_seconds: int = 3600
+    # --- DCA-110 fair cross-business scheduling (bounded per-business + global limits per pass) ---
+    # The worker drains claimable jobs FAIRLY across enabled tenants: a bounded per-business cap (the
+    # TENANT limit) and a bounded global cap (the GLOBAL limit) per pass, taken round-robin. Together
+    # they stop one large tenant monopolizing a pass — a tenant with a big backlog is capped so another
+    # tenant still makes progress in the SAME pass. Both must be positive (validated at boot) so a pass
+    # always makes bounded, fair progress rather than starving a tenant or running unbounded.
+    worker_max_jobs_per_business_per_pass: int = (
+        25  # TENANT limit: max jobs one tenant gets per pass
+    )
+    worker_max_jobs_per_pass: int = (
+        200  # GLOBAL limit: max jobs claimed across all tenants per pass
+    )
 
     # --- sources — nothing fetches anything until explicitly enabled ---
     synthetic_sources_enabled: bool = (
@@ -354,6 +366,16 @@ def validate_required(settings: Settings) -> None:
         )
     if settings.outbox_publish_batch_size <= 0:
         raise RuntimeError("EFFORTLESSPROMO_DCA_OUTBOX_PUBLISH_BATCH_SIZE must be positive")
+
+    # DCA-110: the fair-scheduling caps must be positive so a worker pass always makes bounded, fair
+    # progress — a non-positive per-business cap would starve every tenant, a non-positive global cap
+    # would drain nothing. Name only the offending key.
+    if settings.worker_max_jobs_per_business_per_pass <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_WORKER_MAX_JOBS_PER_BUSINESS_PER_PASS must be positive"
+        )
+    if settings.worker_max_jobs_per_pass <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_WORKER_MAX_JOBS_PER_PASS must be positive")
 
     # DCA-015: end-user token authentication. Only HS256 (symmetric) is implemented; asymmetric
     # (RS256/JWKS) and token introspection are a later story and stay disabled — a missing contract is

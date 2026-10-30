@@ -41,9 +41,31 @@ execution capability ships — it is never silently retried forever and is no lo
 always terminates. When :data:`EXECUTION_ENABLED` is flipped on by a FUTURE story this is where the real
 ``prepare`` → ``run`` → :class:`~app.jobs.complete.JobCompletionStore` commit / retry path is wired in.
 
-Scope note: this story runs the worker over the set of enabled tenants in a simple, stable order. FAIR
-scheduling across businesses (DCA-110) and hierarchical emergency-stop enforcement (DCA-111) are the next,
-separate stories and are deliberately NOT implemented here.
+FAIR cross-business scheduling (DCA-110) — the load-bearing guarantee this module now adds.
+-------------------------------------------------------------------------------------------
+A pass no longer drains one tenant to its batch cap before the next tenant gets a turn — which let a
+single large backlog monopolize a pass. Instead :meth:`DurableJobWorker.drain_fair` claims jobs
+ROUND-ROBIN across the enabled tenants under TWO bounds, so one busy tenant cannot starve another
+(acceptance: "B receives progress while A has a large backlog; global and tenant limits are enforced"):
+
+- **Per-business cap (the TENANT limit).** At most ``max_jobs_per_business`` jobs are claimed for any one
+  tenant in a pass. A tenant with a huge backlog is capped at this many and the rest of its jobs stay
+  ``QUEUED`` for the next pass — it can never consume the whole pass.
+- **Global cap (the GLOBAL limit).** At most ``max_jobs_per_pass`` jobs are claimed across ALL tenants in
+  a pass, so a pass is always bounded regardless of how many tenants or how deep each backlog is.
+- **Round-robin selection.** Each round takes ONE claimable job per still-active tenant, in a stable
+  tenant order, so a tenant with a single queued job is serviced in the SAME pass as a tenant with
+  thousands — the small tenant never waits behind the big one's backlog.
+
+Fairness is a SELECTION policy layered on top of DCA-101 claiming; it changes which tenant's job is
+claimed next, never HOW a job is claimed. Every claim still goes through the tenant-scoped
+:class:`~app.jobs.claim.JobClaimStore` (``FOR UPDATE SKIP LOCKED``, lease + fencing token), so tenant
+isolation / RLS and the single-current-claim guarantee are fully preserved — a worker still only ever
+touches jobs of the tenant it is scoped to. And execution stays the SAME disabled future capability: a
+fairly-claimed job is PARKED ``DEAD_LETTER`` exactly as before, never run and never sent.
+
+Scope note: hierarchical emergency-stop enforcement (DCA-111) is the next, separate story and is
+deliberately NOT implemented here.
 """
 
 from __future__ import annotations
@@ -83,8 +105,17 @@ EXECUTION_ENABLED = False
 
 # How many claimable jobs one pass drains per business at most — a bounded batch so a pass is never
 # unbounded. Parking is terminal (a parked job is no longer claimable), so the drain always terminates;
-# the batch simply caps how much one pass does before yielding to maintenance / shutdown checks.
+# the batch simply caps how much one pass does before yielding to maintenance / shutdown checks. It is
+# the hard ceiling the DCA-110 per-business cap is additionally clamped to (a cap wider than the batch
+# can never drain more than the batch).
 DEFAULT_DRAIN_BATCH = 100
+
+# DCA-110 fair-scheduling defaults (used when a Settings value is absent / a caller does not override).
+# The per-business cap is the TENANT limit (max jobs one tenant gets per pass); the per-pass cap is the
+# GLOBAL limit (max jobs claimed across all tenants per pass). Both are bounded so no tenant is starved
+# and no pass is unbounded; a caller/Settings may tune them.
+DEFAULT_MAX_JOBS_PER_BUSINESS = 25
+DEFAULT_MAX_JOBS_PER_PASS = 200
 
 # PII-safe notes stamped on a parked job's ``last_error`` so an inspector (DCA-105) sees WHY it was parked.
 # Stable codes, never contact data — the same discipline every other durable-row note obeys.
@@ -179,6 +210,15 @@ class WorkerPassReport:
     def enqueued_from_schedules(self) -> int:
         return sum(s.created_count for s in self.scheduled.values())
 
+    @property
+    def handled_by_business(self) -> dict[str, int]:
+        """How many jobs this pass drove PER business — the DCA-110 fairness evidence. A busy tenant is
+        capped at the per-business limit while another tenant still shows progress in the same pass."""
+        counts: dict[str, int] = {}
+        for job in self.handled:
+            counts[job.business_id] = counts.get(job.business_id, 0) + 1
+        return counts
+
 
 class DurableJobWorker:
     """The DCA-109 worker process: a supervised loop over the shipped durable-job mechanics.
@@ -203,6 +243,8 @@ class DurableJobWorker:
         clock: Callable[[], datetime] | None = None,
         lease_seconds: int = DEFAULT_LEASE_SECONDS,
         drain_batch: int = DEFAULT_DRAIN_BATCH,
+        max_jobs_per_business: int | None = None,
+        max_jobs_per_pass: int | None = None,
     ) -> None:
         self._factory = session_factory
         self._settings = settings
@@ -212,6 +254,26 @@ class DurableJobWorker:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lease_seconds = int(lease_seconds)
         self._drain_batch = max(1, int(drain_batch))
+        # DCA-110 fair-scheduling bounds. A caller may override; otherwise take the Settings value, then
+        # the module default. Both are clamped to at least 1 so a pass always makes some fair progress.
+        self._max_jobs_per_business = max(
+            1,
+            int(
+                max_jobs_per_business
+                if max_jobs_per_business is not None
+                else getattr(
+                    settings, "worker_max_jobs_per_business_per_pass", DEFAULT_MAX_JOBS_PER_BUSINESS
+                )
+            ),
+        )
+        self._max_jobs_per_pass = max(
+            1,
+            int(
+                max_jobs_per_pass
+                if max_jobs_per_pass is not None
+                else getattr(settings, "worker_max_jobs_per_pass", DEFAULT_MAX_JOBS_PER_PASS)
+            ),
+        )
         # The graceful-shutdown latch. Set once (idempotent); every checkpoint reads it.
         self._shutdown = threading.Event()
 
@@ -230,7 +292,9 @@ class DurableJobWorker:
 
     # ---------------------------------------------------------------- tenant enumeration
     def enabled_business_ids(self) -> tuple[str, ...]:
-        """Every enabled tenant's business id in a stable order (DCA-110 adds FAIR ordering later)."""
+        """Every enabled tenant's business id in a stable order. The DCA-110 fair drain round-robins
+        ACROSS this set (one job per tenant per round), so the enumeration order only decides the
+        micro-order within a round, never lets an earlier tenant starve a later one."""
         with self._factory() as session:
             rows = session.scalars(
                 select(TenantAgent.business_id)
@@ -322,53 +386,141 @@ class DurableJobWorker:
             max_attempts=claim.max_attempts,
         )
 
+    def _claim_and_handle_one(self, business_id: str, *, now: datetime) -> HandledJob | None:
+        """Claim ONE due job for a tenant and drive it to a safe terminal state, or ``None`` if nothing
+        is claimable. The single shared step both :meth:`drain_business` and the DCA-110
+        :meth:`drain_fair` build on, so the shutdown-race / relinquish discipline lives in exactly one
+        place. Shutdown is honoured at two checkpoints: BEFORE the claim (stop NEW claims → ``None``), and
+        immediately AFTER a claim that raced the shutdown (relinquish the active work back to the queue
+        and return a ``RELINQUISHED`` record). Every claim is tenant-scoped (DCA-101), so this never
+        touches another tenant's job; nothing here runs a handler or sends."""
+        if self._shutdown.is_set():
+            return None  # graceful: stop claiming NEW work
+        claim = self.claim_one(business_id, now=now)
+        if claim is None:
+            return None  # nothing more due for this tenant
+        if self._shutdown.is_set():
+            # A shutdown raced this claim: relinquish the active work safely (back to QUEUED) rather than
+            # leaving it wedged RUNNING until its lease lapses.
+            self.relinquish(claim, now=now)
+            return HandledJob(
+                job_id=claim.job_id,
+                business_id=claim.business_id,
+                job_type=claim.job_type,
+                disposition=ClaimDisposition.RELINQUISHED,
+                status="queued",
+                fence_token=claim.fence_token,
+                attempt_count=claim.attempt_count,
+                max_attempts=claim.max_attempts,
+            )
+        return self.handle_claim(claim, now=now)
+
     def drain_business(
         self, business_id: str, *, now: datetime, max_jobs: int | None = None
     ) -> list[HandledJob]:
-        """Claim and safely drive this tenant's due jobs until none remain, the batch cap, or shutdown.
+        """Claim and safely drive ONE tenant's due jobs until none remain, the batch cap, or shutdown.
 
-        Shutdown is honoured at two checkpoints, matching the acceptance criteria: BEFORE each claim (stop
-        NEW claims) and immediately AFTER a claim that raced the shutdown (relinquish the active work back
-        to the queue, then stop). A parked job is terminal and no longer claimable, so the loop always
-        terminates — the worker never crash-loops on an unrunnable job."""
+        A single-tenant drain (used directly by tests / the graceful-shutdown demo). Shutdown is honoured
+        via :meth:`_claim_and_handle_one`: it stops claiming new work and relinquishes a claim that raced
+        the stop, after which this loop ends. A parked job is terminal and no longer claimable, so the
+        loop always terminates — the worker never crash-loops on an unrunnable job."""
         limit = self._drain_batch if max_jobs is None else max(0, int(max_jobs))
         handled: list[HandledJob] = []
         for _ in range(limit):
-            if self._shutdown.is_set():
-                break  # graceful: stop claiming NEW work
-            claim = self.claim_one(business_id, now=now)
-            if claim is None:
-                break  # nothing more due for this tenant
-            if self._shutdown.is_set():
-                # A shutdown raced this claim: relinquish the active work safely (back to QUEUED) rather
-                # than leaving it wedged RUNNING until its lease lapses, then stop.
-                self.relinquish(claim, now=now)
-                handled.append(
-                    HandledJob(
-                        job_id=claim.job_id,
-                        business_id=claim.business_id,
-                        job_type=claim.job_type,
-                        disposition=ClaimDisposition.RELINQUISHED,
-                        status="queued",
-                        fence_token=claim.fence_token,
-                        attempt_count=claim.attempt_count,
-                        max_attempts=claim.max_attempts,
-                    )
-                )
-                break
-            handled.append(self.handle_claim(claim, now=now))
+            result = self._claim_and_handle_one(business_id, now=now)
+            if result is None:
+                break  # shutdown before the claim, or nothing more due
+            handled.append(result)
+            if result.relinquished:
+                break  # a shutdown raced the claim; the work was relinquished — stop
+        return handled
+
+    def drain_fair(
+        self,
+        business_ids: tuple[str, ...],
+        *,
+        now: datetime,
+        max_jobs_per_business: int | None = None,
+        max_jobs_per_pass: int | None = None,
+    ) -> list[HandledJob]:
+        """DCA-110 — claim + safely drive due jobs FAIRLY across tenants, so no busy tenant starves others.
+
+        The load-bearing guarantee: jobs are claimed ROUND-ROBIN across ``business_ids`` under two bounds,
+        so a tenant with a large backlog can never monopolize a pass while another tenant waits:
+
+        - **Per-business cap (TENANT limit).** At most ``max_jobs_per_business`` (default: the configured
+          per-pass per-business cap, itself clamped to the drain batch) jobs are claimed for any ONE
+          tenant; the rest of its backlog stays ``QUEUED`` for a later pass.
+        - **Global cap (GLOBAL limit).** At most ``max_jobs_per_pass`` (default: the configured per-pass
+          cap) jobs are claimed across ALL tenants, so the drain is always bounded.
+        - **Round-robin.** Each round claims ONE job per still-active tenant in the given stable order, so
+          a tenant with a single queued job is serviced in the SAME pass as one with a deep backlog.
+
+        A tenant drops out of the rotation once it hits its cap or has nothing more claimable. The loop
+        ends when every tenant has dropped out, the global cap is hit, a round makes no progress, or a
+        shutdown lands. Fairness only chooses WHICH tenant's job is claimed next — every claim is still the
+        tenant-scoped DCA-101 claim (lease + fencing token), so tenant isolation / RLS and the
+        single-current-claim guarantee are preserved, and a claimed job is parked exactly as before
+        (execution stays a disabled future capability — nothing is run or sent)."""
+        if not business_ids:
+            return []  # no enabled tenants → a no-op pass
+        per_business = (
+            self._max_jobs_per_business
+            if max_jobs_per_business is None
+            else max(0, int(max_jobs_per_business))
+        )
+        # A per-business cap can never let a single tenant exceed the hard drain-batch ceiling.
+        per_business = min(per_business, self._drain_batch)
+        global_cap = (
+            self._max_jobs_per_pass if max_jobs_per_pass is None else max(0, int(max_jobs_per_pass))
+        )
+
+        handled: list[HandledJob] = []
+        remaining: dict[str, int] = {bid: per_business for bid in business_ids}
+        # Active = tenants still eligible this pass (cap not yet hit, still have claimable work). Preserve
+        # the stable enumeration order so the round-robin is deterministic.
+        active = [bid for bid in business_ids if remaining[bid] > 0]
+
+        while active and len(handled) < global_cap and not self._shutdown.is_set():
+            progressed = False
+            # One claim per still-active tenant this round → fair interleaving across tenants.
+            for business_id in list(active):
+                if self._shutdown.is_set() or len(handled) >= global_cap:
+                    break
+                if remaining[business_id] <= 0:
+                    active.remove(business_id)
+                    continue
+                result = self._claim_and_handle_one(business_id, now=now)
+                if result is None:
+                    # Shutdown before the claim, or this tenant has nothing more due — drop it.
+                    active.remove(business_id)
+                    continue
+                handled.append(result)
+                remaining[business_id] -= 1
+                progressed = True
+                if result.relinquished:
+                    # A shutdown raced the claim; the work was relinquished safely. Stop the whole drain.
+                    return handled
+                if remaining[business_id] <= 0:
+                    active.remove(business_id)  # tenant hit its per-pass cap
+            if not progressed:
+                break  # a full round claimed nothing new — the queue is drained for this pass
         return handled
 
     # ---------------------------------------------------------------- the pass + the loop
     def run_pass(
         self, *, now: datetime | None = None, max_jobs_per_business: int | None = None
     ) -> WorkerPassReport:
-        """Run ONE full pass: per-tenant maintenance ticks, then claim + drive due jobs. Honours shutdown.
+        """Run ONE full pass: per-tenant maintenance ticks, then FAIRLY claim + drive due jobs. Honours
+        shutdown.
 
         Order: for each enabled tenant run the DCA-106 recovery sweep and the DCA-108 due-schedule tick
-        (safe, enqueue-only), then drain each tenant's claimable jobs. Every stage checks the shutdown
-        latch so a stop request halts at the next safe checkpoint. A pass that finds nothing due changes
-        nothing. Nothing here runs a handler or sends."""
+        (safe, enqueue-only); then drain claimable jobs ROUND-ROBIN across tenants (DCA-110
+        :meth:`drain_fair`) under the per-business (TENANT) and per-pass (GLOBAL) caps, so a busy tenant
+        never starves another. ``max_jobs_per_business`` overrides the per-business cap for this pass
+        (e.g. a test narrowing it). Every stage checks the shutdown latch so a stop request halts at the
+        next safe checkpoint. A pass that finds nothing due changes nothing. Nothing here runs a handler
+        or sends."""
         moment = now or self._clock()
         business_ids = self.enabled_business_ids()
         recovered: dict[str, LeaseRecoveryReport] = {}
@@ -386,16 +538,14 @@ class DurableJobWorker:
                 break
             scheduled[business_id] = self.tick_schedules(business_id, now=moment)
 
-        for business_id in business_ids:
-            if self._shutdown.is_set():
-                stopped_early = True
-                break
+        if not self._shutdown.is_set():
             handled.extend(
-                self.drain_business(business_id, now=moment, max_jobs=max_jobs_per_business)
+                self.drain_fair(
+                    business_ids, now=moment, max_jobs_per_business=max_jobs_per_business
+                )
             )
-            if self._shutdown.is_set():
-                stopped_early = True
-                break
+        if self._shutdown.is_set():
+            stopped_early = True
 
         return WorkerPassReport(
             worker_id=self._worker_id,

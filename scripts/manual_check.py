@@ -17189,6 +17189,143 @@ def _dca_109(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-110",
+    "fair cross-business scheduling: a backlog-heavy Business A does not starve Business B - one "
+    "worker pass claims jobs ROUND-ROBIN under a per-business (TENANT) cap and a per-pass (GLOBAL) "
+    "cap, printing the real claim ORDER and per-business counts. Execution stays disabled (parked, "
+    "never run/sent).",
+)
+def _dca_110(ctx: CheckContext) -> dict:
+    """Drive the DCA-110 fair drain directly against the ephemeral synthetic DB and print the real
+    resulting claim ORDER + per-business counts + leftover QUEUED rows - never a bare PASS. Shows that a
+    tenant with a large backlog (A) cannot monopolize a pass: with a small per-business cap and a small
+    global cap, Business B's single job is claimed in the SAME pass as A's backlog, interleaved
+    round-robin. Every claimed job is PARKED dead_letter (no handler run, no AI/network, no send)."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.db.models import DurableJobRequest, JobRequestStatus, TenantAgent
+    from app.jobs.store import JobEnqueueRequest, JobRequestStore
+    from app.jobs.worker import ClaimDisposition, DurableJobWorker
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz_a = "11111111-1111-1111-1111-11111111a110"  # the backlog-heavy tenant
+    biz_b = "22222222-2222-2222-2222-22222222b110"  # the small tenant that must still make progress
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)
+
+    def _enable(business_id: str) -> None:
+        with factory() as session:
+            session.add(TenantAgent(business_id=business_id, country="IN", enabled=True))
+            session.commit()
+
+    def _enqueue_many(business_id: str, count: int, prefix: str) -> None:
+        with factory() as session:
+            store = JobRequestStore(session, business_id)
+            for i in range(count):
+                store.enqueue(
+                    JobEnqueueRequest(
+                        job_type="prospect.research",
+                        idempotency_key=f"{prefix}-{i}",
+                        payload_ref=f"dca-payload://synthetic/{prefix}-{i}",
+                    ),
+                    now=now,
+                )
+            session.commit()
+
+    def _counts(business_id: str) -> dict[str, int]:
+        with factory() as session:
+            rows = session.scalars(
+                select(DurableJobRequest.status).where(DurableJobRequest.business_id == business_id)
+            ).all()
+        out: dict[str, int] = {}
+        for status in rows:
+            out[status] = out.get(status, 0) + 1
+        return out
+
+    _enable(biz_a)
+    _enable(biz_b)
+    _enqueue_many(biz_a, 8, "a")  # A floods the queue with a large backlog
+    _enqueue_many(biz_b, 1, "b")  # B has a single job and must not be starved
+
+    # Deliberately tight caps so the behaviour is obvious: at most 3 jobs for any ONE tenant, and at
+    # most 5 across the whole pass. A alone could fill the pass if draining were unfair.
+    worker = DurableJobWorker(
+        factory, ctx.settings, clock=lambda: now, max_jobs_per_business=3, max_jobs_per_pass=5
+    )
+    print(f"\nworker id: {worker.worker_id}")
+    print(f"enabled businesses: {list(worker.enabled_business_ids())}")
+    print("caps: per-business (TENANT) = 3 jobs/pass ; per-pass (GLOBAL) = 5 jobs/pass")
+    print("\nqueued BEFORE the pass:")
+    print(f"   A = {_counts(biz_a).get('queued', 0)} jobs (large backlog)")
+    print(f"   B = {_counts(biz_b).get('queued', 0)} job  (small tenant)")
+
+    report = worker.run_pass(now=now)
+
+    # 1) The real claim ORDER this pass drove - the fairness evidence (interleaved, not A drained first).
+    order = [("A" if h.business_id == biz_a else "B") for h in report.handled]
+    print("\n1) claim ORDER this pass (round-robin across tenants):")
+    print(f"   {' -> '.join(order)}")
+    print(
+        "   (B is serviced in round 1 alongside A - A never drains its whole backlog before B gets a "
+        "turn; B then drops out having only one job, and A continues up to its cap)"
+    )
+
+    # 2) Per-business counts: A capped at its TENANT limit, B serviced in the SAME pass.
+    by_biz = report.handled_by_business
+    print("\n2) jobs driven PER business this pass:")
+    print(f"   A = {by_biz.get(biz_a, 0)} (capped at the per-business limit of 3)")
+    print(f"   B = {by_biz.get(biz_b, 0)} (serviced despite A's backlog - NOT starved)")
+    print(
+        f"   total this pass = {len(report.handled)} (A capped at 3 + B's 1; under the global cap of 5)"
+    )
+
+    # 3) Leftover rows: A's remaining backlog stays QUEUED for later passes; everything driven is parked.
+    a_after = _counts(biz_a)
+    b_after = _counts(biz_b)
+    print("\n3) resulting rows:")
+    print(f"   A: {a_after}  (parked = driven safely, queued = fair leftover for a later pass)")
+    print(f"   B: {b_after}  (its one job parked dead_letter - driven, never run or sent)")
+
+    checks = {
+        "b_serviced_in_same_pass": by_biz.get(biz_b, 0) == 1,
+        "a_capped_at_tenant_limit": by_biz.get(biz_a, 0) == 3,
+        "pass_within_global_cap": len(report.handled)
+        == 4
+        <= 5,  # 3 (A) + 1 (B); under the global cap
+        "a_backlog_preserved_queued": a_after.get("queued", 0) == 5,  # 8 - 3 driven
+        "claim_order_interleaves": order[:2] == ["A", "B"],
+        "all_driven_jobs_parked": report.parked_count == len(report.handled)
+        and report.relinquished_count == 0,
+        "nothing_executed_or_sent": all(
+            h.disposition is ClaimDisposition.PARKED_NO_HANDLER for h in report.handled
+        ),
+        "a_driven_rows_are_dead_letter": a_after.get(JobRequestStatus.DEAD_LETTER.value, 0) == 3,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send. DCA-110 makes the worker drain "
+        "jobs FAIRLY across enabled tenants: round-robin claiming under a per-business TENANT cap and a "
+        "per-pass GLOBAL cap, so a backlog-heavy tenant cannot monopolize a pass while another waits. "
+        "Fairness is a selection policy on the DCA-101 tenant-scoped claim - tenant isolation/RLS is "
+        "preserved - and handler EXECUTION stays a DISABLED future capability: every claimed job is "
+        "PARKED dead_letter for operator inspection, never run or sent. Emergency stops (DCA-111) are a "
+        "later story.)"
+    )
+    return {
+        "worker_id": worker.worker_id,
+        "claim_order": order,
+        "handled_by_business": {"A": by_biz.get(biz_a, 0), "B": by_biz.get(biz_b, 0)},
+        "total_this_pass": len(report.handled),
+        "a_rows": a_after,
+        "b_rows": b_after,
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
