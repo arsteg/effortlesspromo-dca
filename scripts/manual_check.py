@@ -9605,6 +9605,309 @@ def _dca_071(ctx: CheckContext) -> dict:
 
 
 @register(
+    "DCA-072",
+    "reverse a reviewed identity merge: into synthetic Business A record two reviewed-compatible merges "
+    "(an ambiguous same-name ORG pair and a PERSON pair), then UNDO one — show status flips active -> "
+    "reversed, the identities are separate again, the row and its original record-audit are preserved "
+    "and a SEPARATE reverse-audit entry is appended (nothing deleted). Show the relevant denials: a "
+    "read-only viewer, a platform operator and an AI/automation actor are each REFUSED and change "
+    "nothing; an unknown / cross-tenant merge id is not-found; a double-reversal is refused. Then the "
+    "KEY consent guarantee: WITHDRAW a consent between the merge and the reversal and prove reversal does "
+    "NOT resurrect it (consent state untouched, the withdrawal still stands)",
+)
+def _dca_072(ctx: CheckContext) -> dict:
+    """Exercise the DCA-072 identity-merge REVERSAL (manual-test step 2: merge two fixtures, undo the
+    merge and compare) on local synthetic fixtures. A reversal is the HUMAN review ACTION that undoes a
+    prior DCA-071 merge by flipping ``active`` -> ``reversed`` under the SAME 'identity.merge' authority:
+    it deletes no row and no audit history, and — like the merge — never touches consent/restriction
+    state, so it can never resurrect a consent withdrawn in the meantime. The harness cleans up the
+    ephemeral DB. No AI/paid/network path.
+    """
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import AuditEvent, ConsentReceipt, IdentityMerge, IdentityMergeStatus
+    from app.identity.permissions import PLATFORM_OPERATOR_ROLE
+    from app.services.contact_point import ContactPointStore, PersonInput
+    from app.services.identity_merge import (
+        AUDIT_ACTION_RECORD_MERGE,
+        AUDIT_ACTION_REVERSE_MERGE,
+        IdentityMergeAuthorizationError,
+        IdentityMergeError,
+        IdentityMergeInput,
+        IdentityMergeStore,
+        IdentityReviewer,
+    )
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+
+    biz_a = "11111111-1111-1111-1111-111111111111"
+    biz_b = "22222222-2222-2222-2222-222222222222"
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0072", type=ActorType.USER)
+    merged_at = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    reversed_at = datetime(2026, 10, 31, 13, 0, tzinfo=UTC)
+
+    reviewer = IdentityReviewer(subject="00000000-0000-4000-9000-0000000c0071", roles=("user",))
+    viewer = IdentityReviewer(subject="00000000-0000-4000-9000-0000000c0072", roles=("viewer",))
+    operator = IdentityReviewer(
+        subject="00000000-0000-4000-9000-0000000c0073", roles=(PLATFORM_OPERATOR_ROLE,)
+    )
+    ai_actor = IdentityReviewer(
+        subject="00000000-0000-4000-9000-0000000c0074", roles=("user",), actor_type="service"
+    )
+
+    out: dict = {"business_a": biz_a, "business_b": biz_b}
+
+    def _org(session, business_id, name):
+        return (
+            OrgObservationStore(session, business_id)
+            .create(ObservationInput(entity_type="legal_entity", display_name=name), actor=actor)
+            .id
+        )
+
+    def _person(session, business_id, name):
+        return (
+            ContactPointStore(session, business_id)
+            .create_person(PersonInput(display_name=name), actor=actor)
+            .id
+        )
+
+    def _consent(session, subject_id, cp, action, at):
+        session.add(
+            ConsentReceipt(
+                business_id=biz_a,
+                brand_key="synthetic_brand",
+                subject_type="person",
+                subject_id=subject_id,
+                contact_point_id=cp,
+                channel="email",
+                purpose="marketing_email",
+                action=action,
+                notice_version="notice-v1",
+                form_version="form-v1",
+                language="en",
+                evidence_id=f"evidence-{action}-{subject_id}",
+                collected_at=at,
+            )
+        )
+
+    # --- setup: record two reviewed-compatible merges (an ORG pair + a PERSON pair w/ consent) -----
+    with ctx.session_factory() as session:
+        org_primary = _org(session, biz_a, "Synthetic Textiles Pvt Ltd")
+        org_duplicate = _org(session, biz_a, "Synthetic Textiles Pvt Ltd")
+        person_primary = _person(session, biz_a, "Anil Kumar Sharma")
+        person_duplicate = _person(session, biz_a, "Anil Kumar Sharma")
+        _consent(session, person_primary, "cp-primary", "grant", merged_at)
+        _consent(session, person_duplicate, "cp-duplicate", "grant", merged_at)
+        store = IdentityMergeStore(session, biz_a)
+        org_merge = store.merge(
+            IdentityMergeInput(
+                subject_type="organization",
+                primary_subject_id=org_primary,
+                duplicate_subject_id=org_duplicate,
+                reason="same_name_reviewed",
+            ),
+            reviewer=reviewer,
+            now=merged_at,
+        )
+        person_merge = store.merge(
+            IdentityMergeInput(
+                subject_type="person",
+                primary_subject_id=person_primary,
+                duplicate_subject_id=person_duplicate,
+            ),
+            reviewer=reviewer,
+            now=merged_at,
+        )
+        session.commit()
+        org_merge_id = org_merge.id
+        person_merge_id = person_merge.id
+
+    # Between the merge and the reversal, the PERSON subject WITHDRAWS consent.
+    with ctx.session_factory() as session:
+        _consent(session, person_primary, "cp-primary", "withdraw", reversed_at)
+        session.commit()
+
+    with ctx.session_factory() as session:
+        consent_before = len(session.scalars(select(ConsentReceipt)).all())
+
+    # --- reverse the ORG merge (the undo) ---------------------------------------------------------
+    with ctx.session_factory() as session:
+        store = IdentityMergeStore(session, biz_a)
+        row_before = store.get(org_merge_id)
+        assert row_before is not None
+        status_before_reverse = row_before.status
+        store.reverse(org_merge_id, reviewer=reviewer, now=reversed_at, reason="merged_in_error")
+        session.commit()
+
+    # --- the relevant DENIALS (each refused, nothing changed) -------------------------------------
+    denials: dict = {}
+
+    def _attempt(label, fn):
+        with ctx.session_factory() as session:
+            store = IdentityMergeStore(session, biz_a)
+            try:
+                fn(store)
+                denials[label] = {"refused": False, "code": None}
+            except (IdentityMergeAuthorizationError, IdentityMergeError) as exc:
+                session.rollback()
+                denials[label] = {"refused": True, "code": exc.code}
+
+    # The still-ACTIVE person merge is the target for the authority denials (so a refusal is meaningful).
+    _attempt(
+        "read_only_viewer",
+        lambda s: s.reverse(person_merge_id, reviewer=viewer, now=reversed_at),
+    )
+    _attempt(
+        "platform_operator",
+        lambda s: s.reverse(person_merge_id, reviewer=operator, now=reversed_at),
+    )
+    _attempt(
+        "ai_automation_actor",
+        lambda s: s.reverse(person_merge_id, reviewer=ai_actor, now=reversed_at),
+    )
+    _attempt(
+        "unknown_merge_id",
+        lambda s: s.reverse(
+            "00000000-0000-4000-9000-000000000bad", reviewer=reviewer, now=reversed_at
+        ),
+    )
+    _attempt(
+        "double_reversal",
+        lambda s: s.reverse(org_merge_id, reviewer=reviewer, now=reversed_at),
+    )
+
+    # Business B cannot reverse A's merge (cross-tenant not-found).
+    cross_tenant: dict[str, object] = {"refused": False, "code": None}
+    with ctx.session_factory() as session:
+        store_b = IdentityMergeStore(session, biz_b)
+        try:
+            store_b.reverse(person_merge_id, reviewer=reviewer, now=reversed_at)
+        except IdentityMergeError as exc:
+            session.rollback()
+            cross_tenant = {"refused": True, "code": exc.code}
+
+    # --- inspect the resulting state --------------------------------------------------------------
+    with ctx.session_factory() as session:
+        merges = session.scalars(select(IdentityMerge)).all()
+        merge_rows = [
+            {
+                "id": m.id,
+                "subject_type": m.subject_type,
+                "status": m.status,
+                "primary": m.primary_subject_id,
+                "duplicate": m.duplicate_subject_id,
+                "reviewer": m.reviewer_id,
+            }
+            for m in merges
+        ]
+        record_audits = len(
+            session.scalars(
+                select(AuditEvent).where(AuditEvent.action == AUDIT_ACTION_RECORD_MERGE)
+            ).all()
+        )
+        reverse_audits = session.scalars(
+            select(AuditEvent).where(AuditEvent.action == AUDIT_ACTION_REVERSE_MERGE)
+        ).all()
+        receipts = session.scalars(select(ConsentReceipt)).all()
+        consent_after = len(receipts)
+        primary_consent_actions = sorted(
+            r.action for r in receipts if r.subject_id == person_primary
+        )
+
+    org_row = next(r for r in merge_rows if r["id"] == org_merge_id)
+    person_row = next(r for r in merge_rows if r["id"] == person_merge_id)
+
+    print("\n1) the UNDO — status flips active -> reversed; the row & its history are preserved:")
+    print(
+        f"   org merge {org_merge_id}: status before={status_before_reverse} -> "
+        f"after={org_row['status']} (row NOT deleted; subjects/reviewer intact)"
+    )
+    print(
+        f"   record-audit entries preserved = {record_audits}; "
+        f"reverse-audit entries appended = {len(reverse_audits)}"
+    )
+    if reverse_audits:
+        refs = reverse_audits[0].references
+        print(
+            f"   reverse-audit refs: mergeId={refs['identityMergeId']} "
+            f"{refs['previousStatus']} -> {refs['newStatus']} actor={reverse_audits[0].actor_id}"
+        )
+    print(f"   the still-ACTIVE person merge = {person_row['status']} (only the org merge was undone)")
+
+    print("\n2) the relevant denials (each refused, nothing changed):")
+    for label, d in denials.items():
+        print(f"   - {label:<24} refused={d['refused']} code={d['code']}")
+    print(
+        f"   - {'cross_tenant (B->A merge)':<24} refused={cross_tenant['refused']} "
+        f"code={cross_tenant['code']}"
+    )
+
+    print("\n3) reversal does NOT resurrect revoked consent (the KEY guarantee):")
+    print(f"   consent receipts before reverse={consent_before}  after={consent_after}  (unchanged)")
+    print(
+        f"   person_primary consent actions still = {primary_consent_actions} "
+        "(the withdrawal STILL stands; nothing re-granted)"
+    )
+
+    checks = {
+        "org_merge_flipped_to_reversed": org_row["status"] == IdentityMergeStatus.REVERSED.value,
+        "person_merge_still_active": person_row["status"] == IdentityMergeStatus.ACTIVE.value,
+        "nothing_deleted_two_rows_remain": len(merge_rows) == 2,
+        "record_audit_preserved": record_audits == 2,
+        "one_reverse_audit_appended": len(reverse_audits) == 1,
+        "viewer_refused": denials["read_only_viewer"] == {
+            "refused": True,
+            "code": "identity_merge_not_authorized",
+        },
+        "operator_refused": denials["platform_operator"]["refused"] is True,
+        "ai_actor_refused": denials["ai_automation_actor"] == {
+            "refused": True,
+            "code": "identity_merge_ai_actor_forbidden",
+        },
+        "unknown_id_not_found": denials["unknown_merge_id"] == {
+            "refused": True,
+            "code": "identity_merge_not_found",
+        },
+        "double_reversal_refused": denials["double_reversal"] == {
+            "refused": True,
+            "code": "identity_merge_already_reversed",
+        },
+        "cross_tenant_not_found": cross_tenant == {
+            "refused": True,
+            "code": "identity_merge_not_found",
+        },
+        "revoked_consent_not_resurrected": (
+            consent_after == consent_before == 3
+            and primary_consent_actions == ["grant", "withdraw"]
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    out["merges"] = merge_rows
+    out["denials"] = {**denials, "cross_tenant": cross_tenant}
+    out["consent"] = {
+        "before": consent_before,
+        "after": consent_after,
+        "primary_actions": primary_consent_actions,
+    }
+    out["audit"] = {"record_entries": record_audits, "reverse_entries": len(reverse_audits)}
+    out["ids"] = {"org_merge": org_merge_id, "person_merge": person_merge_id}
+    out["checks"] = checks
+    print(
+        "\n(local synthetic only; no AI/paid action, no network. Reversal is a reviewed, AUTHORIZED "
+        "human ACTION that undoes a prior merge by flipping active -> reversed under the SAME "
+        "'identity.merge' authority — a read-only viewer, a platform operator, an AI/automation actor, "
+        "an unknown / cross-tenant id and a double-reversal are each refused with no state change. It "
+        "deletes NO row and NO audit history (a separate reverse-audit entry is appended) and, like the "
+        "merge, never touches consent/suppression/restriction state, so a consent withdrawn between the "
+        "merge and the reversal is NEVER resurrected. Acting on the (un)merged identity downstream stays "
+        "a disabled future capability.)"
+    )
+    return out
+
+
+@register(
     "DCA-073",
     "expose SEPARATE quality dimensions: record synthetic field observations for one subject in "
     "Business A (a fresh value + a 400-day-stale value), build the freshness/completeness evidence "

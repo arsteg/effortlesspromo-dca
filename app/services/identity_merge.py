@@ -46,8 +46,11 @@ The store stages into the *caller's* session and never commits — the caller ow
 the merge row and its atomic DCA-026 audit entry commit together. Audit references stay OPAQUE (ids /
 subject kind / match outcome / signal count) — never the evidence signal details or any raw value.
 Recording a merge creates no prospect / host record and sends nothing; acting on the merged identity
-downstream (collapsing observations, combining records) stays a DISABLED future capability, and
-reversing a merge is the SEPARATE next story (DCA-072) — this story only records ``ACTIVE`` merges.
+downstream (collapsing observations, combining records) stays a DISABLED future capability.
+:meth:`IdentityMergeStore.reverse` (DCA-072) undoes a recorded merge by flipping ``ACTIVE`` → ``REVERSED``
+under the SAME reviewer authority — it preserves all history (the row and its audit are never deleted,
+a separate reverse audit entry is appended) and, like the merge, never touches consent/restriction
+state, so a reversal can never resurrect a consent that was withdrawn in the meantime.
 """
 
 from __future__ import annotations
@@ -76,6 +79,10 @@ SUBJECT_TYPES: tuple[str, ...] = tuple(t.value for t in FieldSubjectType)
 
 # The audited action code for recording an identity merge (a controlled code, like the other writes).
 AUDIT_ACTION_RECORD_MERGE = "identity.merge.record"
+# The audited action code for reversing a previously-recorded identity merge (DCA-072). A SEPARATE,
+# controlled code from the record above — a reversal is its own auditable event, never an edit of the
+# original record's audit entry, so the full history (recorded → reversed) is preserved.
+AUDIT_ACTION_REVERSE_MERGE = "identity.merge.reverse"
 
 # Stable refusal codes. Each is raised BEFORE the session is mutated, so a refusal stages no row.
 REASON_NOT_AUTHORIZED = "identity_merge_not_authorized"
@@ -84,6 +91,12 @@ REASON_UNKNOWN_SUBJECT_TYPE = "unknown_subject_type"
 REASON_SUBJECT_NOT_FOUND = "subject_not_found"
 REASON_SELF_MERGE = "self_merge"
 REASON_INCOMPATIBLE_IDENTITIES = "incompatible_identities"
+# DCA-072 reversal refusal codes. A merge that cannot be found in this business (an unknown id OR
+# another tenant's id — both read as not-found) and a merge that is already reversed (there is nothing
+# left to undo) are each refused with a stable code before the session is mutated, so a refused
+# reversal changes NOTHING.
+REASON_MERGE_NOT_FOUND = "identity_merge_not_found"
+REASON_ALREADY_REVERSED = "identity_merge_already_reversed"
 
 # The matcher outcomes a human may approve a merge on: a confirmed match, or an AMBIGUOUS review
 # candidate (the "approve an ambiguous identity merge" case). A NO_MATCH / INSUFFICIENT pair is never
@@ -438,6 +451,101 @@ class IdentityMergeStore:
                 "matchOutcome": evidence.outcome,
                 "matchConfidence": evidence.confidence,
                 "signalCount": len(evidence.signals),
+            },
+        )
+        return merge
+
+    def reverse(
+        self,
+        merge_id: str,
+        reviewer: IdentityReviewer,
+        *,
+        reason: str = "",
+        now: datetime | None = None,
+    ) -> IdentityMerge:
+        """Reverse (undo) a previously-recorded ACTIVE merge; return the (uncommitted) row.
+
+        A reversal is the human ACTION that undoes a prior merge decision — it flips an ``ACTIVE`` row's
+        ``status`` to :attr:`~app.db.models.IdentityMergeStatus.REVERSED`, restoring the two identities to
+        their SEPARATE / unmerged state (the active link between them no longer stands). It preserves all
+        history: the merge row is NEVER deleted and the original DCA-071 ``identity.merge.record`` audit
+        entry is never touched — the row's own lineage (both subjects, direction, evidence, original
+        reviewer) stays intact, and a SEPARATE :data:`AUDIT_ACTION_REVERSE_MERGE` audit entry is appended,
+        so the full recorded→reversed trail is readable.
+
+        Order of gates (each leaves NO state behind when it refuses):
+
+        1. **Authority FIRST (same gate as the merge).** A reversal is a HUMAN review action requiring the
+           SAME :attr:`~app.identity.permissions.Scope.IDENTITY_MERGE` scope: a non-human (AI/automation)
+           actor is refused (:data:`REASON_AI_ACTOR_CANNOT_MERGE`) and a human lacking the scope — a
+           read-only viewer, a non-member, a platform operator — is refused (:data:`REASON_NOT_AUTHORIZED`)
+           BEFORE any state is read or written.
+        2. **Found & reversible.** A merge that is not in THIS business (an unknown id OR another tenant's
+           id — both read as not-found) is refused (:data:`REASON_MERGE_NOT_FOUND`); a merge that is
+           ALREADY reversed is refused (:data:`REASON_ALREADY_REVERSED`) — there is nothing left to undo,
+           so a double-reversal changes nothing.
+
+        **Consent is NEVER resurrected.** Because the merge never combined or transferred any
+        :class:`~app.db.models.ConsentReceipt` / :class:`~app.db.models.ProcessingRestriction` (DCA-071),
+        its reversal has nothing to unwind on those tables and this method NEVER touches them — so any
+        consent that was withdrawn in the meantime stays withdrawn, and no permission is re-granted or
+        recombined. Reversal moves identity state only.
+
+        On success the row is flipped to ``REVERSED`` and an atomic DCA-026 audit entry is staged in the
+        SAME unit of work (opaque references only — ids / subject kind / outcome / the status transition,
+        never the evidence details or any raw value). Acting on the (un)merged identity downstream stays a
+        DISABLED future capability. The caller owns the transaction.
+        """
+        moment = now or datetime.now(UTC)
+
+        # 1) Authority FIRST — an AI/automation actor or an unauthorized human is refused, no state read.
+        if not reviewer.is_human_reviewer():
+            raise IdentityMergeAuthorizationError(
+                REASON_AI_ACTOR_CANNOT_MERGE,
+                "reversing a merge is a human review action; an AI suggestion / automation actor "
+                f"('{reviewer.actor_type}') can never execute one",
+            )
+        if not reviewer.has_merge_scope():
+            raise IdentityMergeAuthorizationError(
+                REASON_NOT_AUTHORIZED,
+                "reversing an identity merge requires a business user holding "
+                f"'{Scope.IDENTITY_MERGE.value}'; a read-only viewer or a non-member cannot perform it",
+            )
+
+        # 2) Found & reversible — a cross-tenant / unknown id reads as not-found; an already-reversed
+        #    merge has nothing left to undo. Both refuse before the session is mutated.
+        merge = self.get(merge_id)
+        if merge is None:
+            raise IdentityMergeError(
+                REASON_MERGE_NOT_FOUND,
+                "no such identity merge in this business (an unknown or cross-tenant id is not-found)",
+                detail=merge_id,
+            )
+        if merge.status != IdentityMergeStatus.ACTIVE.value:
+            raise IdentityMergeError(
+                REASON_ALREADY_REVERSED,
+                f"identity merge '{merge.id}' is '{merge.status}', not active — nothing to reverse",
+                detail=merge.status,
+            )
+
+        previous_status = merge.status
+        merge.status = IdentityMergeStatus.REVERSED.value
+
+        # Atomic audit (SEC-001/BR-122): a SEPARATE event appended in the caller's session so it commits
+        # with the flip. References stay OPAQUE — ids / subject kind / outcome / the status transition —
+        # NEVER the evidence signal details or any raw value. Consent tables are NEVER touched here.
+        AuditSink(self._session, business_id=self._business_id, actor=reviewer.as_actor()).record(
+            action=AUDIT_ACTION_REVERSE_MERGE,
+            reason=(reason or "").strip() or f"reversed identity merge '{merge.id}'",
+            references={
+                "identityMergeId": merge.id,
+                "subjectType": merge.subject_type,
+                "primarySubjectId": merge.primary_subject_id,
+                "duplicateSubjectId": merge.duplicate_subject_id,
+                "matchOutcome": merge.match_outcome,
+                "previousStatus": previous_status,
+                "newStatus": merge.status,
+                "reversedAt": moment.isoformat(),
             },
         )
         return merge
