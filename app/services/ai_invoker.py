@@ -16,7 +16,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.clients.ai_client import AiClient, AiServiceUnavailable
+from app.clients.ai_client import AiClient, AiServiceTimeout, AiServiceUnavailable
 from app.db.models import AiInvocation
 
 
@@ -51,8 +51,13 @@ def invoke_recorded(
             correlation_id=correlation_id,
             dry_run=dry_run,
         )
-    except AiServiceUnavailable:
-        invocation.status = "unavailable"  # retryable later with the same request_id
+    except AiServiceUnavailable as exc:
+        # Distinguish a NOT-submitted failure (safe to retry fresh) from a timed-out, POSSIBLY-submitted
+        # one (the gateway may have processed/charged the call): the latter is "uncertain" and must be
+        # reconciled by replaying the SAME deterministic request_id against the gateway's idempotency
+        # cache, never blindly re-run (DCA-129 acceptance). Both keep the durable row (the AI-side cache
+        # is in-memory and does not survive restarts).
+        invocation.status = "uncertain" if isinstance(exc, AiServiceTimeout) else "unavailable"
         session.commit()
         raise
 

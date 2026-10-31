@@ -21054,6 +21054,205 @@ def _dca_128(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-129",
+    "the authenticated DCA HTTP adapter to the existing effortlesspromo-ai gateway. Drive real calls "
+    "against an IN-PROCESS fake gateway (NO socket, NO network, NO model, NO spend) and show: an "
+    "authorized call carrying X-Service-Auth + a distinct X-Correlation-Id + the deterministic "
+    "X-Request-Id, with the provider/model the GATEWAY selected recorded back (routing is the "
+    "gateway's job, not the DCA's); then the fail-safe denials — a capability that would escape the "
+    "pinned /v1 path is refused before any I/O, an unauthorized 4xx is rejected with the body/token "
+    "REDACTED, a read timeout is marked UNCERTAIN (possibly submitted) while a clean connect failure "
+    "is unavailable. No provider SDK/key/routing lives in the adapter.",
+)
+def _dca_129(ctx: CheckContext) -> dict:
+    """Exercise the DCA-129 HTTP adapter end-to-end against a local in-process fake gateway and PRINT
+    the REAL outcomes — never a bare PASS. The fake gateway mirrors effortlesspromo-ai: it verifies
+    ``X-Service-Auth``, echoes ``jobId``/``capability``, and reports which provider/model IT chose
+    (honouring the ``modelHint`` the DCA merely *suggests*) — proving the DCA records the routing
+    outcome without choosing it. Uses ``httpx.MockTransport`` so there is NO socket and NO spend."""
+    import json
+
+    import httpx
+    from sqlalchemy import select
+
+    from app.clients.ai_client import (
+        AiClient,
+        AiEndpointNotAllowed,
+        AiServiceRejected,
+        AiServiceTimeout,
+        AiServiceUnavailable,
+    )
+    from app.db.models import AiInvocation
+    from app.services.ai_invoker import invoke_recorded
+
+    token = "demo-service-secret-token"  # a sentinel — must never appear in a raised error
+    requests_seen: list[httpx.Request] = []
+
+    def gateway(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        if request.headers.get("X-Service-Auth") != token:
+            # A hostile/echoing body: the DCA must NOT surface the token or PII from it.
+            return httpx.Response(401, text=f"unauthorized token={token} email=victim@example.com")
+        body = json.loads(request.read())
+        capability = str(request.url).rsplit("/", 1)[-1]
+        # The GATEWAY selects the provider/model (honouring the hint if given) — the DCA does not.
+        model = body.get("modelHint") or "claude-sonnet-5"
+        return httpx.Response(
+            200,
+            json={
+                "jobId": body["jobId"],
+                "capability": capability,
+                "status": "completed",
+                "modelProvider": "anthropic",
+                "modelId": model,
+                "costEstimate": {
+                    "amount": 0.0 if body["dryRun"] else 0.012,
+                    "currency": "USD",
+                    "estimated": body["dryRun"],
+                },
+            },
+        )
+
+    client = AiClient("http://ai.internal", token, transport=httpx.MockTransport(gateway))
+    out: dict = {}
+
+    # 1) AUTHORIZED call — show the headers the adapter sent and the provider/model the gateway chose.
+    envelope = client.invoke(
+        "research",
+        business_id="biz-A",
+        job_id="dca:inv-129",
+        request_id="dca:inv-129",
+        correlation_id="trace-xyz",
+        model_hint="claude-opus-4",  # a SUGGESTION — the gateway decides
+        dry_run=True,
+    )
+    sent = requests_seen[-1]
+    out["authorized"] = {
+        "url": str(sent.url),
+        "service_auth_sent": sent.headers.get("X-Service-Auth") == token,
+        "request_id": sent.headers.get("X-Request-Id"),
+        "correlation_id": sent.headers.get("X-Correlation-Id"),
+        "provider_gateway_selected": envelope["modelProvider"],
+        "model_gateway_selected": envelope["modelId"],
+        "cost_estimated_dry_run": envelope["costEstimate"]["estimated"],
+    }
+
+    # 2) ALLOWLIST — a capability that would escape the pinned /v1 path is refused before any I/O.
+    before = len(requests_seen)
+    try:
+        client.invoke("../admin", business_id="biz-A", job_id="dca:x", request_id="dca:x")
+        out["allowlist_refusal"] = {"refused": False}
+    except AiEndpointNotAllowed as exc:
+        out["allowlist_refusal"] = {
+            "refused": True,
+            "error": type(exc).__name__,
+            "no_io": len(requests_seen) == before,
+        }
+
+    # 3) REDACTED 4xx — a wrong token is rejected (non-retryable) and the raised error leaks nothing.
+    bad_client = AiClient(
+        "http://ai.internal", "wrong-token", transport=httpx.MockTransport(gateway)
+    )
+    try:
+        bad_client.invoke("research", business_id="biz-A", job_id="dca:y", request_id="dca:y")
+        out["unauthorized"] = {"rejected": False}
+    except AiServiceRejected as exc:
+        msg = str(exc)
+        out["unauthorized"] = {
+            "rejected": True,
+            "status_code": exc.status_code,
+            "message": msg,
+            "leaks": [s for s in (token, "victim@example.com", "unauthorized") if s in msg],
+        }
+
+    # 4/5) Durable classification via the recorder: a read timeout is UNCERTAIN (possibly submitted),
+    #      a clean connect failure is UNAVAILABLE (safe to retry fresh) — both keep the durable row.
+    def _timeout_gateway(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    def _connect_gateway(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    timeout_client = AiClient(
+        "http://ai.internal", token, transport=httpx.MockTransport(_timeout_gateway)
+    )
+    connect_client = AiClient(
+        "http://ai.internal", token, transport=httpx.MockTransport(_connect_gateway)
+    )
+
+    with ctx.session_factory() as session:
+        try:
+            invoke_recorded(session, timeout_client, business_id="biz-A", capability="research")
+        except AiServiceTimeout:
+            pass
+        try:
+            invoke_recorded(session, connect_client, business_id="biz-A", capability="research")
+        except AiServiceUnavailable:
+            pass
+
+    with ctx.session_factory() as session:
+        rows = session.scalars(select(AiInvocation).order_by(AiInvocation.created_at)).all()
+        out["durable_rows"] = [
+            {"capability": r.capability, "status": r.status, "request_id": r.request_id}
+            for r in rows
+        ]
+
+    a = out["authorized"]
+    print("\n1) AUTHORIZED call to the gateway (in-process fake; no socket, no spend):")
+    print(f"   url={a['url']}  X-Service-Auth sent={a['service_auth_sent']}")
+    print(
+        f"   X-Request-Id={a['request_id']} (deterministic)  X-Correlation-Id={a['correlation_id']} (trace)"
+    )
+    print(
+        f"   GATEWAY selected provider={a['provider_gateway_selected']} "
+        f"model={a['model_gateway_selected']} (the DCA only suggested a hint)"
+    )
+    print(f"   dry_run cost estimated (no spend)={a['cost_estimated_dry_run']}")
+
+    r = out["allowlist_refusal"]
+    print(
+        f"\n2) ALLOWLIST: capability '../admin' refused={r['refused']} ({r.get('error')}), no_io={r.get('no_io')}"
+    )
+    u = out["unauthorized"]
+    print(f"\n3) REDACTED 4xx: rejected={u['rejected']} status={u.get('status_code')}")
+    print(f"   raised message: {u.get('message')!r}")
+    print(f"   leaked sentinels in error: {u.get('leaks')}")
+
+    print("\n4/5) DURABLE classification (the durable AiInvocation rows this run wrote):")
+    for row in out["durable_rows"]:
+        print(
+            f"   capability={row['capability']} status={row['status']} request_id={row['request_id']}"
+        )
+
+    checks = {
+        "authorized_sends_service_auth": a["service_auth_sent"] is True,
+        "request_id_is_deterministic": a["request_id"] == "dca:inv-129",
+        "correlation_distinct_from_request_id": a["correlation_id"] != a["request_id"],
+        "provider_recorded_not_chosen_by_dca": a["provider_gateway_selected"] == "anthropic",
+        "allowlist_refused_before_io": r["refused"] is True and r["no_io"] is True,
+        "unauthorized_rejected_and_redacted": u["rejected"] is True and u["leaks"] == [],
+        "timeout_marked_uncertain": any(
+            row["status"] == "uncertain" for row in out["durable_rows"]
+        ),
+        "connect_failure_marked_unavailable": any(
+            row["status"] == "unavailable" for row in out["durable_rows"]
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; an IN-PROCESS fake gateway via httpx.MockTransport — NO socket, NO "
+        "network, NO model, NO spend. DCA-129 is the authenticated HTTP ADAPTER to the existing "
+        "effortlesspromo-ai gateway: an allowlisted single-origin /v1/<capability> URL, X-Service-Auth, "
+        "a distinct X-Correlation-Id trace id alongside the deterministic X-Request-Id idempotency key, "
+        "explicit connect+overall deadlines, and redacted errors. Provider ROUTING/failover stays the "
+        "gateway's job — the DCA only suggests a model hint and RECORDS which provider the gateway used. "
+        "A read timeout is UNCERTAIN, so recovery replays the SAME request id against the gateway's "
+        "idempotency cache rather than blindly re-running. No provider SDK/key/routing lives in the DCA.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

@@ -141,6 +141,7 @@ def build_ai_gateway_transport(settings: Any) -> FakeAiGatewayTransport | AiClie
             getattr(settings, "ai_base_url", None),
             getattr(settings, "ai_service_token", None),
             timeout_seconds=float(getattr(settings, "ai_timeout_seconds", 100.0)),
+            connect_timeout_seconds=float(getattr(settings, "ai_connect_timeout_seconds", 5.0)),
         )
     if getattr(settings, "is_production", False):
         raise AiContractDisabled(

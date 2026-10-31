@@ -2006,7 +2006,7 @@ class AiInvocation(TenantOwned, Base):
     dry_run: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(
         String(16), default="pending"
-    )  # pending|completed|failed|unavailable
+    )  # pending|completed|failed|unavailable|uncertain (DCA-129: timed-out, possibly submitted)
     response_status: Mapped[str | None] = mapped_column(String(16), default=None)
     cost_amount: Mapped[float] = mapped_column(Float, default=0.0)
     cost_currency: Mapped[str] = mapped_column(String(8), default="USD")

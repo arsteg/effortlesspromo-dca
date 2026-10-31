@@ -150,7 +150,10 @@ class Settings(BaseSettings):
     # --- outbound: existing effortlesspromo-ai gateway (all model execution goes there) ---
     ai_base_url: str | None = None  # empty => AI-dependent features disabled
     ai_service_token: str | None = None  # must equal the AI service's service_auth_token
-    ai_timeout_seconds: float = 100.0  # matches the .NET caller's effective default
+    ai_timeout_seconds: float = (
+        100.0  # overall deadline (matches the .NET caller's effective default)
+    )
+    ai_connect_timeout_seconds: float = 5.0  # DCA-129: separate connect deadline — never unbounded
 
     # --- outbound: the platform (.NET API) HTTP transport (DCA-032) — OFF by default ---
     # The hardened transport MECHANISM for calling the platform API: single allowlisted origin,
@@ -368,6 +371,14 @@ def validate_required(settings: Settings) -> None:
         raise RuntimeError(
             "AI integration is enabled (EFFORTLESSPROMO_DCA_AI_BASE_URL set) but "
             "EFFORTLESSPROMO_DCA_AI_SERVICE_TOKEN is missing"
+        )
+
+    # DCA-129: the AI HTTP adapter's deadlines must be positive so a gateway call is never unbounded
+    # (a non-positive connect or overall timeout would disable the very protection). Name only the key.
+    if settings.ai_timeout_seconds <= 0 or settings.ai_connect_timeout_seconds <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_AI_TIMEOUT_SECONDS and "
+            "EFFORTLESSPROMO_DCA_AI_CONNECT_TIMEOUT_SECONDS must be positive"
         )
 
     # DCA-032: the platform HTTP transport, when its base URL is set, MUST carry a scoped credential —
