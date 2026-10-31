@@ -20301,6 +20301,275 @@ def _dca_125(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-126",
+    "import a client's private contact CSV (the fourth concrete source adapter, and the FIRST that "
+    "writes PERSONAL data): a caller-supplied private list is mapped + validated and imported into the "
+    "tenant-private DCA-060 person/contact store with the CLIENT-ASSERTED lawful basis + provenance. "
+    "Importing is NOT recipient consent — no ConsentReceipt is fabricated, a subscribed flag is never "
+    "trusted, and a suppressed (DCA-079) or restricted (DCA-078) contact is EXCLUDED/flagged (no "
+    "contactable record). Idempotent; tenant-private (B can never see A's imported contacts).",
+)
+def _dca_126(ctx: CheckContext) -> dict:
+    """Drive the real DCA-126 private-contact importer against a disposable DB with isolated synthetic
+    Businesses A/B and PRINT the REAL imported person/contact rows, the client-asserted basis/provenance,
+    the suppressed + restricted EXCLUSIONS (flagged, no contactable record), the idempotent re-import AND
+    the tenant isolation (B cannot see A's imported contacts) — never a bare PASS. The CSV is caller-
+    supplied synthetic data: no network, no socket, no fetch. Importing is NOT recipient consent: no
+    ConsentReceipt is created and a ``subscribed`` flag is never trusted."""
+    from datetime import UTC, datetime
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import ConsentReceipt, ContactPoint, PersonObservation
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.processing_restriction import (
+        ProcessingRestrictionInput,
+        ProcessingRestrictionStore,
+        RestrictionPrincipal,
+    )
+    from app.sources.private_contact_import import (
+        PrivateContactImporter,
+        PrivateImportManifest,
+    )
+    from app.suppression.contract import (
+        SuppressionAvailability,
+        SuppressionEntry,
+        SuppressionSnapshot,
+    )
+
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0126", type=ActorType.USER)
+    restrictor = RestrictionPrincipal(
+        subject="00000000-0000-4000-9000-0000000a0126", roles=("user",)
+    )
+    suppressed_email = "optedout@synthetic-a.example"
+
+    def _manifest(dataset_id: str) -> PrivateImportManifest:
+        return PrivateImportManifest(
+            dataset_id=dataset_id,
+            basis="existing_customer",
+            purpose="account_servicing",
+            source_label="acme_crm_export",
+            source_version="2026-09-30",
+        )
+
+    def _snapshot(business_id: str, *, with_suppression: bool) -> SuppressionSnapshot:
+        entries = (
+            (
+                SuppressionEntry(
+                    contact_point=suppressed_email, channel="email", reason="unsubscribe"
+                ),
+            )
+            if with_suppression
+            else ()
+        )
+        return SuppressionSnapshot(
+            business_id=business_id,
+            availability=SuppressionAvailability.AVAILABLE,
+            version="fake-suppression-v1",
+            as_of=now,
+            covered_channels=("email", "sms", "whatsapp"),
+            entries=entries,
+            host_owns_consent=True,
+            synthetic=True,
+        )
+
+    rows = [
+        {
+            "row_ref": "c-1",
+            "name": "Asha Rao",
+            "role_title": "Procurement Head",
+            "email": "Asha.Rao@Buyer.example",
+            "mobile": "9812345678",
+            "subscribed": "true",
+        },
+        {"row_ref": "c-2", "name": "Vikram Singh", "email": "vikram@buyer.example"},
+        # Suppressed on the host registry (subscribed=true must NOT override it) -> excluded/flagged.
+        {
+            "row_ref": "c-3",
+            "name": "Suppressed Sam",
+            "email": suppressed_email,
+            "subscribed": "true",
+        },
+        # The business restricts the MOBILE channel -> this value is excluded/flagged.
+        {"row_ref": "c-4", "name": "Restricted Rita", "mobile": "9833333333"},
+    ]
+
+    out: dict = {}
+
+    # 1) Business A: place a MOBILE processing restriction, then import the private CSV with suppression.
+    with ctx.session_factory() as session:
+        ProcessingRestrictionStore(session, BUSINESS_A).restrict(
+            ProcessingRestrictionInput(channel="mobile"), restrictor, now=now
+        )
+        result = PrivateContactImporter(session, BUSINESS_A).import_contacts(
+            _manifest("crm-export-a"),
+            rows,
+            actor,
+            suppression=_snapshot(BUSINESS_A, with_suppression=True),
+            now=now,
+        )
+        session.commit()
+        out["import"] = {
+            "rows_imported": result.imported_count,
+            "rows_skipped": result.skipped_count,
+            "row_errors": result.error_count,
+            "contacts_imported": result.contacts_imported,
+            "contacts_excluded": result.contacts_excluded,
+            "rows": [
+                {
+                    "ref": r.source_row_ref,
+                    "status": r.status,
+                    "basis": r.basis,
+                    "subscribed_claim": r.asserted_subscribed,
+                    "imported": r.contacts_imported,
+                    "excluded": r.contacts_excluded,
+                    "flags": r.exclusion_flags,
+                }
+                for r in PrivateContactImporter(session, BUSINESS_A).imports_for("crm-export-a")
+            ],
+        }
+
+    # 2) The REAL stored persons + contact points (tenant-private), and the (zero) consent receipts.
+    with ctx.session_factory() as session:
+        persons = (
+            session.query(PersonObservation)
+            .filter(PersonObservation.business_id == BUSINESS_A)
+            .order_by(PersonObservation.display_name)
+            .all()
+        )
+        points = (
+            session.query(ContactPoint)
+            .filter(ContactPoint.business_id == BUSINESS_A)
+            .order_by(ContactPoint.channel, ContactPoint.value)
+            .all()
+        )
+        out["persons"] = [{"name": p.display_name, "role": p.role_title} for p in persons]
+        out["contacts"] = [
+            {"channel": c.channel, "value": c.value, "evidence": c.evidence} for c in points
+        ]
+        out["consent_receipts"] = session.query(ConsentReceipt).count()
+
+    # 3) IDEMPOTENT re-import: the same list again -> every row skipped, nothing new.
+    with ctx.session_factory() as session:
+        again = PrivateContactImporter(session, BUSINESS_A).import_contacts(
+            _manifest("crm-export-a"),
+            rows,
+            actor,
+            suppression=_snapshot(BUSINESS_A, with_suppression=True),
+            now=now,
+        )
+        persons_after = (
+            session.query(PersonObservation)
+            .filter(PersonObservation.business_id == BUSINESS_A)
+            .count()
+        )
+        session.rollback()
+        out["refetch"] = {
+            "imported": again.imported_count,
+            "skipped": again.skipped_count,
+            "persons_total": persons_after,
+        }
+
+    # 4) TENANT ISOLATION: Business B imports the SAME CSV; it can never see A's imported contacts.
+    with ctx.session_factory() as session:
+        PrivateContactImporter(session, BUSINESS_B).import_contacts(
+            _manifest("crm-export-a"),
+            rows,
+            actor,
+            suppression=_snapshot(BUSINESS_B, with_suppression=False),  # B's own clean registry
+            now=now,
+        )
+        session.commit()
+
+    with ctx.session_factory() as session:
+        a_import = PrivateContactImporter(session, BUSINESS_A)
+        b_import = PrivateContactImporter(session, BUSINESS_B)
+        a_people = {
+            r.source_row_ref: r.person_observation_id for r in a_import.imports_for("crm-export-a")
+        }
+        b_people = {
+            r.source_row_ref: r.person_observation_id for r in b_import.imports_for("crm-export-a")
+        }
+        # B resolves A's person id to not-found; same contact value is B's own independent private row.
+        a_person_id = next(iter(a_people.values()))
+        out["isolation"] = {
+            "a_rows": len(a_people),
+            "b_rows": len(b_people),
+            "distinct_person_ids": all(a_people[ref] != b_people[ref] for ref in a_people),
+            "b_sees_a_person": b_import._contacts.get_person(a_person_id) is not None,
+            "b_has_own_vikram": b_import._contacts.resolve_contact("email", "vikram@buyer.example")
+            is not None,
+        }
+
+    imp = out["import"]
+    print(
+        "\n1) Business A imports its private CRM CSV (MOBILE channel restricted; one email suppressed):"
+    )
+    print(
+        f"   rows_imported={imp['rows_imported']} rows_skipped={imp['rows_skipped']} "
+        f"row_errors={imp['row_errors']} contacts_imported={imp['contacts_imported']} "
+        f"contacts_excluded={imp['contacts_excluded']}"
+    )
+    for r in imp["rows"]:
+        print(
+            f"   row {r['ref']}: status={r['status']:18} basis={r['basis']} "
+            f"subscribed_claim={r['subscribed_claim']} imported={r['imported']} "
+            f"excluded={r['excluded']} flags={r['flags']}"
+        )
+    print("\n2) REAL stored tenant-private persons + contact points (evidence='imported'):")
+    for p in out["persons"]:
+        print(f"   person: {p['name']:18} role={p['role']}")
+    for c in out["contacts"]:
+        print(f"   contact: {c['channel']:8} {c['value']:30} <- {c['evidence']}")
+    print(
+        f"   ConsentReceipt rows created by the import = {out['consent_receipts']} "
+        "(importing is NOT recipient consent)"
+    )
+    rf = out["refetch"]
+    print("\n3) IDEMPOTENT re-import (same list again):")
+    print(
+        f"   imported={rf['imported']} skipped={rf['skipped']} persons_total={rf['persons_total']} "
+        "(no duplicates)"
+    )
+    iso = out["isolation"]
+    print("\n4) TENANT ISOLATION (Business B imports the SAME CSV):")
+    print(
+        f"   A rows={iso['a_rows']} B rows={iso['b_rows']} distinct_person_ids={iso['distinct_person_ids']} "
+        f"B_can_see_A_person={iso['b_sees_a_person']} B_has_own_copy={iso['b_has_own_vikram']}"
+    )
+
+    checks = {
+        "four_rows_imported_persons": imp["rows_imported"] == 4,
+        # Only the two clean emails (Asha, Vikram); Asha's mobile is restricted like Rita's.
+        "only_clean_contacts_stored": imp["contacts_imported"] == 2,
+        "suppressed_and_restricted_excluded": imp["contacts_excluded"] == 3,
+        "suppressed_email_flagged": ["email", "contact_point_suppressed"]
+        in next(r["flags"] for r in imp["rows"] if r["ref"] == "c-3"),
+        "restricted_mobile_flagged": ["mobile", "processing_restricted"]
+        in next(r["flags"] for r in imp["rows"] if r["ref"] == "c-4"),
+        "no_consent_fabricated": out["consent_receipts"] == 0,
+        "reimport_is_idempotent": rf["imported"] == 0
+        and rf["skipped"] == 4
+        and rf["persons_total"] == 4,
+        "tenant_isolated": iso["distinct_person_ids"] is True
+        and iso["b_sees_a_person"] is False
+        and iso["b_has_own_vikram"] is True,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no socket, no fetch. DCA-126 is the FIRST concrete source "
+        "adapter that writes PERSONAL data: it imports a CLIENT'S OWN private contact list into the "
+        "tenant-private DCA-060 person/contact store, recording the client-asserted lawful basis + "
+        "provenance as the explicit permission-evidence status. Importing a contact is NOT recipient "
+        "consent — no ConsentReceipt is fabricated and a subscribed flag is never trusted; a suppressed "
+        "(DCA-079) or restricted (DCA-078) contact is EXCLUDED and only flagged (no contactable record); "
+        "the import is idempotent on (dataset, row); and one business's imported contacts are never "
+        "visible to another. The send pipeline stays a disabled future capability.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

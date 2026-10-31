@@ -186,12 +186,16 @@ class SourceKind(str, Enum):
     """The provenance class of a catalog source (DCA-044).
 
     ``OFFICIAL`` — an official/government registry or dataset (e.g. a company registry). ``COMMERCIAL``
-    — a licensed commercial data provider. The kind is descriptive metadata only: neither kind, on
-    creation, grants any usage right — a newly catalogued source of either kind is a DISABLED draft.
+    — a licensed commercial data provider. ``FIRST_PARTY`` — data the owning business already holds
+    itself and supplies directly (e.g. a client's own private contact CSV, DCA-126); it is NOT acquired
+    from an external catalogued source and is never shared across tenants. The kind is descriptive
+    metadata only: NO kind, on creation, grants any usage right — a newly catalogued source of any kind
+    is a DISABLED draft, and (first-party) importing a contact is never recipient consent to send.
     """
 
     OFFICIAL = "official"
     COMMERCIAL = "commercial"
+    FIRST_PARTY = "first_party"
 
 
 class SourceAccessMethod(str, Enum):
@@ -2317,6 +2321,118 @@ class LicensedProviderFetch(TenantOwned, Base):
         Boolean, default=False, server_default=sa_false(), nullable=False
     )
     # The version of the fetch-provenance contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ContactImportBasis(str, Enum):
+    """DCA-126 — the CLIENT-ASSERTED lawful basis a business declares for a privately-imported contact.
+
+    When a business imports a contact from its OWN private list, it ASSERTS why it lawfully holds the
+    contact. This is a recorded *assertion* for review/provenance — it is NEVER a recipient consent to
+    be contacted and NEVER clears suppression: "acceptance/holding of a contact is not recipient
+    consent". The send pipeline stays a disabled future capability regardless of the basis recorded
+    here, and no :class:`ConsentReceipt` is ever fabricated from an import.
+
+    - ``EXISTING_CUSTOMER`` — the contact is an existing customer of the business.
+    - ``CONTRACT`` — the contact is held to perform a contract with the business.
+    - ``CONSENT_ELSEWHERE`` — the business asserts it captured consent on its OWN channel (recorded as a
+      claim only; it is NOT replayed as a DCA consent grant and does not authorize any send).
+    - ``LEGITIMATE_INTEREST`` — the business asserts a legitimate-interest basis.
+    - ``OTHER`` — any other client-asserted basis (free-text detail may accompany it off-model).
+
+    An unrecognized basis is refused by the importer before any row is staged.
+    """
+
+    EXISTING_CUSTOMER = "existing_customer"
+    CONTRACT = "contract"
+    CONSENT_ELSEWHERE = "consent_elsewhere"
+    LEGITIMATE_INTEREST = "legitimate_interest"
+    OTHER = "other"
+
+
+class ContactImportStatus(str, Enum):
+    """DCA-126 — the per-row outcome of a private-contact import (recorded on the provenance row).
+
+    - ``IMPORTED`` — ≥1 contact point was stored and none was excluded.
+    - ``PARTIALLY_EXCLUDED`` — ≥1 contact point was stored AND ≥1 was excluded (suppressed / restricted
+      / duplicate): the excluded value has NO contactable record, only a flag.
+    - ``EXCLUDED`` — every contact point on the row was excluded, so the person carries NO contactable
+      value at all (the suppressed/restricted row is flagged, not contactable).
+    """
+
+    IMPORTED = "imported"
+    PARTIALLY_EXCLUDED = "partially_excluded"
+    EXCLUDED = "excluded"
+
+
+class ContactImport(TenantOwned, Base):
+    """DCA-126 — the provenance linking one imported private-CSV ROW to the person it produced
+    (tenant-owned, RLS-protected).
+
+    The fourth concrete source adapter
+    (:class:`~app.sources.private_contact_import.PrivateContactImporter`) imports a CLIENT'S OWN private
+    contact list into tenant-private :class:`PersonObservation` + :class:`ContactPoint` rows. This is the
+    FIRST adapter that writes PERSONAL data, so it is held to the tenant-isolation + suppression/
+    restriction discipline exactly: a suppressed / restricted contact point is EXCLUDED (no contactable
+    record) and only flagged here. This table is the per-row SOURCE ATTRIBUTION + the explicit
+    PERMISSION-EVIDENCE status the acceptance criterion requires: one row records WHICH imported CSV row
+    produced WHICH person, under WHICH client-asserted lawful ``basis`` and provenance label, and how
+    many contact points were imported vs excluded (with opaque channel/reason flags — NEVER a raw contact
+    value).
+
+    **Importing is NOT recipient consent.** ``basis`` is the business's *assertion* of why it lawfully
+    holds the contact; ``asserted_subscribed`` records a ``subscribed``-style flag the CSV may have
+    carried — BOTH are recorded for review only and NEITHER is ever turned into a
+    :class:`ConsentReceipt` or used to clear suppression. The send pipeline stays disabled; a basis here
+    authorizes nothing.
+
+    **Idempotent re-import.** ``(business_id, dataset_id, source_row_ref)`` is unique, so one CSV row maps
+    to at most ONE person within a business. A re-import of the same list finds the existing provenance
+    row and SKIPS the row (reusing its person) rather than creating duplicates — the import is
+    deterministic and replay-safe. ``source_row_ref`` is the checkpointable reference a later refresh
+    re-locates the row by.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one business can never read another's imported contacts or their import
+    provenance. The same CSV row ref may legitimately recur across tenants, each mapping to that tenant's
+    own private person.
+    """
+
+    __tablename__ = "contact_imports"
+    # One provenance row per imported CSV row WITHIN a business — the idempotency key that makes a
+    # re-import a no-op instead of a duplicate. The same (dataset, row) may recur across tenants.
+    __table_args__ = (tenant_unique("dataset_id", "source_row_ref", name="uq_contact_import_row"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The person (PersonObservation.id within this business) this imported row produced/reused.
+    person_observation_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The opaque id of the import batch/list this row came from (a client-chosen list id, not contact data).
+    dataset_id: Mapped[str] = mapped_column(String(128), index=True)
+    # The client's own provenance label for the list and its version/snapshot (source attribution); "".
+    source_label: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The checkpointable reference of this row within the list (how a later refresh re-locates it).
+    source_row_ref: Mapped[str] = mapped_column(String(200), index=True)
+    # The CLIENT-ASSERTED lawful basis (ContactImportBasis) — the explicit permission-EVIDENCE status.
+    # Recorded for review; NEVER a recipient consent and never a ConsentReceipt.
+    basis: Mapped[str] = mapped_column(String(32), index=True)
+    # The purpose the import serves (recorded; restrictions are purpose-bound). "" = unspecified.
+    purpose: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    # A ``subscribed``-style flag the CSV may have carried — RECORDED as a client claim only and NEVER
+    # trusted as consent or used to clear suppression (the acceptance "do not trust a subscribed flag").
+    asserted_subscribed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa_false(), nullable=False
+    )
+    # imported | partially_excluded | excluded — the per-row outcome (ContactImportStatus).
+    status: Mapped[str] = mapped_column(String(24), default=ContactImportStatus.IMPORTED.value)
+    # How many contact points were stored vs EXCLUDED (suppressed/restricted/duplicate) on this row.
+    contacts_imported: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    contacts_excluded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The opaque (channel, reason) flags for each excluded contact point — NEVER a raw contact value, so
+    # a suppressed/restricted value leaves an auditable flag without recording the value itself.
+    exclusion_flags: Mapped[list] = mapped_column(JSON, default=list)
+    # The version of the import-provenance contract this row was written under (expand→migrate→contract).
     schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 

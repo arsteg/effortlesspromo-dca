@@ -82,6 +82,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "host_crawl_state",
         "website_fact_extractions",
         "licensed_provider_fetches",
+        "contact_imports",
     }
 
 
