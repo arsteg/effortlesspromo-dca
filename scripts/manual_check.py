@@ -18016,6 +18016,154 @@ def _dca_114(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-115",
+    "track external provider-call lifecycle: record a call's intent/identity/source as PENDING, then "
+    "advance it along a SAFE state machine (pending -> in_flight -> succeeded/failed/uncertain). A "
+    "timeout AFTER possible external acceptance (UNCERTAIN, a cost MAY exist) is distinguishable from a "
+    "CONFIRMED no-call FAILED (no cost); an invalid OR duplicate transition is REFUSED with no change; "
+    "recording is idempotent on the call key; authority (budget.manage) is checked FIRST. Records "
+    "lifecycle ONLY - no actual provider/model/network/paid call is ever made.",
+)
+def _dca_115(ctx: CheckContext) -> dict:
+    """Drive the DCA-115 provider-call lifecycle store directly against the ephemeral synthetic DB and
+    PRINT the REAL rows / transitions / refusals - never a bare PASS. Shows: a success path (dispatch ->
+    succeed with usage); a dispatched-then-lost call resolving to UNCERTAIN (a cost MAY exist) vs a
+    pre-dispatch FAILED (a confirmed no-call, no cost); an invalid transition refused (pending -> succeeded)
+    and a duplicate transition refused (self loop); and idempotent re-recording on the call key. No actual
+    provider/model/network/paid call is ever made - lifecycle is recorded only."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.cost.provider_call import (
+        REASON_INVALID_TRANSITION,
+        ProviderCallActor,
+        ProviderCallError,
+        ProviderCallIntent,
+        ProviderCallStore,
+        ProviderCallTransition,
+    )
+    from app.db.models import ProviderCallStatus
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz = "11111111-1111-1111-1111-11111111b115"
+    admin = ProviderCallActor(subject="00000000-0000-4000-9000-0000000a0115", roles=("admin",))
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)  # 2026-10-31 14:30 IST
+    later = datetime(2026, 10, 31, 9, 5, 0, tzinfo=UTC)
+
+    def _row(key: str) -> dict:
+        with factory() as session:
+            r = ProviderCallStore(session, biz).by_key(key)
+            assert r is not None  # seeded in this scenario; present
+            return {
+                "id": r.id[:8],
+                "status": r.status,
+                "dispatched": r.dispatched,
+                "cost_possible": r.cost_possible,
+                "outcome": r.outcome_code,
+                "total_tokens": r.total_tokens,
+            }
+
+    def _record(key: str, **kw) -> str:
+        with factory() as session:
+            r = ProviderCallStore(session, biz).record(
+                ProviderCallIntent(call_key=key, capability=kw.pop("capability", "contact_research"), **kw),
+                admin,
+                now=now,
+            )
+            session.commit()
+            return r.id[:8]
+
+    def _transition(key: str, target: ProviderCallStatus, **kw) -> str:
+        with factory() as session:
+            try:
+                r = ProviderCallStore(session, biz).transition(
+                    ProviderCallTransition(key, target, **kw), admin, now=later
+                )
+                session.commit()
+                return f"applied status={r.status} dispatched={r.dispatched} cost_possible={r.cost_possible}"
+            except ProviderCallError as exc:
+                session.rollback()
+                return f"refused({exc.code})"
+
+    print(f"\nbusiness: ...{biz[-4:]}")
+
+    # 1) Success path: record -> dispatch -> succeed (with numeric usage).
+    id1 = _record("call-ok", request_id="req-ok", model="claude-sonnet-5", source_version="v9")
+    print("\n1) success path (pending -> in_flight -> succeeded):")
+    print(f"   recorded id={id1}  row={_row('call-ok')}")
+    t1a = _transition("call-ok", ProviderCallStatus.IN_FLIGHT)
+    print(f"   dispatch  -> {t1a}")
+    t1b = _transition(
+        "call-ok", ProviderCallStatus.SUCCEEDED, outcome_code="completed", total_tokens=165
+    )
+    print(f"   succeed   -> {t1b}  row={_row('call-ok')}")
+
+    # 2) The load-bearing distinction: UNCERTAIN (dispatched, cost MAY exist) vs FAILED (confirmed no-call).
+    _record("call-lost")
+    _transition("call-lost", ProviderCallStatus.IN_FLIGHT)
+    t2u = _transition("call-lost", ProviderCallStatus.UNCERTAIN, outcome_code="gateway_timeout")
+    _record("call-prefail")
+    t2f = _transition("call-prefail", ProviderCallStatus.FAILED, outcome_code="config_invalid")
+    print("\n2) timeout-after-acceptance vs confirmed no-call failure:")
+    print(f"   dispatched then lost -> {t2u}  row={_row('call-lost')}")
+    print(f"   pre-dispatch failure -> {t2f}  row={_row('call-prefail')}")
+
+    # 3) Invalid transition (pending -> succeeded) and duplicate transition (self loop) refused, no change.
+    _record("call-bad")
+    inv = _transition("call-bad", ProviderCallStatus.SUCCEEDED)  # cannot succeed undispatched
+    _transition("call-bad", ProviderCallStatus.IN_FLIGHT)
+    dup = _transition("call-bad", ProviderCallStatus.IN_FLIGHT)  # duplicate / self loop
+    print("\n3) invalid + duplicate transitions refused (no change):")
+    print(f"   pending -> succeeded -> {inv}  (REASON={REASON_INVALID_TRANSITION})")
+    print(f"   in_flight -> in_flight -> {dup}  row={_row('call-bad')}")
+
+    # 4) Recording is idempotent on the call key (a retry replays, never a second row).
+    first = _record("call-idem", capability="scoring")
+    again = _record("call-idem", capability="classification")  # same key, ignored body
+    print("\n4) idempotent record on the call key:")
+    print(f"   first id={first}  retry id={again}  same_row={first == again}")
+
+    checks = {
+        "success_records_usage": _row("call-ok")["status"] == "succeeded"
+        and _row("call-ok")["total_tokens"] == 165,
+        "uncertain_is_cost_possible": _row("call-lost")["status"] == "uncertain"
+        and _row("call-lost")["cost_possible"] is True,
+        "failed_is_confirmed_no_call": _row("call-prefail")["status"] == "failed"
+        and _row("call-prefail")["cost_possible"] is False,
+        "uncertain_distinct_from_failed": _row("call-lost")["status"]
+        != _row("call-prefail")["status"],
+        "invalid_transition_refused": inv == f"refused({REASON_INVALID_TRANSITION})",
+        "duplicate_transition_refused": dup == f"refused({REASON_INVALID_TRANSITION})"
+        and _row("call-bad")["status"] == "in_flight",
+        "record_idempotent_on_key": first == again,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no spend, no send, and NO actual "
+        "provider/model call is ever made. DCA-115 TRACKS the lifecycle of an external provider call so "
+        "cost accounting and the DCA-114 reconciliation have an authoritative record: a PENDING intent is "
+        "advanced along a SAFE state machine (pending -> in_flight -> succeeded/failed/uncertain); a "
+        "timeout AFTER possible external acceptance is UNCERTAIN (a billable cost MAY exist) and is kept "
+        "distinct from a CONFIRMED no-call FAILED (no cost); an invalid OR duplicate transition is REFUSED "
+        "with no change (serialized under a FOR UPDATE lock, proven on real Postgres in "
+        "tests/test_provider_call.py); recording is idempotent on the call key; authority (budget.manage) "
+        "is checked FIRST; only opaque references / codes / counts are stored, never a raw payload. "
+        "Performing the call stays a disabled future capability.)"
+    )
+    return {
+        "success_path": t1b,
+        "uncertain": t2u,
+        "failed": t2f,
+        "invalid_transition": inv,
+        "duplicate_transition": dup,
+        "idempotent_same_row": first == again,
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest

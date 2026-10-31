@@ -814,6 +814,163 @@ class BudgetReservation(TenantOwned, Base):
     reconciled_by_actor_type: Mapped[str | None] = mapped_column(String(32), default=None)
 
 
+class ProviderCallStatus(str, Enum):
+    """DCA-115 — the lifecycle state of ONE tracked external provider call.
+
+    This records the lifecycle of a provider call so cost accounting and the DCA-114 reconciliation have
+    an AUTHORITATIVE record of what happened — WITHOUT ever performing a paid call (execution stays a
+    disabled future capability). The states form a safe one-way machine; the single sanctioned writer
+    :class:`~app.cost.provider_call.ProviderCallStore` admits only valid transitions and refuses an
+    invalid or duplicate one with no change.
+
+    - ``PENDING`` — the call INTENT is recorded but the request has NOT been dispatched. No external side
+      effect and no billable cost is possible yet.
+    - ``IN_FLIGHT`` — the request was dispatched / handed to the provider path, so an external side effect
+      (and therefore a billable cost) is now POSSIBLE but unconfirmed.
+    - ``SUCCEEDED`` — terminal. The provider CONFIRMED completion; the outcome and token usage are known
+      and a billable cost definitely occurred.
+    - ``FAILED`` — terminal. A CONFIRMED no-call failure: it is KNOWN that no billable external call took
+      effect — either a pre-dispatch failure (never left ``PENDING``) or a definitive provider rejection
+      that confirmed nothing was processed/charged. No cost was incurred.
+    - ``UNCERTAIN`` — terminal. The call was dispatched (``IN_FLIGHT``) and then its outcome could NOT be
+      confirmed (a timeout / lost response after possible external acceptance). A billable cost MAY have
+      occurred, so this is kept strictly distinct from ``FAILED``: a timeout after possible acceptance is
+      never collapsed into a confirmed no-call failure.
+
+    The load-bearing acceptance distinction is exactly ``UNCERTAIN`` vs ``FAILED``: cost accounting reads
+    :attr:`ProviderCallRecord.cost_possible` (true for ``SUCCEEDED``/``UNCERTAIN``) to decide whether the
+    matching DCA-113 hold must be preserved (possible charge) or may be released (confirmed no charge).
+    Resolving an ``UNCERTAIN`` call later — and any actual provider/model/paid call — stays a disabled
+    future capability; this story records lifecycle only.
+    """
+
+    PENDING = "pending"
+    IN_FLIGHT = "in_flight"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    UNCERTAIN = "uncertain"
+
+    @classmethod
+    def terminal_values(cls) -> frozenset[str]:
+        """The terminal status values — a call in any of these has resolved and accepts no transition."""
+        return frozenset({cls.SUCCEEDED.value, cls.FAILED.value, cls.UNCERTAIN.value})
+
+
+class ProviderCallRecord(TenantOwned, Base):
+    """DCA-115 — the authoritative lifecycle record of ONE external provider call (tenant-owned, RLS).
+
+    One row tracks one provider call from intent to a terminal outcome so cost accounting and the DCA-114
+    reconciliation have a durable, authoritative record of what happened — WITHOUT performing a paid call.
+    No actual provider/model/network/paid call is ever made here: this records lifecycle ONLY (execution
+    stays a disabled future capability). It persists the call INTENT (``capability`` / ``intent``), the
+    REQUEST IDENTITY (the opaque ``call_key`` dedup token and the gateway ``request_id``), the
+    SOURCE/VERSION (``provider`` / ``model`` / ``source_version``), the OUTCOME/USAGE (``status`` /
+    ``outcome_code`` / token counts) and the AMBIGUOUS completion state (``UNCERTAIN``) — all as opaque
+    references, codes and counts, never raw request/response payloads.
+
+    The load-bearing guarantees (the DCA-115 acceptance criteria), enforced by the single sanctioned
+    writer :class:`~app.cost.provider_call.ProviderCallStore`:
+
+    - **A safe state machine; an invalid or duplicate transition changes nothing.** Only a valid successor
+      of the current :class:`ProviderCallStatus` is admitted (``PENDING`` → in-flight/failed; ``IN_FLIGHT``
+      → succeeded/failed/uncertain; the terminal states accept nothing). An invalid target, a self /
+      duplicate transition, or any transition out of a terminal state is refused BEFORE the row is
+      mutated, so a refusal stages no change and no audit. A ``FOR UPDATE`` lock serializes concurrent
+      transitions on PostgreSQL, so a duplicate can never both apply.
+
+    - **A timeout after possible acceptance is distinguishable from a confirmed no-call failure.**
+      ``UNCERTAIN`` (dispatched then unconfirmed — a billable cost MAY exist) is a different terminal state
+      from ``FAILED`` (a CONFIRMED no-call failure — no cost). ``dispatched`` records whether external
+      acceptance was ever possible, and :attr:`cost_possible` surfaces the distinction cost accounting
+      needs.
+
+    - **Idempotent on the call key.** ``(business_id, call_key)`` is unique: re-recording the same call key
+      returns the EXISTING record and stages no second row — a retry of the intent is always safe.
+
+    ``actor_id`` / ``actor_type`` record WHO acted (an opaque subject id, never a name/email), on the
+    atomic DCA-026 audit entry in the SAME unit of work as the row. ``reservation_id`` optionally links the
+    call to the DCA-113 hold it draws on (an opaque reference; reconciliation is the separate DCA-114
+    writer and is never driven here). Tenant-owned: it inherits the DCA-017 ``business_id`` column and the
+    DCA-018 RLS policy like every other tenant table, so a provider-call record can never be read across
+    tenants. Recording lifecycle spends nothing and sends nothing (the DCA has no such path).
+    """
+
+    __tablename__ = "provider_call_records"
+    # One record per call key within a business: a retry recording the same key is a replay, never a second
+    # record; two tenants may reuse a key without colliding.
+    __table_args__ = (tenant_unique("call_key", name="uq_provider_call_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the provider-call-record contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The caller's opaque idempotency token for this logical call (the per-business dedup key / identity).
+    call_key: Mapped[str] = mapped_column(String(128), index=True)
+    # The gateway idempotency identity (X-Request-Id) this call would be / was issued under. Opaque; the
+    # durable request identity, retained so a lifecycle row traces to the gateway call it represents.
+    request_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Call INTENT — the AI capability requested and an optional opaque purpose/intent code. Never a payload.
+    capability: Mapped[str] = mapped_column(String(64))
+    intent: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # SOURCE / VERSION — the provider/cost bucket, the model/source label and the prompt/contract version.
+    # Opaque descriptive metadata (never a key/secret, never a payload).
+    provider: Mapped[str] = mapped_column(
+        String(64), default="platform", server_default="platform", index=True
+    )
+    model: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Optional opaque link to the DCA-113 BudgetReservation this call draws on (cost accounting). NULL when
+    # unlinked; reconciling the hold is the separate DCA-114 writer and is never driven here.
+    reservation_id: Mapped[str | None] = mapped_column(String(36), default=None, index=True)
+    # The lifecycle state. The writer only ever creates PENDING and advances it along valid edges.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=ProviderCallStatus.PENDING.value,
+        server_default=ProviderCallStatus.PENDING.value,
+        index=True,
+    )
+    # Whether external acceptance was ever POSSIBLE — set true the moment the call enters IN_FLIGHT. This is
+    # what keeps UNCERTAIN (dispatched, unconfirmed) distinct from a never-dispatched confirmed no-call.
+    dispatched: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa_false(), nullable=False
+    )
+    # A stable OUTCOME / denial code recorded on the terminal transition (opaque; e.g. "completed",
+    # "provider_rejected", "gateway_timeout"). NULL while the call is still PENDING / IN_FLIGHT.
+    outcome_code: Mapped[str | None] = mapped_column(String(64), default=None)
+    # Token USAGE — numeric counts only (never raw text). Populated only on a SUCCEEDED outcome; NULL
+    # otherwise (a failed call has no usage; an uncertain result's usage is unknown and never fabricated).
+    prompt_tokens: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    completion_tokens: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    total_tokens: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # WHO acted — an opaque subject id (never a name/email) plus its kind, screened by the audit sink in the
+    # SAME unit of work as the row.
+    actor_id: Mapped[str] = mapped_column(String(128))
+    actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+    # WHEN the call was dispatched (entered IN_FLIGHT) and WHEN it reached a terminal state. NULL until each
+    # transition happens.
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether the call has reached a terminal state (succeeded / failed / uncertain)."""
+        return self.status in ProviderCallStatus.terminal_values()
+
+    @property
+    def cost_possible(self) -> bool:
+        """Whether a billable external cost may / did occur — ``True`` for ``SUCCEEDED`` (definitely) and
+        ``UNCERTAIN`` (possibly), ``False`` for ``PENDING`` / ``IN_FLIGHT`` / ``FAILED`` (a confirmed
+        no-call failure). This is the distinction cost accounting / DCA-114 reconciliation reads to decide
+        whether the matching hold must be preserved or may be released."""
+        return self.status in {
+            ProviderCallStatus.SUCCEEDED.value,
+            ProviderCallStatus.UNCERTAIN.value,
+        }
+
+
 class DiscoveryRun(TenantOwned, Base):
     """One agent cycle for one tenant — the explainability record of what happened and why."""
 

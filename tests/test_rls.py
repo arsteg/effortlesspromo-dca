@@ -77,6 +77,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "recurring_schedules",
         "business_emergency_stops",
         "budget_reservations",
+        "provider_call_records",
     }
 
 
@@ -545,6 +546,54 @@ def test_budget_reservation_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_RESERVATION, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_PROVIDER_CALL = (
+    "INSERT INTO provider_call_records "
+    "(id, business_id, schema_version, call_key, request_id, capability, intent, provider, model, "
+    "source_version, status, dispatched, actor_id, actor_type, created_at, updated_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'call-key-1', 'req-1', 'contact_research', '', "
+    "'platform', '', '', 'pending', false, 'admin-1', 'user', now(), now())"
+)
+
+
+@requires_pg
+def test_provider_call_record_is_tenant_isolated(rls_db):
+    """DCA-115 — a provider-call lifecycle record is tenant-owned: each tenant can read only its OWN
+    records (RLS on real Postgres), so one business can never see another's provider-call lifecycle."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_PROVIDER_CALL, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_PROVIDER_CALL, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM provider_call_records").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM provider_call_records").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_provider_call_record_write_check_rejects_foreign_owner(rls_db):
+    """A provider-call record can never be stamped for another tenant: writing a B-owned row while scoped
+    to A violates the WITH CHECK clause (defence-in-depth beneath the store's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_PROVIDER_CALL, (B,))
         conn.rollback()
     finally:
         conn.close()

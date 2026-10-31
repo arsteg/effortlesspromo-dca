@@ -70,6 +70,7 @@ DCA_TABLES = {
     "business_emergency_stops",
     "platform_emergency_stops",
     "budget_reservations",
+    "provider_call_records",
 }
 
 
@@ -1866,6 +1867,53 @@ def test_0045_adds_reconciliation_columns_on_a_preexisting_database(clean_schema
     }.issubset(cols)  # columns re-added
     assert backfilled == (None, None, None, 0, None)  # pre-existing hold backfilled to "not reconciled"
     assert policies == {"budget_reservations"}  # tenant-owned RLS unchanged by the add-column migration
+
+
+@requires_pg
+def test_0046_creates_provider_call_records_on_a_preexisting_database(clean_schema):
+    """DCA-115 — the 0046 create branch (for a DB migrated before ``provider_call_records`` existed).
+
+    ``provider_call_records`` is tenant-owned, so a fresh DB gets it from the metadata baseline (0001) with
+    RLS from 0002, and 0046 is a no-op there. To exercise 0046's real job, upgrade to head, drop the
+    table, stamp history back to 0045, then upgrade to head again — 0046 must recreate the table (with its
+    per-(business, call_key) uniqueness constraint) and add its tenant-isolation RLS policy, so a
+    provider-call lifecycle record is protected exactly like every other tenant table.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "provider_call_records" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0045_reservation_reconcile")  # pretend we predate the provider-call table
+    command.upgrade(cfg, "head")  # 0046 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    tables = set(insp.get_table_names(schema=clean_schema))
+    assert "provider_call_records" in tables
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("provider_call_records", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'provider_call_records' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert "uq_provider_call_key" in uniques  # one record per (business, call_key); a retry replays
+    assert policies == {"provider_call_records"}  # tenant-owned: RLS applied
 
 
 @requires_pg
