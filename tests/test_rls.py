@@ -91,6 +91,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "acquisition_plans",
         "discovery_run_requests",
         "discovery_task_executions",
+        "discovery_task_conversions",
     }
 
 

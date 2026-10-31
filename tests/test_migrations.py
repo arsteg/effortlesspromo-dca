@@ -84,6 +84,7 @@ DCA_TABLES = {
     "acquisition_plans",
     "discovery_run_requests",
     "discovery_task_executions",
+    "discovery_task_conversions",
 }
 
 
@@ -2406,13 +2407,17 @@ def test_0057_creates_fit_explanations_on_a_preexisting_database(clean_schema):
         conn.execute(text('DROP TABLE IF EXISTS "fit_explanations" CASCADE'))  # policy drops too
     eng.dispose()
 
-    command.stamp(cfg, "0056_identity_match_suggestions")  # pretend we predate the fit-explanation table
+    command.stamp(
+        cfg, "0056_identity_match_suggestions"
+    )  # pretend we predate the fit-explanation table
     command.upgrade(cfg, "head")  # 0057 runs its create branch
 
     eng = create_engine(PG_URL)
     insp = inspect(eng)
     assert "fit_explanations" in set(insp.get_table_names(schema=clean_schema))
-    uniques = {u["name"] for u in insp.get_unique_constraints("fit_explanations", schema=clean_schema)}
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("fit_explanations", schema=clean_schema)
+    }
     with eng.connect() as conn:
         policy = conn.execute(
             text(
@@ -2454,7 +2459,9 @@ def test_0058_creates_acquisition_plans_on_a_preexisting_database(clean_schema):
     eng = create_engine(PG_URL)
     insp = inspect(eng)
     assert "acquisition_plans" in set(insp.get_table_names(schema=clean_schema))
-    uniques = {u["name"] for u in insp.get_unique_constraints("acquisition_plans", schema=clean_schema)}
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("acquisition_plans", schema=clean_schema)
+    }
     with eng.connect() as conn:
         policy = conn.execute(
             text(
@@ -2465,7 +2472,9 @@ def test_0058_creates_acquisition_plans_on_a_preexisting_database(clean_schema):
             {"s": clean_schema},
         ).first()
     eng.dispose()
-    assert "uq_acquisition_plan_icp_version" in uniques  # one plan per (tenant, confirmed ICP version)
+    assert (
+        "uq_acquisition_plan_icp_version" in uniques
+    )  # one plan per (tenant, confirmed ICP version)
     assert policy is not None  # RLS re-established, not just the bare table
 
 
@@ -2574,6 +2583,51 @@ def test_0061_creates_discovery_task_executions_on_a_preexisting_database(clean_
         ).first()
     eng.dispose()
     assert "uq_discovery_task_execution_task" in uniques  # one execution per (tenant, run, task)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0062_creates_discovery_task_conversions_on_a_preexisting_database(clean_schema):
+    """DCA-143 — the 0062 create branch (for a DB migrated before ``discovery_task_conversions``).
+
+    ``discovery_task_conversions`` is tenant-owned (RLS-protected), like ``discovery_task_executions``
+    (0061). A fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so
+    0062 is a no-op there. To exercise 0062's real job, upgrade to head, drop the table + policy, stamp
+    history back to 0061, then upgrade to head again — 0062 must recreate the table (with its per-tenant
+    per-(run, task) unique constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "discovery_task_conversions" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0061_discovery_task_executions")  # pretend we predate the conversion table
+    command.upgrade(cfg, "head")  # 0062 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "discovery_task_conversions" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("discovery_task_conversions", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'discovery_task_conversions' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_discovery_task_conversion_task" in uniques  # one conversion per (tenant, run, task)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

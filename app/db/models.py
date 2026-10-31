@@ -1417,6 +1417,64 @@ class DiscoveryTaskExecution(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class DiscoveryTaskConversion(TenantOwned, Base):
+    """DCA-143 — the record of CONVERTING one DONE :class:`DiscoveryTaskExecution` into observations
+    (tenant-owned, RLS).
+
+    DCA-142 executes a planned task and stages a PERMITTED raw checkpoint (``staged_result``). This row
+    is the next step: it normalizes that one staged task result into provenanced OBSERVATIONS — reading
+    the organization identities the task imported and recording each PERMITTED organization-level field
+    as a DCA-061 :class:`FieldObservation` that CITES a DCA-062 :class:`EvidenceObject` capturing the
+    checkpoint (license-aware retention derived from the cited source terms). Only fields on the
+    conversion's permitted allowlist are recorded; any other candidate field is DROPPED (counted in
+    ``fields_dropped``), never persisted. There is **no network fetch and no recipient send** — the
+    conversion reads already-collected, already-permitted data and writes nothing outbound.
+
+    **A task converts once (idempotent).** ``(business_id, run_id, task_index)`` is unique: re-converting
+    the same task is a deterministic no-op that returns this existing record and records NO duplicate
+    observations. Only a :attr:`DiscoveryTaskStatus.DONE` execution is convertible — a ``DENIED`` /
+    ``FAILED`` task (which staged no result) is refused and this row is never written.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy, so one
+    business can never read or convert another's tasks. It holds only opaque counts + references to the
+    rows it produced (the evidence id and field-observation count) — never prospect contact data and no
+    secrets.
+    """
+
+    __tablename__ = "discovery_task_conversions"
+    # At most ONE conversion per (run, task_index) in a business — the "a task converts once" guarantee.
+    __table_args__ = (
+        tenant_unique("run_id", "task_index", name="uq_discovery_task_conversion_task"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-140 run and the 0-based task index within its frozen plan this conversion covers.
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("discovery_run_requests.id"), index=True
+    )
+    task_index: Mapped[int] = mapped_column(Integer)
+    # The DCA-142 execution record that was converted (the DONE task whose staged_result was normalized).
+    execution_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("discovery_task_executions.id"), index=True
+    )
+    # The catalog source the converted task ran against, and the SourceTerms version the recorded
+    # observations + the captured evidence are grounded in (the provenance the facts cite).
+    source_key: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    source_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The captured checkpoint evidence object the recorded field observations CITE (NULL only if nothing
+    # was convertible). License-aware retention is derived from the cited terms by the DCA-062 store.
+    evidence_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    # How many organization identities the staged result referenced, how many PERMITTED field
+    # observations were recorded, and how many candidate fields were DROPPED (not on the allowlist).
+    org_observation_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    observations_recorded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    fields_dropped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Conversion provenance + the load-bearing invariants (converted = True; sent / spent = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

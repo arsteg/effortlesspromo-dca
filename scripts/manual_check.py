@@ -23976,6 +23976,307 @@ def _dca_142(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-143",
+    "CONVERT one staged (DONE) discovery task into observations — read the organization identities the "
+    "DCA-142 task imported and record each PERMITTED organization-level field as a provenanced field "
+    "observation that CITES a captured checkpoint evidence object (license-aware retention). A field "
+    "not on the allowlist is DROPPED (never persisted), re-converting is an idempotent no-op, and a "
+    "non-DONE task is refused. NO fetch, NO model call, NO spend, NO send. Local synthetic only.",
+)
+def _dca_143(ctx: CheckContext) -> dict:
+    """Drive the real DCA-143 converter against a disposable DB. Business A executes one valid task
+    (DCA-142) whose dataset row carries a permitted CIN and a NON-permitted DUNS external id, then
+    CONVERTS it: PRINT the staged result, the recorded observations (legal_name + cin), the DROPPED
+    forbidden field (duns), the captured evidence (retention mode) and an idempotent re-convert.
+    Business B shows a REVOKED-source DENIED task is NOT convertible. Nothing is fetched, sent or
+    spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        BudgetLimit,
+        BusinessSourceEntitlement,
+        DiscoveryPlan,
+        DiscoveryTaskStatus,
+        EvidenceObject,
+        FieldObservation,
+        IcpConfirmation,
+        IcpDraft,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_observation import (
+        DiscoveryObservationConverter,
+        TaskConversionActor,
+        TaskConversionError,
+    )
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.discovery_task_execution import DiscoveryTaskExecutor, OrgDatasetTaskInput
+    from app.services.discovery_task_execution import TaskExecutionActor
+    from app.services.org_observation import ExternalIdInput
+    from app.services.run_plan_approval import RunPlanApprover, approve_run_plan
+    from app.sources.org_dataset_import import DatasetManifest, DatasetRow
+
+    biz_a = "00000000-0000-4000-8000-00000000013a"
+    biz_b = "00000000-0000-4000-8000-00000000013b"
+    allowed_key = "mca_master_data"
+    exec_admin = TaskExecutionActor(
+        subject="00000000-0000-4000-9000-0000000a0143a", roles=("owner",)
+    )
+    approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0143a", roles=("owner",))
+    conv_admin = TaskConversionActor(
+        subject="00000000-0000-4000-9000-0000000a0143a", roles=("owner",)
+    )
+
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session, biz):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(IcpConfirmation(business_id=biz, version=1, actor_id="seed", actor_type="user"))
+        session.add(
+            BudgetLimit(
+                business_id=biz,
+                version=1,
+                currency="INR",
+                daily_cap_minor=10_000_000,
+                monthly_cap_minor=100_000_000,
+                per_run_cap_minor=1_000_000,
+                timezone="Asia/Kolkata",
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        if not session.query(Source).filter_by(key=allowed_key).count():
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=["org_name", "org_identifier"],
+                    access_method=SourceAccessMethod.BULK_DOWNLOAD.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _planned(session, biz):
+        run = create_discovery_run(session, settings, biz).run
+        assert run is not None
+        session.add(
+            DiscoveryPlan(
+                business_id=biz,
+                version=1,
+                icp_version=1,
+                status="draft",
+                tasks=[
+                    {
+                        "sourceKey": allowed_key,
+                        "fields": ["org_name"],
+                        "filters": {"geography": ["KA"]},
+                        "maxQueries": 2,
+                    }
+                ],
+                excluded=[],
+                task_cap=5,
+                query_cap=3,
+                rationale="reviewed discovery plan",
+                overall_confidence=0.8,
+                source="discovery_plan",
+                source_version="pv-1",
+                provenance={},
+            )
+        )
+        session.flush()
+        approve_run_plan(session, biz, run.id, 1, approver)
+        session.flush()
+        return run
+
+    def _adapter_input():
+        return OrgDatasetTaskInput(
+            manifest=DatasetManifest(
+                dataset_id="mca-2026-q3",
+                source_key=allowed_key,
+                source_version="2026-09-30",
+                license="data.gov.in-GODL-1.0",
+                purpose=PLAN_PURPOSE,
+            ),
+            rows=(
+                DatasetRow(
+                    row_ref="le-1",
+                    entity_type="legal_entity",
+                    display_name="Synthetic Textiles Pvt Ltd",
+                    external_ids=(
+                        ExternalIdInput("cin", "U17120MH2026PTC900099"),  # permitted field
+                        ExternalIdInput("duns", "123456789"),  # NOT a permitted field -> dropped
+                    ),
+                ),
+            ),
+        )
+
+    print(
+        "\nconvert one staged task into observations (local synthetic — nothing fetched/sent/spent):"
+    )
+
+    with ctx.session_factory() as session:
+        _seed(session, biz_a)
+        _seed(session, biz_b)
+        session.flush()
+        run_a = _planned(session, biz_a)
+        run_b = _planned(session, biz_b)
+        session.commit()
+        run_a_id, run_b_id = run_a.id, run_b.id
+
+        # A — execute (DCA-142) then CONVERT (DCA-143).
+        ex_a = DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run_a_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        print("\n  Business A — staged task result (the DCA-142 checkpoint being converted):")
+        print(f"      status={ex_a.status}  stagedResult={ex_a.execution.staged_result}")
+
+        res_a = DiscoveryObservationConverter(session, biz_a).convert_task(run_a_id, 0, conv_admin)
+        session.commit()
+        fields_a = (
+            session.query(FieldObservation)
+            .filter_by(business_id=biz_a)
+            .order_by(FieldObservation.field_key)
+            .all()
+        )
+        evidence_a = session.query(EvidenceObject).filter_by(id=res_a.evidence_id).one()
+        print("\n  Business A — AFTER conversion (observations recorded, forbidden field dropped):")
+        print(
+            f"      observationsRecorded={res_a.observations_recorded}  "
+            f"fieldsDropped={res_a.fields_dropped}  orgObservations={res_a.org_observation_count}"
+        )
+        for f in fields_a:
+            print(
+                f"        field={f.field_key!r} value={f.field_value!r} label={f.inference_label} "
+                f"source={f.source_key}/v{f.source_version} cites={f.provenance_ref}"
+            )
+        print(
+            f"      evidence={evidence_a.id}  retentionMode={evidence_a.retention_mode}  "
+            f"rawRetained={evidence_a.raw_content is not None}  digest={evidence_a.content_digest[:12]}…"
+        )
+
+        # A — re-convert the SAME task: an idempotent no-op (a task converts once).
+        res_a2 = DiscoveryObservationConverter(session, biz_a).convert_task(run_a_id, 0, conv_admin)
+        session.commit()
+        fields_after = session.query(FieldObservation).filter_by(business_id=biz_a).count()
+        print(
+            f"\n  Business A — re-conversion idempotent: already_converted={res_a2.already_converted}"
+            f"  fieldObservations still={fields_after}"
+        )
+
+        # B — a REVOKED source makes the DCA-142 task DENIED; a DENIED task is NOT convertible.
+        session.query(BusinessSourceEntitlement).filter_by(business_id=biz_b).delete()
+        session.commit()
+        ex_b = DiscoveryTaskExecutor(session, biz_b).execute_task(
+            run_b_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        refused_code = None
+        try:
+            DiscoveryObservationConverter(session, biz_b).convert_task(run_b_id, 0, conv_admin)
+        except TaskConversionError as exc:
+            refused_code = exc.code
+        print("\n  Business B — DENIED task is NOT convertible (wrong state):")
+        print(f"      executionStatus={ex_b.status}  conversionRefusedWith={refused_code}")
+        from app.db.models import DiscoveryTaskConversion as _Conv
+
+        conv_b_count = session.query(_Conv).filter_by(business_id=biz_b).count()
+
+    recorded_keys = sorted(f.field_key for f in fields_a)
+    checks = {
+        "a_recorded_two_permitted": res_a.observations_recorded == 2,
+        "a_recorded_legal_name_and_cin": recorded_keys == ["cin", "legal_name"],
+        "a_dropped_forbidden_duns": res_a.fields_dropped == 1 and "duns" not in recorded_keys,
+        "a_evidence_reference_only": evidence_a.retention_mode == "reference_only"
+        and evidence_a.raw_content is None,
+        "a_reconvert_idempotent": res_a2.already_converted is True and fields_after == 2,
+        "b_denied_not_convertible": ex_b.status == DiscoveryTaskStatus.DENIED.value
+        and refused_code == "discovery_task_not_convertible",
+        "b_no_conversion_rows": conv_b_count == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-143 CONVERTS one DONE "
+        "task's staged checkpoint into provenanced observations: it records only PERMITTED "
+        "organization-level fields — a forbidden field is DROPPED, never persisted — each citing a "
+        "captured, license-aware evidence object; re-converting is an idempotent no-op; and a non-DONE "
+        "task is refused without any state change.)"
+    )
+    return {
+        "checks": checks,
+        "runs": {"a": run_a_id, "b": run_b_id},
+        "recordedKeys": recorded_keys,
+        "fieldsDropped": res_a.fields_dropped,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
