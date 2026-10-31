@@ -29,6 +29,7 @@ from app.api.routes import (
     reacquisition,
     records,
     service_integration,
+    spend_summary,
     targeting,
     tenants,
 )
@@ -141,6 +142,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(authz.router)
     app.include_router(budget.router)
+    app.include_router(spend_summary.router)
     app.include_router(grievances.router)
     app.include_router(privacy_scope.router)
     app.include_router(privacy_erasure.router)

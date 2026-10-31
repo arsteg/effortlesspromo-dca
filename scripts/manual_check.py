@@ -18385,6 +18385,160 @@ def _dca_116(ctx: CheckContext) -> dict:
     }
 
 
+
+@register(
+    "DCA-117",
+    "expose business spend summaries: a READ-ONLY aggregation of the DCA-113/114 reservation ledger - how "
+    "much is RESERVED (active holds), INCURRED (settled actual cost), UNCERTAIN (preserved possible cost) "
+    "and how much budget REMAINS - by run, civil day and civil month. The headline guarantee: an UNCERTAIN "
+    "hold keeps counting against the budget (reported in its own bucket AND in committed) and is NEVER "
+    "shown as free/released budget; and one tenant can never read another's cost details. Reads only - no "
+    "spend, no send, no provider/model/paid call.",
+)
+def _dca_117(ctx: CheckContext) -> dict:
+    """Build the DCA-117 spend summary directly against the ephemeral synthetic DB for two isolated
+    synthetic businesses A/B and PRINT the REAL aggregated rows - never a bare PASS. Shows: per-status
+    totals that reconcile with the ledger; an UNCERTAIN hold counted toward committed and NOT as free
+    budget (contrasted with a RELEASED hold that IS freed); the per-day / per-month / per-run breakdown;
+    and that B's summary never shows A's spend (and vice-versa). Reads only - nothing is spent or sent."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.cost.reconcile import (
+        BudgetReconciliationStore,
+        ReconcileOutcome,
+        ReconciliationActor,
+        ReconciliationRequest,
+    )
+    from app.cost.reserve import BudgetReservationStore, ReservationActor, ReservationRequest
+    from app.cost.summary import BudgetSpendSummaryStore
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz_a = "11111111-1111-1111-1111-11111111b117"
+    biz_b = "22222222-2222-2222-2222-22222222b117"
+    res_admin = ReservationActor(subject="00000000-0000-4000-9000-0000000a0117", roles=("admin",))
+    rec_admin = ReconciliationActor(
+        subject="00000000-0000-4000-9000-0000000a0117", roles=("admin",)
+    )
+    budget_actor = AuditActor(id="00000000-0000-4000-9000-0000000b0117", type=ActorType.USER)
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)  # 2026-10-31 14:30 IST → day 2026-10-31
+    last_month = datetime(2026, 9, 30, 5, 0, 0, tzinfo=UTC)  # 2026-09-30 10:30 IST → month 2026-09
+
+    def _seed_caps(biz: str) -> None:
+        with factory() as session:
+            BudgetLimitStore(session, biz).save(
+                BudgetLimitInput(
+                    daily_cap_minor=100_000, monthly_cap_minor=2_000_000, per_run_cap_minor=50_000
+                ),
+                budget_actor,
+            )
+            session.commit()
+
+    def _reserve(biz: str, key: str, amount: int, *, when: datetime = now) -> str:
+        with factory() as session:
+            r = BudgetReservationStore(session, biz).reserve(
+                ReservationRequest(idempotency_key=key, amount_minor=amount), res_admin, now=when
+            )
+            session.commit()
+            return r.id
+
+    def _reconcile(biz: str, rid: str, outcome: ReconcileOutcome, key: str, actual=None) -> None:
+        with factory() as session:
+            BudgetReconciliationStore(session, biz).reconcile(
+                ReconciliationRequest(rid, key, outcome, actual_minor=actual), rec_admin, now=now
+            )
+            session.commit()
+
+    def _summary(biz: str) -> dict:
+        with factory() as session:
+            s = BudgetSpendSummaryStore(session, biz).summarize(now=now)
+        return {
+            "configured": s.configured,
+            "dailyCap": s.daily_cap_minor,
+            "dailyRemaining": s.daily_remaining_minor,
+            "total": {
+                "reserved": s.total.reserved_minor,
+                "incurred": s.total.incurred_minor,
+                "uncertain": s.total.uncertain_minor,
+                "released": s.total.released_minor,
+                "committed": s.total.committed_minor,
+                "runs": s.total.reservation_count,
+            },
+            "byDay": {b.key: b.committed_minor for b in s.by_day},
+            "byMonth": {b.key: b.committed_minor for b in s.by_month},
+            "byRun": {line.run_key: (line.status, line.committed_minor) for line in s.by_run},
+        }
+
+    # Business A: an ACTIVE hold, a SETTLED hold (under-spend frees the difference), an UNCERTAIN hold
+    # (preserved - possible cost), a RELEASED hold (freed), plus one hold in the PRIOR civil month.
+    _seed_caps(biz_a)
+    _reserve(biz_a, "run-active", 4_000)
+    s_id = _reserve(biz_a, "run-settle", 6_000)
+    _reconcile(biz_a, s_id, ReconcileOutcome.SETTLE, "call-settle", actual=2_500)
+    u_id = _reserve(biz_a, "run-uncertain", 1_000)
+    _reconcile(biz_a, u_id, ReconcileOutcome.MARK_UNCERTAIN, "call-uncertain")
+    r_id = _reserve(biz_a, "run-release", 800)
+    _reconcile(biz_a, r_id, ReconcileOutcome.RELEASE, "call-release")
+    _reserve(biz_a, "run-sep", 2_000, when=last_month)
+
+    # Business B: a single, different hold - its summary must never show any of A's spend.
+    _seed_caps(biz_b)
+    _reserve(biz_b, "b-run", 9_000)
+
+    a = _summary(biz_a)
+    b = _summary(biz_b)
+
+    print(f"\nbusiness A ...{biz_a[-4:]}  in-force daily cap (paise): {a['dailyCap']}")
+    print(f"  total:   {a['total']}")
+    print(f"  remaining (current day): {a['dailyRemaining']}  (= cap - committed-in-day)")
+    print(f"  by day:   {a['byDay']}")
+    print(f"  by month: {a['byMonth']}")
+    print(f"  by run:   {a['byRun']}")
+    print(f"\nbusiness B ...{biz_b[-4:]}")
+    print(f"  total:   {b['total']}")
+    print(f"  by run:   {b['byRun']}   (B never shows A's runs)")
+
+    checks = {
+        # Per-status totals reconcile with the ledger (all-time, across both civil months). Two ACTIVE
+        # holds remain: run-active (4000, Oct) + run-sep (2000, Sep) = 6000 reserved.
+        "reserved_is_active_holds": a["total"]["reserved"] == 6_000,
+        "incurred_is_settled_actual": a["total"]["incurred"] == 2_500,
+        "uncertain_preserved": a["total"]["uncertain"] == 1_000,
+        "released_freed": a["total"]["released"] == 800,
+        # The headline acceptance: uncertain counts toward committed and is NOT free budget.
+        "committed_includes_uncertain": a["total"]["committed"] == 6_000 + 2_500 + 1_000,
+        "uncertain_not_released": a["total"]["released"] == 800
+        and a["total"]["uncertain"] == 1_000,
+        # Remaining-in-current-day = 100000 - (4000 active + 2500 settled + 1000 uncertain). The
+        # prior-month hold and the released hold do not reduce today's headroom.
+        "remaining_reflects_uncertain": a["dailyRemaining"] == 100_000 - 7_500,
+        "by_month_splits_sep_and_oct": a["byMonth"].get("2026-09") == 2_000,
+        "settled_run_counts_only_actual": a["byRun"]["run-settle"] == ("settled", 2_500),
+        # Tenant isolation: A and B each see only their own spend.
+        "b_isolated_from_a": b["total"]["reserved"] == 9_000
+        and set(b["byRun"]) == {"b-run"}
+        and set(a["byRun"]).isdisjoint(set(b["byRun"])),
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no spend, no send, and NO actual "
+        "provider/model call is ever made. DCA-117 EXPOSES a READ-ONLY spend summary over the DCA-113/114 "
+        "reservation ledger: RESERVED (active holds), INCURRED (settled actual cost), UNCERTAIN (preserved "
+        "possible cost) and REMAINING headroom, broken down by run / civil day / civil month. The figures "
+        "reconcile with the committed ledger using the same effective-amount convention the reserve path "
+        "enforces; an UNCERTAIN hold keeps counting against the budget (reported in its own bucket AND in "
+        "committed) and is NEVER shown as free/released budget - only a RELEASED hold frees budget. The "
+        "aggregator is tenant-scoped (B never sees A's spend) and the HTTP surface gates on the "
+        "budget.manage administrator read scope with path-business membership, so one tenant can never read "
+        "another's cost details. Summarizing reads only - it holds, charges, spends and sends nothing.)"
+    )
+    return {"business_a": a, "business_b": b, "checks": checks}
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest
