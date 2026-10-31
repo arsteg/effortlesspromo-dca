@@ -50,6 +50,7 @@ DCA_TABLES = {
     "compliance_policy_approvals",
     "org_observations",
     "org_external_ids",
+    "org_observation_imports",
     "person_observations",
     "contact_points",
     "field_observations",
@@ -2043,6 +2044,52 @@ def test_0048_creates_host_crawl_state_on_a_preexisting_database(clean_schema):
         ).first()
     eng.dispose()
     assert "uq_host_crawl_state" in uniques  # one crawl-state row per (tenant, source, host)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0049_creates_org_observation_imports_on_a_preexisting_database(clean_schema):
+    """DCA-123 — the 0049 create branch (for a DB migrated before ``org_observation_imports`` existed).
+
+    ``org_observation_imports`` is tenant-owned (RLS-protected), like ``host_crawl_state`` (0048). A
+    fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0049 is a
+    no-op there. To exercise 0049's real job, upgrade to head, drop the table + policy, stamp history
+    back to 0048, then upgrade to head again — 0049 must recreate the table (with its per-tenant
+    (source_key, dataset_id, source_row_ref) constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "org_observation_imports" CASCADE'))  # policy too
+    eng.dispose()
+
+    command.stamp(cfg, "0048_host_crawl_state")  # pretend we predate the import-provenance table
+    command.upgrade(cfg, "head")  # 0049 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "org_observation_imports" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("org_observation_imports", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'org_observation_imports' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_org_observation_import_row" in uniques
+    )  # one provenance row per (tenant, source, dataset, row)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

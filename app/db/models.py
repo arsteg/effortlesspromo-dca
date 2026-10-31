@@ -2128,6 +2128,56 @@ class OrgExternalId(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class OrgObservationImport(TenantOwned, Base):
+    """DCA-123 — the provenance linking one org observation to the approved dataset ROW it was imported
+    from (tenant-owned, RLS-protected).
+
+    The first concrete source adapter (:class:`~app.sources.org_dataset_import.OrgDatasetImporter`)
+    imports an APPROVED + entitled organization dataset into :class:`OrgObservation` rows. This table is
+    the SOURCE ATTRIBUTION the acceptance criterion requires: one row records WHICH dataset row produced
+    WHICH observation, under WHICH source / dataset version / license — the durable audit of where an
+    imported organization fact came from. It holds only organization provenance (a catalog source key, an
+    opaque dataset id, a version/license label, and a checkpointable row reference); NO personal contact
+    data — the importer is organization-only (DCA-122) and can never write a contact field.
+
+    **Idempotent re-import.** ``(business_id, source_key, dataset_id, source_row_ref)`` is unique, so one
+    dataset row maps to at most ONE observation within a business. A re-import of the same dataset finds
+    the existing provenance row and SKIPS the row (reusing its observation) rather than creating a
+    duplicate — the import is deterministic and replay-safe. ``source_row_ref`` is the checkpointable
+    reference a later refresh/resume uses to locate exactly this row again.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one business can never read another's import provenance. The same dataset
+    row ref may legitimately recur across tenants, each mapping to that tenant's own observation.
+    """
+
+    __tablename__ = "org_observation_imports"
+    # One provenance row per imported dataset row WITHIN a business — the idempotency key that makes a
+    # re-import a no-op instead of a duplicate. The same (source, dataset, row) may recur across tenants.
+    __table_args__ = (
+        tenant_unique(
+            "source_key", "dataset_id", "source_row_ref", name="uq_org_observation_import_row"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The observation (OrgObservation.id within this business) this provenance row attributes.
+    observation_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The catalog Source (DCA-044) the dataset was collected under — the rights-gated source key.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The opaque id of the approved dataset release the row came from (a manifest id, not contact data).
+    dataset_id: Mapped[str] = mapped_column(String(128), index=True)
+    # The dataset/source version or snapshot label the row was imported at (source attribution).
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The declared license of the dataset the row was imported under (source attribution).
+    dataset_license: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # The checkpointable reference of this row within the dataset (how a later refresh re-locates it).
+    source_row_ref: Mapped[str] = mapped_column(String(200), index=True)
+    # The version of the import contract this provenance row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class ContactChannel(str, Enum):
     """DCA-060 — the channel type of a tenant-private contact point (controlled vocabulary).
 

@@ -19386,6 +19386,254 @@ def _dca_122(ctx: CheckContext) -> dict:
     return {"registered": registered, "rejected": rejected, "checks": checks}
 
 
+@register(
+    "DCA-123",
+    "import an APPROVED organization dataset (the first concrete source adapter): a manifest-driven "
+    "importer loads an approved + entitled ORGANIZATION dataset into the DCA-059 org-observation store "
+    "with durable source provenance (source key / dataset id / version / license + a checkpointable row "
+    "reference). Rights are checked FIRST (DCA-048) so an unentitled source imports NOTHING; the import "
+    "is organization-only (a row carrying personal contact fields is refused); and a re-import is "
+    "idempotent (already-imported rows are skipped, never duplicated). No network fetch — the dataset is "
+    "a caller-supplied synthetic fixture; fetching stays a disabled future capability.",
+)
+def _dca_123(ctx: CheckContext) -> dict:
+    """Drive the real DCA-123 importer against a disposable DB with isolated synthetic Businesses A/B and
+    PRINT the REAL imported observation rows, their provenance, the idempotent re-import, the personal-
+    field refusal AND the rights denial — never a bare PASS. No network, no socket, no fetch, no AI/paid
+    action: the importer writes a provided approved dataset; in the running service no source is ever
+    ENABLED, so production imports deny at the rights gate (here we synthetically enable one source so the
+    allow branch is reachable)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import OrgObservation, Source, SourceStatus
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.org_observation import ExternalIdInput
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+    from app.sources.org_dataset_import import (
+        DatasetManifest,
+        DatasetRow,
+        OrgDatasetImporter,
+    )
+
+    source_key = "mca_master_data"
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0123", type=ActorType.USER)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0123", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+
+    manifest = DatasetManifest(
+        dataset_id="mca-2026-q3",
+        source_key=source_key,
+        source_version="2026-09-30",
+        license="data.gov.in-GODL-1.0",
+        purpose="prospecting",
+    )
+    rows = [
+        DatasetRow(
+            row_ref="le-1",
+            entity_type="legal_entity",
+            display_name="Synthetic Textiles Pvt Ltd",
+            external_ids=(ExternalIdInput("cin", "U17120MH2026PTC900099"),),
+        ),
+        DatasetRow(
+            row_ref="est-mh",
+            entity_type="establishment",
+            display_name="Synthetic Textiles — Maharashtra",
+            parent_row_ref="le-1",
+            state_code="MH",
+            external_ids=(ExternalIdInput("gstin", "27AAACS0000A1Z5"),),
+        ),
+        DatasetRow(
+            row_ref="est-ka",
+            entity_type="establishment",
+            display_name="Synthetic Textiles — Karnataka",
+            parent_row_ref="le-1",
+            state_code="KA",
+            external_ids=(ExternalIdInput("gstin", "29AAACS0000A1Z1"),),
+        ),
+        # A row smuggling in personal contact data — organization-only, so it is REFUSED.
+        DatasetRow(
+            row_ref="le-2",
+            entity_type="legal_entity",
+            display_name="Leaky Org Pvt Ltd",
+            contact={"email": "founder@leaky.example"},
+        ),
+    ]
+
+    # 1) platform ceiling: an APPROVED + (test-only) ENABLED source; A is entitled to collect, B is NOT.
+    with ctx.session_factory() as session:
+        catalog = SourceCatalogStore(session)
+        catalog.create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                name="MCA Company Master Data",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        src = session.query(Source).filter(Source.key == source_key).one()
+        src.status = SourceStatus.ENABLED.value
+        src.enabled = True
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=source_key,
+                enabled=True,
+                operations={"collect": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        session.commit()
+
+    out: dict = {}
+
+    # 2) ALLOW: Business A imports the approved dataset (3 org rows accepted, the personal row refused).
+    with ctx.session_factory() as session:
+        result = OrgDatasetImporter(session, BUSINESS_A).import_dataset(
+            manifest, rows, actor, now=now
+        )
+        session.commit()
+        out["import"] = {
+            "authorized": result.authorized,
+            "imported": result.imported_count,
+            "skipped": result.skipped_count,
+            "refused": list(result.refused_rows),
+        }
+
+    # 3) the real imported observations + their provenance (source attribution + checkpointable refs).
+    with ctx.session_factory() as session:
+        importer = OrgDatasetImporter(session, BUSINESS_A)
+        provenance = importer.imports_for("mca-2026-q3", source_key)
+        obs_by_id = {
+            o.id: o
+            for o in session.query(OrgObservation).filter(OrgObservation.business_id == BUSINESS_A)
+        }
+        out["observations"] = [
+            {
+                "row_ref": p.source_row_ref,
+                "display_name": obs_by_id[p.observation_id].display_name,
+                "entity_type": obs_by_id[p.observation_id].entity_type,
+                "state": obs_by_id[p.observation_id].state_code,
+                "source_key": p.source_key,
+                "source_version": p.source_version,
+                "license": p.dataset_license,
+            }
+            for p in provenance
+        ]
+
+    # 4) IDEMPOTENT re-import: the same dataset again — every row skipped, nothing new.
+    with ctx.session_factory() as session:
+        again = OrgDatasetImporter(session, BUSINESS_A).import_dataset(
+            manifest, rows, actor, now=now
+        )
+        session.commit()
+        out["reimport"] = {"imported": again.imported_count, "skipped": again.skipped_count}
+
+    # 5) DENIAL: Business B is NOT entitled -> the import is un-authorized and writes nothing.
+    with ctx.session_factory() as session:
+        denied = OrgDatasetImporter(session, BUSINESS_B).import_dataset(
+            manifest, rows, actor, now=now
+        )
+        b_obs = (
+            session.query(OrgObservation).filter(OrgObservation.business_id == BUSINESS_B).count()
+        )
+        session.rollback()
+        out["denied"] = {
+            "authorized": denied.authorized,
+            "reason": denied.reason,
+            "b_observations": b_obs,
+        }
+
+    imp = out["import"]
+    print(
+        "\n1) platform ceiling: APPROVED + (test-only) ENABLED 'mca_master_data'; A entitled to collect."
+    )
+    print("\n2) ALLOW — Business A imports the approved organization dataset:")
+    print(
+        f"   authorized={imp['authorized']} imported={imp['imported']} "
+        f"skipped={imp['skipped']} refused={imp['refused']}"
+    )
+    print(
+        "\n3) imported organization observations (with source attribution + checkpointable row ref):"
+    )
+    for o in out["observations"]:
+        print(
+            f"   [{o['row_ref']:7}] {o['display_name']:32} type={o['entity_type']:13} "
+            f"state={o['state'] or '-':3} <- {o['source_key']}@{o['source_version']} "
+            f"({o['license']})"
+        )
+    r = out["reimport"]
+    print("\n4) IDEMPOTENT re-import (same dataset again):")
+    print(f"   imported={r['imported']} skipped={r['skipped']} (no duplicates created)")
+    d = out["denied"]
+    print("\n5) DENIAL — Business B is NOT entitled (import writes nothing):")
+    print(
+        f"   authorized={d['authorized']} reason={d['reason']} "
+        f"B observations written={d['b_observations']}"
+    )
+
+    checks = {
+        "approved_import_recorded_three_orgs": imp["imported"] == 3,
+        "personal_row_refused": imp["refused"] == [["le-2", "personal_fields_not_importable"]]
+        or imp["refused"] == [("le-2", "personal_fields_not_importable")],
+        "provenance_has_source_attribution": all(
+            o["source_key"] == source_key and o["source_version"] == "2026-09-30"
+            for o in out["observations"]
+        ),
+        "reimport_is_idempotent": r["imported"] == 0 and r["skipped"] == 3,
+        "unentitled_import_wrote_nothing": d["authorized"] is False
+        and d["reason"] == "source_not_entitled"
+        and d["b_observations"] == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no socket, no fetch, no AI/paid action. DCA-123 is the first "
+        "concrete source adapter: it imports a caller-supplied APPROVED organization dataset into the "
+        "DCA-059 org-observation store with durable source provenance. Rights are checked FIRST (DCA-048), "
+        "so an unentitled source imports NOTHING; the importer is organization-only (DCA-122) and refuses "
+        "any row carrying personal contact fields; and a re-import is idempotent on "
+        "(source, dataset, row_ref). Fetching stays a disabled future capability — this imports a provided "
+        "dataset, it never crawls.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
