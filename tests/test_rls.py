@@ -711,6 +711,54 @@ def test_source_result_cache_write_check_rejects_foreign_owner(rls_db):
         conn.close()
 
 
+_SEED_RUN_REQUEST = (
+    "INSERT INTO discovery_run_requests "
+    "(id, business_id, icp_version, status, source_scope, target_cap, task_cap, query_cap, "
+    "requested, clamped, clamp_notes, provenance, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'pending', '[]', 50, 5, 3, '{}', false, '[]', '{}', now())"
+)
+
+
+@requires_pg
+def test_discovery_run_request_is_tenant_isolated(rls_db):
+    """DCA-140/141 — a bounded discovery run (the pipeline envelope a plan is approved onto) is
+    tenant-owned: each tenant can read only its OWN runs (RLS on real Postgres), so one business can
+    never see, approve a plan onto, or enumerate another's discovery runs."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_RUN_REQUEST, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_RUN_REQUEST, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM discovery_run_requests").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM discovery_run_requests").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_discovery_run_request_write_check_rejects_foreign_owner(rls_db):
+    """A run can never be stamped for another tenant: writing a B-owned run while scoped to A violates
+    the WITH CHECK clause (defence-in-depth beneath the creator's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_RUN_REQUEST, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 @requires_pg
 def test_platform_emergency_stop_is_separate_from_the_app_role(rls_db):
     # The platform-wide stop is control-plane data (like platform_source_restrictions): it is NOT

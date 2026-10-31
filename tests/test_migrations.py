@@ -2469,6 +2469,69 @@ def test_0058_creates_acquisition_plans_on_a_preexisting_database(clean_schema):
 
 
 @requires_pg
+def test_0060_adds_run_plan_approval_columns_on_a_preexisting_database(clean_schema):
+    """DCA-141 — the 0060 add-column branch (for a DB migrated before the run-plan columns existed).
+
+    A fresh DB gets ``discovery_run_requests`` WITH ``plan_version`` / ``plan_snapshot`` / ``approved_by``
+    / ``approved_by_type`` / ``approved_at`` from the metadata baseline (0001), so 0060 is a no-op there.
+    To exercise 0060's real job, upgrade to head, DROP the five columns, seed one pre-existing PENDING run
+    row, stamp history back to 0059, then upgrade to head again — 0060 must re-add exactly those columns
+    and backfill the existing row's ``approved_by`` / ``approved_by_type`` to the empty string (not yet
+    approved), with no new table and no RLS change (``discovery_run_requests`` is tenant-owned already).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "discovery_run_requests" DROP COLUMN "approved_at", '
+                'DROP COLUMN "approved_by_type", DROP COLUMN "approved_by", '
+                'DROP COLUMN "plan_snapshot", DROP COLUMN "plan_version"'
+            )
+        )
+        # Seed one pre-existing (pre-approval) PENDING run row to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO discovery_run_requests "
+                "(id, business_id, icp_version, status, source_scope, target_cap, task_cap, "
+                "query_cap, requested, clamp_notes, provenance, created_at) VALUES "
+                "('run-legacy', 'biz-legacy', 1, 'pending', '[]', 50, 5, 3, '{}', '[]', '{}', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0059_discovery_run_requests")  # pretend we predate the run-plan columns
+    command.upgrade(cfg, "head")  # 0060 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("discovery_run_requests", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT plan_version, plan_snapshot, approved_by, approved_by_type, approved_at "
+                "FROM discovery_run_requests WHERE id = 'run-legacy'"
+            )
+        ).first()
+    eng.dispose()
+    assert {
+        "plan_version",
+        "plan_snapshot",
+        "approved_by",
+        "approved_by_type",
+        "approved_at",
+    }.issubset(cols)  # columns re-added
+    # The pre-existing PENDING row backfilled to "not yet approved": empty actor strings, NULL rest.
+    assert backfilled == (None, None, "", "", None)
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 

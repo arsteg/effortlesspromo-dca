@@ -1314,6 +1314,20 @@ class DiscoveryRunRequest(TenantOwned, Base):
     # Run provenance + the load-bearing invariants (executed / sent / spent = False, feature/entitlement
     # state, the applied caps and source keys).
     provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    # DCA-141 — the approved run plan bound to this run. NULL/empty until an authorized actor approves a
+    # reviewed DCA-135 discovery plan onto the run (which also moves ``status`` PENDING → PLANNED):
+    #   ``plan_version`` pins the exact :class:`DiscoveryPlan` version this run froze (traceability);
+    #   ``plan_snapshot`` is the FROZEN, immutable copy of that plan's bounded tasks + caps + grounding
+    #   at the moment of approval — the exact set the (later, still-disabled) pipeline would execute, so a
+    #   subsequent edit of the plan (a NEW draft version) never changes what this run committed to;
+    #   ``approved_by`` / ``approved_by_type`` / ``approved_at`` record WHO approved it and WHEN (the
+    #   business principal + time, like :class:`IcpConfirmation`). Approving freezes a plan — it still
+    #   executes NOTHING (no task is run, no job enqueued, no message sent, nothing spent).
+    plan_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    plan_snapshot: Mapped[dict | None] = mapped_column(JSON, default=None)
+    approved_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    approved_by_type: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

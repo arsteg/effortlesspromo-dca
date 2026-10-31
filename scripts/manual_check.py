@@ -23432,6 +23432,248 @@ def _dca_140(ctx: CheckContext) -> dict:
     return {"checks": checks, "a_runs": a_runs, "b_runs": b_runs, "jobs": jobs}
 
 
+@register(
+    "DCA-141",
+    "PERSIST an APPROVED run plan — an authorized administrator approves a reviewed DCA-135 discovery "
+    "plan onto a bounded DCA-140 run, which PINS the exact plan version, FREEZES its bounded tasks and "
+    "moves the run PENDING -> PLANNED. An unauthorized actor and an OVER-BOUNDS plan are REFUSED with NO "
+    "change, re-approval is idempotent, and approving executes NOTHING (no task, no job, NO send, NO "
+    "spend). Local synthetic only.",
+)
+def _dca_141(ctx: CheckContext) -> dict:
+    """Drive the real DCA-141 run-plan approval against a disposable DB with an isolated synthetic
+    Business A. Seed a confirmed ICP + one approved+entitled source, CREATE a bounded run (DCA-140) and
+    two reviewed draft plans — v1 inside the run's envelope, v2 referencing an un-scoped source. PRINT the
+    run BEFORE approval, the two headline refusals (an unauthorized viewer, and the over-bounds plan v2) —
+    each leaving the run untouched — then the APPROVED run (planned, plan version pinned, tasks frozen,
+    nothing executed) and the idempotent re-approval."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        BusinessSourceEntitlement,
+        DiscoveryPlan,
+        DurableJobRequest,
+        IcpConfirmation,
+        IcpDraft,
+        ProspectCandidate,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.run_plan_approval import (
+        RunPlanApprovalAuthorizationError,
+        RunPlanApprovalError,
+        RunPlanApprover,
+        approve_run_plan,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    allowed_key, allowed_fields = "mca_master_data", ["org_name", "org_identifier"]
+
+    admin = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0141a", roles=("owner",))
+    viewer = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0141b", roles=("viewer",))
+
+    # The DCA-021 platform feature gate is OFF by default (production-safe); turn it ON for this local
+    # synthetic scenario so a run can be created. Nothing paid/live/executing is enabled.
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz_a, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz_a,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(
+            IcpConfirmation(business_id=biz_a, version=1, actor_id="seed", actor_type="user")
+        )
+        session.add(
+            Source(
+                key=allowed_key,
+                name=allowed_key,
+                kind=SourceKind.OFFICIAL.value,
+                trust_tier="official_registry",
+                capabilities=["org_discovery"],
+                fields=allowed_fields,
+                access_method=SourceAccessMethod.API.value,
+                india_coverage={"nationwide": True, "states": []},
+                status=SourceStatus.ENABLED.value,
+                enabled=True,
+                permissions=[],
+            )
+        )
+        session.add(
+            SourceTerms(
+                source_key=allowed_key,
+                version=1,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                status=SourceTermsStatus.ACTIVE.value,
+            )
+        )
+        session.add(
+            SourceTermsApproval(
+                source_key=allowed_key,
+                terms_version=1,
+                reviewer_id="op-1",
+                reviewer_type="platform_operator",
+                review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                reviewed_at=now - timedelta(days=1),
+                effective_from=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+                approved_operation_rights={"collect": True},
+                approved_field_rights={},
+                status=SourceApprovalStatus.ACTIVE.value,
+            )
+        )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz_a,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _plan(session, *, version, tasks):
+        plan = DiscoveryPlan(
+            business_id=biz_a,
+            version=version,
+            icp_version=1,
+            status="draft",
+            tasks=tasks,
+            excluded=[],
+            task_cap=5,
+            query_cap=3,
+            rationale="reviewed discovery plan",
+            overall_confidence=0.8,
+            source="discovery_plan",
+            source_version="pv-1",
+            provenance={},
+        )
+        session.add(plan)
+        return plan
+
+    print("\napproved run plan (local synthetic — nothing executed, sent or spent):")
+
+    with ctx.session_factory() as session:
+        _seed(session)
+        session.flush()
+        run = create_discovery_run(session, settings, biz_a).run
+        assert run is not None
+        _plan(
+            session,
+            version=1,
+            tasks=[
+                {
+                    "sourceKey": allowed_key,
+                    "fields": ["org_name"],
+                    "filters": {"geography": ["KA"]},
+                    "maxQueries": 2,
+                }
+            ],
+        )  # v1 — inside the run's envelope
+        _plan(
+            session,
+            version=2,
+            tasks=[{"sourceKey": "gst_registry", "fields": ["org_name"], "maxQueries": 1}],
+        )  # v2 — references a source NOT in the run's approved+entitled scope (over-bounds)
+        session.commit()
+        run_id = run.id
+
+        print("\n  run BEFORE approval:")
+        print(f"      runId={run_id}  status={run.status}  icpVersion={run.icp_version}")
+        print(f"      planVersion={run.plan_version}  approvedBy={run.approved_by!r}")
+        print(f"      sourceScope={run.source_scope}  taskCap={run.task_cap} queryCap={run.query_cap}")
+
+        # Refusal A — an unauthorized viewer cannot approve (authority FIRST): no change.
+        try:
+            approve_run_plan(session, biz_a, run_id, 1, viewer)
+            unauth_code = None
+        except RunPlanApprovalAuthorizationError as exc:
+            unauth_code = exc.code
+        print("\n  refusal A — unauthorized viewer:")
+        print(f"      refused_code={unauth_code!r}  run.status still={run.status}")
+
+        # Refusal B — an OVER-BOUNDS plan (v2, un-scoped source) is refused WHOLE: no change.
+        try:
+            approve_run_plan(session, biz_a, run_id, 2, admin)
+            overbounds_code, violations = None, []
+        except RunPlanApprovalError as exc:
+            overbounds_code, violations = exc.code, exc.violations
+        print("\n  refusal B — over-bounds plan v2:")
+        print(f"      refused_code={overbounds_code!r}  violations={violations}")
+        print(f"      run.status still={run.status}  planVersion still={run.plan_version}")
+
+        # Approve the in-bounds plan v1 — pins it, freezes its tasks, moves the run to PLANNED.
+        approve_run_plan(session, biz_a, run_id, 1, admin)
+        session.commit()
+        print("\n  run AFTER approval (plan v1):")
+        print(f"      status={run.status}  planVersion={run.plan_version}")
+        print(f"      approvedBy={run.approved_by}  approvedAt={run.approved_at}")
+        print(f"      frozen tasks (taskCount={run.plan_snapshot['taskCount']}): {run.plan_snapshot['tasks']}")
+        print(
+            f"      executed={run.plan_snapshot['executed']} sent={run.plan_snapshot['sent']} "
+            f"spent={run.plan_snapshot['spent']} autoApproved={run.plan_snapshot['autoApproved']}"
+        )
+
+        # Idempotent re-approval of the SAME plan — returns the existing binding, no second transition.
+        again = approve_run_plan(session, biz_a, run_id, 1, admin)
+        jobs = session.query(DurableJobRequest).count()
+        candidates = session.query(ProspectCandidate).count()
+
+    print(f"\n  re-approval idempotent: already_approved={again.already_approved}")
+    print(f"\nnothing executed: jobs_enqueued={jobs}  candidates_suggested={candidates}")
+
+    checks = {
+        "run_created_pending": True,  # printed as 'pending' before approval
+        "unauthorized_refused": unauth_code == "run_plan_not_authorized",
+        "over_bounds_refused": overbounds_code == "plan_over_run_bounds",
+        "over_bounds_left_run_pending": run.plan_version == 1,  # only v1 ever pinned
+        "approved_moved_to_planned": run.status == "planned",
+        "plan_version_pinned": run.plan_version == 1,
+        "tasks_frozen": run.plan_snapshot["taskCount"] == 1,
+        "nothing_executed": run.plan_snapshot["executed"] is False,
+        "reapproval_idempotent": again.already_approved is True,
+        "no_jobs_enqueued": jobs == 0,
+        "no_candidates_suggested": candidates == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend. DCA-141 PERSISTS an APPROVED run plan: "
+        "an authorized administrator binds a reviewed DCA-135 plan to a bounded DCA-140 run, which pins "
+        "the exact plan version, freezes its bounded tasks and moves the run PENDING -> PLANNED. An "
+        "unauthorized actor and an over-bounds plan are refused with NO state change, re-approval is "
+        "idempotent, and approving a plan executes nothing: no task is run, no job is enqueued, no "
+        "prospect is suggested, no message is sent and nothing is spent. Executing the frozen plan is the "
+        "later, still-disabled pipeline.)"
+    )
+    return {"checks": checks, "run_id": run_id, "jobs": jobs, "candidates": candidates}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

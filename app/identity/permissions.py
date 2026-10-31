@@ -80,6 +80,17 @@ class Scope(str, Enum):
     SOURCE_APPROVE = "source.approve"  # administrator: approve a data source
     POLICY_APPROVE = "policy.approve"  # administrator: approve a compliance policy
     BUDGET_MANAGE = "budget.manage"  # administrator: change spend budgets
+    # approve + persist a reviewed DCA-135 discovery plan onto one of this business's bounded discovery
+    # runs (DCA-141) — binding the plan to the run, freezing the exact bounded tasks it will execute and
+    # moving the run PENDING → PLANNED. An ADMINISTRATOR scope: committing a run's scope/budget envelope
+    # to an executable plan is an administration decision (it governs chargeable discovery work, like
+    # ``budget.manage``), so an ordinary acting user and a read-only viewer both lack it — only a
+    # business administrator holds it. It is a business-plane scope, so a platform operator (holding no
+    # membership) can never approve a client's run plan with their global rights alone; delegated
+    # client-support approval would be a separate, scoped, expiring grant (a later story), never an
+    # operator right. Approving freezes a plan — it still executes NOTHING (no task is run, no job is
+    # enqueued, no message is sent and nothing is spent; execution stays a disabled future capability).
+    RUN_PLAN_APPROVE = "run.plan.approve"
     # store a per-business recurring schedule — a durable record of a recurring intent, pinned to the
     # confirmed ICP / profile versions it targets (DCA-107). An ADMINISTRATOR scope: configuring the
     # agent's automation cadence is an administration action, so an ordinary acting user and a read-only
@@ -157,6 +168,8 @@ _ADMIN_SCOPES = frozenset(
         Scope.SOURCE_APPROVE,
         Scope.POLICY_APPROVE,
         Scope.BUDGET_MANAGE,
+        # approving/persisting a reviewed discovery plan onto a run is an administrator action (DCA-141).
+        Scope.RUN_PLAN_APPROVE,
         # configuring the agent's recurring-schedule cadence is an administrator action (DCA-107).
         Scope.SCHEDULE_MANAGE,
         # pausing (or resuming) all of a business's own agent work is an administrator action (DCA-111).
