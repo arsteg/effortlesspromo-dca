@@ -1331,6 +1331,92 @@ class DiscoveryRunRequest(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class DiscoveryTaskStatus(str, Enum):
+    """DCA-142 — terminal state of ONE executed planned source task within a discovery run.
+
+    Executing a planned task is bounded to ONE task and runs the appropriate source adapter
+    deterministically against caller-supplied / synthetic fixture inputs (no real network fetch, no
+    recipient send). The three terminal states draw the load-bearing distinction the DCA-142 acceptance
+    criteria require:
+
+    - :attr:`DONE` — the rights + budget guards permitted, the adapter was invoked and its raw result was
+      staged (the checkpoint).
+    - :attr:`FAILED` — the guards permitted and the adapter WAS invoked, but the adapter itself refused /
+      errored (external access was reached; the task produced no staged result).
+    - :attr:`DENIED` — a guard (a REVOKED source's rights check, or an EXHAUSTED budget reservation)
+      stopped the task BEFORE any adapter was invoked. Nothing ran: no provider call was dispatched, no
+      budget hold was taken past the refusal, and the run's state is unchanged — only this denial record
+      and its atomic audit entry are written.
+    """
+
+    DONE = "done"
+    FAILED = "failed"
+    DENIED = "denied"
+
+
+class DiscoveryTaskExecution(TenantOwned, Base):
+    """DCA-142 — the record of executing ONE planned source task of a discovery run (tenant-owned, RLS).
+
+    One row is the inert, inspectable outcome of running exactly ONE task frozen into a run's DCA-141
+    ``plan_snapshot``: the orchestration glue that connects the DCA-048 rights preflight, the DCA-113
+    cost reservation, the DCA-115 provider-call ledger and the concrete DCA-123 source adapter for that
+    one task, storing only the PERMITTED staged output / checkpoint. There is **no real network fetch and
+    no recipient send** — the adapter runs deterministically against caller-supplied / synthetic fixture
+    inputs; "execute" means run the adapter mechanics, bounded to one task.
+
+    **A task runs once (idempotent).** ``(business_id, run_id, task_index)`` is unique: re-executing the
+    same task is a deterministic no-op that returns this existing record and stages nothing new. A denial
+    (``DENIED``) is recorded the same way, so a replay of a denied task is equally a no-op.
+
+    **Guards FIRST; a denial runs nothing.** A ``DENIED`` row (a revoked source or an exhausted budget)
+    is written BEFORE any adapter is invoked — ``provider_call_id`` is NULL (no external access occurred)
+    and the run's state is unchanged. Only when the rights AND budget guards permit is the adapter
+    invoked, the provider call dispatched, and the run advanced ``planned`` → ``running``.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy, so one
+    business can never read or execute another's tasks. ``staged_result`` holds only opaque counts and
+    checkpointable row references (never prospect contact data) and no secrets.
+    """
+
+    __tablename__ = "discovery_task_executions"
+    # At most ONE execution record per (run, task_index) in a business — the "a task runs once" guarantee.
+    __table_args__ = (
+        tenant_unique("run_id", "task_index", name="uq_discovery_task_execution_task"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-140 run this task belongs to (its frozen DCA-141 plan_snapshot holds the approved task set).
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("discovery_run_requests.id"), index=True
+    )
+    # The 0-based position of the executed task within the run's FROZEN plan_snapshot task list. The task
+    # must come from that approved snapshot — only approved tasks run.
+    task_index: Mapped[int] = mapped_column(Integer)
+    # A non-reversible fingerprint of the exact frozen task executed (ties this record to that task).
+    task_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The catalog source the task's adapter ran against, and the adapter key invoked.
+    source_key: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    adapter_key: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # done | failed | denied (:class:`DiscoveryTaskStatus`).
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    # Which stage produced the outcome: rights | budget | adapter (for review/reproducibility).
+    phase: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # The stable denial / failure reason code (empty on a DONE outcome).
+    reason_code: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The DCA-113 reservation the task drew on (NULL on a rights denial — budget was never reached).
+    reservation_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    # The DCA-115 provider-call ledger record for the invocation (NULL when no external access occurred,
+    # i.e. on any DENIED outcome — the guards stopped the task before the adapter was invoked).
+    provider_call_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    # The PERMITTED raw staged output / checkpoint: opaque counts + checkpointable row refs; NO contact
+    # data and no secrets. Empty on a denial (nothing was staged).
+    staged_result: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Execution provenance + the load-bearing invariants (sent / spent = False; executed reflects whether
+    # the adapter actually ran).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

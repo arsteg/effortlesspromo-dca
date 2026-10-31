@@ -23607,7 +23607,9 @@ def _dca_141(ctx: CheckContext) -> dict:
         print("\n  run BEFORE approval:")
         print(f"      runId={run_id}  status={run.status}  icpVersion={run.icp_version}")
         print(f"      planVersion={run.plan_version}  approvedBy={run.approved_by!r}")
-        print(f"      sourceScope={run.source_scope}  taskCap={run.task_cap} queryCap={run.query_cap}")
+        print(
+            f"      sourceScope={run.source_scope}  taskCap={run.task_cap} queryCap={run.query_cap}"
+        )
 
         # Refusal A — an unauthorized viewer cannot approve (authority FIRST): no change.
         try:
@@ -23634,7 +23636,9 @@ def _dca_141(ctx: CheckContext) -> dict:
         print("\n  run AFTER approval (plan v1):")
         print(f"      status={run.status}  planVersion={run.plan_version}")
         print(f"      approvedBy={run.approved_by}  approvedAt={run.approved_at}")
-        print(f"      frozen tasks (taskCount={run.plan_snapshot['taskCount']}): {run.plan_snapshot['tasks']}")
+        print(
+            f"      frozen tasks (taskCount={run.plan_snapshot['taskCount']}): {run.plan_snapshot['tasks']}"
+        )
         print(
             f"      executed={run.plan_snapshot['executed']} sent={run.plan_snapshot['sent']} "
             f"spent={run.plan_snapshot['spent']} autoApproved={run.plan_snapshot['autoApproved']}"
@@ -23672,6 +23676,304 @@ def _dca_141(ctx: CheckContext) -> dict:
         "later, still-disabled pipeline.)"
     )
     return {"checks": checks, "run_id": run_id, "jobs": jobs, "candidates": candidates}
+
+
+@register(
+    "DCA-142",
+    "EXECUTE one planned source task — for a single approved, frozen task of a DCA-141 run, connect the "
+    "rights preflight, the budget reservation, the provider-call ledger and the DCA-123 source adapter, "
+    "staging only the permitted result/checkpoint and advancing the run PLANNED -> RUNNING. A REVOKED "
+    "source and an EXHAUSTED budget each STOP the task before external access (nothing runs), re-execution "
+    "is an idempotent no-op, and NO real network fetch and NO recipient send ever happen. Local synthetic "
+    "only.",
+)
+def _dca_142(ctx: CheckContext) -> dict:
+    """Drive the real DCA-142 task executor against a disposable DB with THREE isolated synthetic
+    businesses. Business A executes a valid fixture task (DONE — a staged result + a dispatched provider
+    call, run advanced to RUNNING). Business B has its source REVOKED after approval (rights deny — the
+    adapter is never invoked). Business C has a near-zero budget (the reservation is refused — the adapter
+    is never invoked). PRINT each run's task BEFORE and AFTER execution, and COMPARE the call logs: only A
+    reached external access. Nothing is fetched over the network and nothing is sent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        BudgetLimit,
+        BusinessSourceEntitlement,
+        DiscoveryPlan,
+        IcpConfirmation,
+        IcpDraft,
+        OrgObservation,
+        ProviderCallRecord,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.discovery_task_execution import (
+        PER_QUERY_COST_MINOR,
+        DiscoveryTaskExecutor,
+        OrgDatasetTaskInput,
+        TaskExecutionActor,
+    )
+    from app.services.org_observation import ExternalIdInput
+    from app.services.run_plan_approval import RunPlanApprover, approve_run_plan
+    from app.sources.org_dataset_import import DatasetManifest, DatasetRow
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    biz_b = "00000000-0000-4000-8000-00000000000b"
+    biz_c = "00000000-0000-4000-8000-00000000000c"
+    allowed_key, allowed_fields = "mca_master_data", ["org_name", "org_identifier"]
+    admin = TaskExecutionActor(subject="00000000-0000-4000-9000-0000000a0142a", roles=("owner",))
+    approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0142a", roles=("owner",))
+
+    # The DCA-021 platform feature gate is OFF by default; turn it ON for this local synthetic scenario so
+    # a run can be created. Nothing paid/live/executing is enabled.
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session, biz, *, per_run_minor):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(IcpConfirmation(business_id=biz, version=1, actor_id="seed", actor_type="user"))
+        session.add(
+            BudgetLimit(
+                business_id=biz,
+                version=1,
+                currency="INR",
+                daily_cap_minor=10_000_000,
+                monthly_cap_minor=100_000_000,
+                per_run_cap_minor=per_run_minor,
+                timezone="Asia/Kolkata",
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        # The catalog source is shared control-plane data — add it once (on the first business).
+        if not session.query(Source).filter_by(key=allowed_key).count():
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=allowed_fields,
+                    access_method=SourceAccessMethod.BULK_DOWNLOAD.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _planned(session, biz):
+        run = create_discovery_run(session, settings, biz).run
+        assert run is not None
+        session.add(
+            DiscoveryPlan(
+                business_id=biz,
+                version=1,
+                icp_version=1,
+                status="draft",
+                tasks=[
+                    {
+                        "sourceKey": allowed_key,
+                        "fields": ["org_name"],
+                        "filters": {"geography": ["KA"]},
+                        "maxQueries": 2,
+                    }
+                ],
+                excluded=[],
+                task_cap=5,
+                query_cap=3,
+                rationale="reviewed discovery plan",
+                overall_confidence=0.8,
+                source="discovery_plan",
+                source_version="pv-1",
+                provenance={},
+            )
+        )
+        session.flush()
+        approve_run_plan(session, biz, run.id, 1, approver)
+        session.flush()
+        return run
+
+    def _adapter_input():
+        return OrgDatasetTaskInput(
+            manifest=DatasetManifest(
+                dataset_id="mca-2026-q3",
+                source_key=allowed_key,
+                source_version="2026-09-30",
+                license="data.gov.in-GODL-1.0",
+                purpose=PLAN_PURPOSE,
+            ),
+            rows=(
+                DatasetRow(
+                    row_ref="le-1",
+                    entity_type="legal_entity",
+                    display_name="Synthetic Textiles Pvt Ltd",
+                    external_ids=(ExternalIdInput("cin", "U17120MH2026PTC900099"),),
+                ),
+            ),
+        )
+
+    print("\nexecute one planned source task (local synthetic — nothing fetched, sent or spent):")
+
+    with ctx.session_factory() as session:
+        _seed(session, biz_a, per_run_minor=1_000_000)
+        _seed(session, biz_b, per_run_minor=1_000_000)
+        _seed(session, biz_c, per_run_minor=PER_QUERY_COST_MINOR - 1)  # near-zero budget
+        session.flush()
+        run_a = _planned(session, biz_a)
+        run_b = _planned(session, biz_b)
+        run_c = _planned(session, biz_c)
+        session.commit()
+        run_a_id, run_b_id, run_c_id = run_a.id, run_b.id, run_c.id
+
+        task_a = run_a.plan_snapshot["tasks"][0]
+        print("\n  Business A — task BEFORE execution:")
+        print(f"      runId={run_a_id}  status={run_a.status}  task#0={task_a}")
+
+        # A — a valid execution: rights + budget permit, the adapter runs, the result is staged.
+        res_a = DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run_a_id, 0, admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        ex_a = res_a.execution
+        print("\n  Business A — task AFTER execution (DONE):")
+        print(
+            f"      status={res_a.status}  ranAdapter={res_a.ran_adapter}  run.status={run_a.status}"
+        )
+        print(f"      reservationId={ex_a.reservation_id}  providerCallId={ex_a.provider_call_id}")
+        print(f"      stagedResult={ex_a.staged_result}")
+
+        # A — re-execute the SAME task: an idempotent no-op (a task runs once).
+        res_a2 = DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run_a_id, 0, admin, adapter_input=_adapter_input()
+        )
+        print(
+            f"\n  Business A — re-execution idempotent: already_executed={res_a2.already_executed}"
+        )
+
+        # B — REVOKE the source after approval (delete the business entitlement), then execute.
+        session.query(BusinessSourceEntitlement).filter_by(business_id=biz_b).delete()
+        session.commit()
+        res_b = DiscoveryTaskExecutor(session, biz_b).execute_task(
+            run_b_id, 0, admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        ex_b = res_b.execution
+        print("\n  Business B — REVOKED source -> DENIED before external access:")
+        print(f"      status={res_b.status}  phase={ex_b.phase}  reason={ex_b.reason_code}")
+        print(f"      providerCallId={ex_b.provider_call_id}  run.status still={run_b.status}")
+
+        # C — near-zero budget: the reservation is refused, so the adapter is never invoked.
+        res_c = DiscoveryTaskExecutor(session, biz_c).execute_task(
+            run_c_id, 0, admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        ex_c = res_c.execution
+        print("\n  Business C — EXHAUSTED budget -> DENIED before external access:")
+        print(f"      status={res_c.status}  phase={ex_c.phase}  reason={ex_c.reason_code}")
+        print(f"      providerCallId={ex_c.provider_call_id}  run.status still={run_c.status}")
+
+        # Compare the call logs: only A reached external access (a provider call + a staged org record).
+        calls_a = session.query(ProviderCallRecord).filter_by(business_id=biz_a).count()
+        calls_b = session.query(ProviderCallRecord).filter_by(business_id=biz_b).count()
+        calls_c = session.query(ProviderCallRecord).filter_by(business_id=biz_c).count()
+        orgs_a = session.query(OrgObservation).filter_by(business_id=biz_a).count()
+        orgs_b = session.query(OrgObservation).filter_by(business_id=biz_b).count()
+        orgs_c = session.query(OrgObservation).filter_by(business_id=biz_c).count()
+
+    print("\n  call log comparison (provider calls / staged org observations):")
+    print(f"      A (valid):          providerCalls={calls_a}  orgObservations={orgs_a}")
+    print(f"      B (revoked rights): providerCalls={calls_b}  orgObservations={orgs_b}")
+    print(f"      C (zero budget):    providerCalls={calls_c}  orgObservations={orgs_c}")
+
+    checks = {
+        "a_executed_done": res_a.status == "done",
+        "a_staged_result": ex_a.staged_result.get("importedCount") == 1,
+        "a_run_running": run_a.status == "running",
+        "a_reexecute_idempotent": res_a2.already_executed is True,
+        "b_revoked_denied": res_b.status == "denied" and ex_b.phase == "rights",
+        "b_no_external_access": ex_b.provider_call_id is None and orgs_b == 0,
+        "b_run_unchanged": run_b.status == "planned",
+        "c_budget_denied": res_c.status == "denied" and ex_c.phase == "budget",
+        "c_no_external_access": ex_c.provider_call_id is None and orgs_c == 0,
+        "c_run_unchanged": run_c.status == "planned",
+        "only_a_reached_external_access": calls_a == 1 and calls_b == 0 and calls_c == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend. DCA-142 EXECUTES one approved, frozen "
+        "task: it connects the rights preflight, the budget reservation, the provider-call ledger and the "
+        "DCA-123 source adapter for that one task, staging only the permitted result/checkpoint and "
+        "advancing the run PLANNED -> RUNNING. A revoked source and an exhausted budget each stop the task "
+        "BEFORE any external access — the adapter is never invoked and the run is unchanged — re-execution "
+        "is an idempotent no-op, and no real network fetch and no recipient send ever occur.)"
+    )
+    return {
+        "checks": checks,
+        "runs": {"a": run_a_id, "b": run_b_id, "c": run_c_id},
+        "calls": {"a": calls_a, "b": calls_b, "c": calls_c},
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:

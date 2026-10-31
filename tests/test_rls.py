@@ -90,6 +90,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "fit_explanations",
         "acquisition_plans",
         "discovery_run_requests",
+        "discovery_task_executions",
     }
 
 
@@ -754,6 +755,60 @@ def test_discovery_run_request_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_RUN_REQUEST, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_TASK_EXEC = (
+    "WITH r AS ("
+    "INSERT INTO discovery_run_requests "
+    "(id, business_id, icp_version, status, source_scope, target_cap, task_cap, query_cap, "
+    "requested, clamped, clamp_notes, provenance, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'planned', '[]', 50, 5, 3, '{}', false, '[]', '{}', now()) "
+    "RETURNING id, business_id) "
+    "INSERT INTO discovery_task_executions "
+    "(id, business_id, run_id, task_index, task_fingerprint, source_key, adapter_key, status, phase, "
+    "reason_code, staged_result, provenance, created_at) "
+    "SELECT gen_random_uuid()::text, r.business_id, r.id, 0, 'fp', 'synthetic.mca', "
+    "'dca.org_dataset_import', 'done', 'adapter', '', '{}', '{}', now() FROM r"
+)
+
+
+@requires_pg
+def test_discovery_task_execution_is_tenant_isolated(rls_db):
+    """DCA-142 — a task-execution record is tenant-owned: each tenant can read only its OWN executed
+    tasks (RLS on real Postgres), so one business can never see or enumerate another's task executions."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_TASK_EXEC, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_TASK_EXEC, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM discovery_task_executions").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM discovery_task_executions").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_discovery_task_execution_write_check_rejects_foreign_owner(rls_db):
+    """A task execution can never be stamped for another tenant: writing a B-owned record while scoped to
+    A violates the WITH CHECK clause (defence-in-depth beneath the executor's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_TASK_EXEC, (B,))
         conn.rollback()
     finally:
         conn.close()
