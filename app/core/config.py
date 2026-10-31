@@ -154,6 +154,11 @@ class Settings(BaseSettings):
         100.0  # overall deadline (matches the .NET caller's effective default)
     )
     ai_connect_timeout_seconds: float = 5.0  # DCA-129: separate connect deadline — never unbounded
+    # DCA-130: a hard upper bound on the serialized model-invocation payload (input context + untrusted
+    # frames, measured in characters) that the DCA will send to the gateway. A request over this bound is
+    # REFUSED before any budget is reserved and before any gateway call — a bounded invocation never ships
+    # an unbounded payload. Mirrors the AI service's own ``untrusted_max_chars`` default (20000).
+    ai_max_payload_chars: int = 20_000
 
     # --- outbound: the platform (.NET API) HTTP transport (DCA-032) — OFF by default ---
     # The hardened transport MECHANISM for calling the platform API: single allowlisted origin,

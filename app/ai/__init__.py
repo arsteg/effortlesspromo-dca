@@ -31,6 +31,14 @@ from app.ai.contract import (
     dca_job_binding,
     parse_envelope,
 )
+from app.ai.bound_invocation import (
+    BoundInvocationActor,
+    BoundInvocationAuthorizationError,
+    BoundInvocationError,
+    BoundInvocationRequest,
+    BoundInvocationResult,
+    BoundModelInvoker,
+)
 from app.ai.fake import (
     SYNTHETIC_VERSION,
     AiContractDisabled,
@@ -56,6 +64,12 @@ __all__ = [
     "AiTokenUsage",
     "AiUntrustedItem",
     "AiValidation",
+    "BoundInvocationActor",
+    "BoundInvocationAuthorizationError",
+    "BoundInvocationError",
+    "BoundInvocationRequest",
+    "BoundInvocationResult",
+    "BoundModelInvoker",
     "FakeAiGatewayTransport",
     "build_ai_capability_facade",
     "build_ai_gateway_transport",

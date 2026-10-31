@@ -21253,6 +21253,205 @@ def _dca_129(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-130",
+    "bound an AI-service (model) invocation's cost and retries: reserve a conservative hold BEFORE the "
+    "ONE gateway call (over-budget DENIES the invocation with no call), record the call lifecycle, and "
+    "reconcile the hold from the RETURNED actual cost (settle / release / preserve-uncertain). The gateway "
+    "owns model retry/failover - the invoker calls once and CLASSIFIES the outcome for a bounded DCA-104 "
+    "job retry (a non-retryable error is dead-lettered, never retried). A timeout stays PENDING (never "
+    "zero); a re-invocation is idempotent. No real/paid call is ever made (scripted fixture transport).",
+)
+def _dca_130(ctx: CheckContext) -> dict:
+    """Drive the real DCA-130 BoundModelInvoker directly against the ephemeral synthetic DB and PRINT the
+    REAL reservation / provider-call / reconciliation rows, the budget remaining, and the DCA-104 retry
+    PLAN for each outcome - never a bare PASS. The gateway is a deterministic SCRIPTED fixture: no network,
+    no model, no spend; it either returns a synthetic envelope with a chosen INR cost or raises the DCA-129
+    transport errors. Shows: a within-budget success reserving ₹20 then settling at the reported ₹12 (₹8
+    freed); an over-budget request DENIED before any call; a 4xx rejection released + classified PERMANENT
+    (DCA-104 dead-letters it immediately); a 5xx/unreachable released + classified TRANSIENT (retried while
+    attempts remain, then dead-lettered at the cap); a read-timeout preserved UNCERTAIN (pending, never
+    zero); and an idempotent re-invocation that makes no second call and no second settlement."""
+    import random
+    from datetime import UTC, datetime
+    from typing import Any, cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.ai.bound_invocation import (
+        BoundInvocationActor,
+        BoundInvocationRequest,
+        BoundModelInvoker,
+    )
+    from app.ai.contract import AiCapabilityFacade
+    from app.audit.sink import ActorType, AuditActor
+    from app.clients.ai_client import (
+        AiServiceRejected,
+        AiServiceTimeout,
+        AiServiceUnavailable,
+    )
+    from app.cost.reserve import BudgetReservationStore
+    from app.jobs.retry import plan_retry
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz = "11111111-1111-1111-1111-11111111b130"
+    admin = BoundInvocationActor(subject="00000000-0000-4000-9000-0000000a0130", roles=("admin",))
+    budget_actor = AuditActor(id="00000000-0000-4000-9000-0000000b0130", type=ActorType.USER)
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)  # 2026-10-31 14:30 IST
+    cap = "contact_research"  # the one DCA-128-allowlisted capability
+
+    class _Scripted:
+        """A network-free, no-spend scripted gateway transport (returns an envelope or raises)."""
+
+        synthetic = True
+
+        def __init__(self, *, cost_major: float = 12.0, raises: Exception | None = None, fail: bool = False) -> None:
+            self._cost_major = cost_major
+            self._raises = raises
+            self._fail = fail
+            self.calls: list[dict[str, Any]] = []
+
+        @property
+        def enabled(self) -> bool:
+            return True
+
+        def invoke(self, capability: str, *, business_id: str, job_id: str, request_id: str, **kw: Any) -> dict:
+            self.calls.append({"request_id": request_id})
+            if self._raises is not None:
+                raise self._raises
+            return {
+                "jobId": job_id,
+                "capability": capability,
+                "status": "failed" if self._fail else "completed",
+                "structuredOutput": None if self._fail else {"synthetic": True},
+                "modelProvider": "scripted",
+                "tokenUsage": {"promptTokens": 100, "completionTokens": 140, "totalTokens": 240},
+                "costEstimate": {"amount": self._cost_major, "currency": "INR", "estimated": False},
+                "validationReport": {"status": "failed" if self._fail else "passed"},
+                "error": {"code": "rule_failed", "retryable": False} if self._fail else None,
+            }
+
+    with factory() as session:
+        BudgetLimitStore(session, biz).save(
+            BudgetLimitInput(daily_cap_minor=100_000, monthly_cap_minor=1_000_000, per_run_cap_minor=100_000),
+            budget_actor,
+        )
+        session.commit()
+
+    def _run(key: str, transport: _Scripted, *, estimate: int = 2_000) -> Any:
+        with factory() as session:
+            invoker = BoundModelInvoker(session, biz, AiCapabilityFacade(transport))
+            result = invoker.invoke(
+                BoundInvocationRequest(
+                    invocation_key=key,
+                    capability=cap,
+                    reserved_cost_minor=estimate,
+                    input_context={"org_ref": "CIN-U72900MH2026PTC000130"},
+                ),
+                admin,
+                now=now,
+            )
+            session.commit()
+            return result
+
+    def _remaining() -> int | None:
+        with factory() as session:
+            return BudgetReservationStore(session, biz).window(now=now).daily_remaining_minor
+
+    def _retry_plan(result: Any, *, attempt: int, cap_attempts: int) -> str:
+        signal = result.as_failure_signal()
+        if signal is None:
+            return "n/a (success)"
+        plan = plan_retry(signal, attempt_count=attempt, max_attempts=cap_attempts, now=now, rng=random.Random(0))
+        return plan.action.value
+
+    print(f"\nbusiness: ...{biz[-4:]}   per-run cap INR 1000.00, daily INR 1000.00; each run reserves INR 20.00")
+
+    # 1) within-budget success: reserve ₹20 -> settle at the reported ₹12 -> ₹8 freed.
+    ok = _run("inv-ok", _Scripted(cost_major=12.0))
+    print("\n1) within-budget success (reserve -> call once -> settle from actual):")
+    print(
+        f"   outcome={ok.outcome} call={ok.call_status} reserved={ok.reserved_minor} "
+        f"settled={ok.settled_minor} released={ok.released_minor} spent={ok.spent_minor}  "
+        f"daily_remaining={_remaining()}"
+    )
+
+    # 2) over-budget: DENIED before the call (no reservation, no gateway call).
+    big = _Scripted()
+    over = _run("inv-over", big, estimate=5_000_00)  # ₹5000 > ₹1000 per-run cap
+    print("\n2) over-budget DENIES the invocation (no call, no spend):")
+    print(f"   authorized={over.authorized} phase={over.phase} reason={over.reason} gateway_calls={len(big.calls)}")
+
+    # 3) non-retryable 4xx: released + classified PERMANENT -> DCA-104 dead-letters immediately.
+    rej_t = _Scripted(raises=AiServiceRejected(400))
+    rej = _run("inv-rej", rej_t)
+    print("\n3) non-retryable 4xx rejection (released; NOT retried):")
+    print(
+        f"   outcome={rej.outcome} released={rej.released_minor} class={rej.failure_class.value} "
+        f"gateway_calls={len(rej_t.calls)}  retry_plan(attempt=1/5)={_retry_plan(rej, attempt=1, cap_attempts=5)}"
+    )
+
+    # 4) transient 5xx/unreachable: released + classified TRANSIENT -> retried while attempts remain,
+    #    then dead-lettered at the cap (bounded; the invoker itself never loops).
+    un_t = _Scripted(raises=AiServiceUnavailable("unreachable"))
+    un = _run("inv-unavail", un_t)
+    print("\n4) transient 5xx/unreachable (released; BOUNDED retry, not stacked):")
+    print(
+        f"   outcome={un.outcome} class={un.failure_class.value} gateway_calls={len(un_t.calls)}  "
+        f"retry_plan(1/3)={_retry_plan(un, attempt=1, cap_attempts=3)} "
+        f"retry_plan(3/3)={_retry_plan(un, attempt=3, cap_attempts=3)}"
+    )
+
+    # 5) read-timeout: preserved UNCERTAIN -> the full hold stays PENDING (never zeroed).
+    to_t = _Scripted(raises=AiServiceTimeout("read timeout"))
+    to = _run("inv-timeout", to_t)
+    print("\n5) read-timeout stays UNCERTAIN / pending (never zero):")
+    print(
+        f"   outcome={to.outcome} call={to.call_status} settled={to.settled_minor} "
+        f"spent={to.spent_minor} needs_review={to.needs_review}  daily_remaining={_remaining()}"
+    )
+
+    # 6) idempotent re-invocation: no second call, no second settlement.
+    again_t = _Scripted(cost_major=12.0)
+    again = _run("inv-ok", again_t)  # same key as (1)
+    print("\n6) idempotent re-invocation (no second call, no double-settle):")
+    print(f"   skipped={again.skipped} outcome={again.outcome} settled={again.settled_minor} gateway_calls={len(again_t.calls)}")
+
+    checks = {
+        "within_budget_settles_from_actual": ok.outcome == "completed" and ok.settled_minor == 1_200 and ok.released_minor == 800,
+        "over_budget_denies_with_no_call": over.authorized is False and len(big.calls) == 0,
+        "rejection_not_retryable_dead_letter": rej.failure_class.value == "permanent"
+        and _retry_plan(rej, attempt=1, cap_attempts=5) == "dead_letter_permanent"
+        and len(rej_t.calls) == 1,
+        "transient_bounded_by_cap": _retry_plan(un, attempt=1, cap_attempts=3) == "schedule_retry"
+        and _retry_plan(un, attempt=3, cap_attempts=3) == "dead_letter_exhausted",
+        "timeout_preserved_pending": to.outcome == "uncertain" and to.settled_minor is None and to.spent_minor == 2_000,
+        "reinvocation_idempotent": again.skipped is True and len(again_t.calls) == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no socket, NO real/paid model call. DCA-130 BOUNDS one model "
+        "invocation through the DCA-128 facade: a conservative hold is RESERVED before the ONE gateway call "
+        "(an over-budget request DENIES the invocation with no call and no spend), the call lifecycle is "
+        "recorded (DCA-115), and the hold is RECONCILED from the returned actual cost (DCA-114) - settled on "
+        "success (unused freed), released on a confirmed failure, or PRESERVED as uncertain on a timeout "
+        "(pending, never zero). Model retry/failover is the GATEWAY's: the invoker calls once and classifies "
+        "the outcome with the DCA-104 discipline for a BOUNDED job retry - a non-retryable error is "
+        "dead-lettered immediately, never retried, and retries are never stacked on the gateway's. Idempotent "
+        "on the stable logical invocation key; duplicated receipts cannot double-settle.)"
+    )
+    return {
+        "within_budget": {"outcome": ok.outcome, "reserved": ok.reserved_minor, "settled": ok.settled_minor, "released": ok.released_minor},
+        "over_budget": {"authorized": over.authorized, "phase": over.phase, "reason": over.reason, "calls": len(big.calls)},
+        "rejected": {"outcome": rej.outcome, "class": rej.failure_class.value, "calls": len(rej_t.calls)},
+        "unavailable": {"outcome": un.outcome, "class": un.failure_class.value},
+        "timeout": {"outcome": to.outcome, "settled": to.settled_minor, "spent": to.spent_minor},
+        "idempotent": {"skipped": again.skipped, "calls": len(again_t.calls)},
+        "checks": checks,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
