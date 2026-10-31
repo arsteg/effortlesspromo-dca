@@ -83,12 +83,17 @@ class FakeAiGatewayTransport:
         correlation_id: str | None = None,
         dry_run: bool = False,
     ) -> dict[str, Any]:
+        # A RECORDING fake (DCA-131): it captures the exact ``input_context`` / ``untrusted`` it was handed
+        # so a test can inspect the outgoing envelope and prove no forbidden field was ever egressed. This
+        # stands in for a recording fake AI HTTP service placed in front of the gateway.
         self.calls.append(
             {
                 "capability": capability,
                 "business_id": business_id,
                 "job_id": job_id,
                 "request_id": request_id,
+                "input_context": dict(input_context or {}),
+                "untrusted": list(untrusted or []),
                 "dry_run": dry_run,
             }
         )

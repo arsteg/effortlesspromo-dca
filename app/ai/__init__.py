@@ -39,6 +39,18 @@ from app.ai.bound_invocation import (
     BoundInvocationResult,
     BoundModelInvoker,
 )
+from app.ai.context_minimizer import (
+    CAPABILITY_CONTEXT_ALLOWLIST,
+    DEFAULT_MAX_CONTEXT_CHARS,
+    FORBIDDEN_CONTEXT_KEYS,
+    INTERNAL_SEND_SENTINEL,
+    ContextMinimizationError,
+    ContextMinimizer,
+    FieldDrop,
+    MinimizedContext,
+    default_context_minimizer,
+    minimize_context,
+)
 from app.ai.fake import (
     SYNTHETIC_VERSION,
     AiContractDisabled,
@@ -48,7 +60,11 @@ from app.ai.fake import (
 )
 
 __all__ = [
+    "CAPABILITY_CONTEXT_ALLOWLIST",
     "DCA_JOB_ID_PREFIX",
+    "DEFAULT_MAX_CONTEXT_CHARS",
+    "FORBIDDEN_CONTEXT_KEYS",
+    "INTERNAL_SEND_SENTINEL",
     "KNOWN_CAPABILITIES",
     "SYNTHETIC_VERSION",
     "AiCapabilityDisabled",
@@ -70,9 +86,15 @@ __all__ = [
     "BoundInvocationRequest",
     "BoundInvocationResult",
     "BoundModelInvoker",
+    "ContextMinimizationError",
+    "ContextMinimizer",
     "FakeAiGatewayTransport",
+    "FieldDrop",
+    "MinimizedContext",
     "build_ai_capability_facade",
     "build_ai_gateway_transport",
     "dca_job_binding",
+    "default_context_minimizer",
+    "minimize_context",
     "parse_envelope",
 ]

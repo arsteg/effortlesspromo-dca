@@ -373,9 +373,18 @@ class AiCapabilityFacade:
         transport: AiGatewayTransport,
         *,
         allowed_capabilities: frozenset[str] = KNOWN_CAPABILITIES,
+        minimizer: Any | None = None,
     ) -> None:
         self._transport = transport
         self._allowed = allowed_capabilities
+        # DCA-131 — minimize the context per capability BEFORE egress. Imported lazily to avoid an
+        # import cycle (the minimizer imports this module's AiContractViolation). Defaults to the
+        # process-wide minimizer over the module allowlist.
+        if minimizer is None:
+            from app.ai.context_minimizer import default_context_minimizer
+
+            minimizer = default_context_minimizer()
+        self._minimizer = minimizer
 
     @property
     def transport_enabled(self) -> bool:
@@ -416,12 +425,19 @@ class AiCapabilityFacade:
                 "(a caller may only invoke for the tenant it authorized)"
             )
 
+        # DCA-131 — minimize the context to this capability's authorized fields BEFORE egress. Strips
+        # secrets, the internal send sentinel and out-of-scope PII, and bounds total size; an
+        # un-minimizable/oversize context raises AiContractViolation (fail closed, no call made). The DCA
+        # performs this even though the gateway ALSO runs privacy screens — a recording fake in front of
+        # the gateway never observes a forbidden field because the DCA never sends one.
+        minimized = self._minimizer.minimize(request.capability, request.input_context)
+
         envelope = self._transport.invoke(
             request.capability,
             business_id=request.business_id,
             job_id=binding.job_id,
             request_id=binding.request_id,
-            input_context=dict(request.input_context),
+            input_context=minimized.context,
             untrusted=[{"source": u.source, "content": u.content} for u in request.untrusted],
             model_hint=request.model_hint,
             prompt_version=request.prompt_version,

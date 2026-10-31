@@ -21306,7 +21306,9 @@ def _dca_130(ctx: CheckContext) -> dict:
 
         synthetic = True
 
-        def __init__(self, *, cost_major: float = 12.0, raises: Exception | None = None, fail: bool = False) -> None:
+        def __init__(
+            self, *, cost_major: float = 12.0, raises: Exception | None = None, fail: bool = False
+        ) -> None:
             self._cost_major = cost_major
             self._raises = raises
             self._fail = fail
@@ -21316,7 +21318,9 @@ def _dca_130(ctx: CheckContext) -> dict:
         def enabled(self) -> bool:
             return True
 
-        def invoke(self, capability: str, *, business_id: str, job_id: str, request_id: str, **kw: Any) -> dict:
+        def invoke(
+            self, capability: str, *, business_id: str, job_id: str, request_id: str, **kw: Any
+        ) -> dict:
             self.calls.append({"request_id": request_id})
             if self._raises is not None:
                 raise self._raises
@@ -21334,7 +21338,9 @@ def _dca_130(ctx: CheckContext) -> dict:
 
     with factory() as session:
         BudgetLimitStore(session, biz).save(
-            BudgetLimitInput(daily_cap_minor=100_000, monthly_cap_minor=1_000_000, per_run_cap_minor=100_000),
+            BudgetLimitInput(
+                daily_cap_minor=100_000, monthly_cap_minor=1_000_000, per_run_cap_minor=100_000
+            ),
             budget_actor,
         )
         session.commit()
@@ -21363,10 +21369,14 @@ def _dca_130(ctx: CheckContext) -> dict:
         signal = result.as_failure_signal()
         if signal is None:
             return "n/a (success)"
-        plan = plan_retry(signal, attempt_count=attempt, max_attempts=cap_attempts, now=now, rng=random.Random(0))
+        plan = plan_retry(
+            signal, attempt_count=attempt, max_attempts=cap_attempts, now=now, rng=random.Random(0)
+        )
         return plan.action.value
 
-    print(f"\nbusiness: ...{biz[-4:]}   per-run cap INR 1000.00, daily INR 1000.00; each run reserves INR 20.00")
+    print(
+        f"\nbusiness: ...{biz[-4:]}   per-run cap INR 1000.00, daily INR 1000.00; each run reserves INR 20.00"
+    )
 
     # 1) within-budget success: reserve ₹20 -> settle at the reported ₹12 -> ₹8 freed.
     ok = _run("inv-ok", _Scripted(cost_major=12.0))
@@ -21381,7 +21391,9 @@ def _dca_130(ctx: CheckContext) -> dict:
     big = _Scripted()
     over = _run("inv-over", big, estimate=5_000_00)  # ₹5000 > ₹1000 per-run cap
     print("\n2) over-budget DENIES the invocation (no call, no spend):")
-    print(f"   authorized={over.authorized} phase={over.phase} reason={over.reason} gateway_calls={len(big.calls)}")
+    print(
+        f"   authorized={over.authorized} phase={over.phase} reason={over.reason} gateway_calls={len(big.calls)}"
+    )
 
     # 3) non-retryable 4xx: released + classified PERMANENT -> DCA-104 dead-letters immediately.
     rej_t = _Scripted(raises=AiServiceRejected(400))
@@ -21416,17 +21428,23 @@ def _dca_130(ctx: CheckContext) -> dict:
     again_t = _Scripted(cost_major=12.0)
     again = _run("inv-ok", again_t)  # same key as (1)
     print("\n6) idempotent re-invocation (no second call, no double-settle):")
-    print(f"   skipped={again.skipped} outcome={again.outcome} settled={again.settled_minor} gateway_calls={len(again_t.calls)}")
+    print(
+        f"   skipped={again.skipped} outcome={again.outcome} settled={again.settled_minor} gateway_calls={len(again_t.calls)}"
+    )
 
     checks = {
-        "within_budget_settles_from_actual": ok.outcome == "completed" and ok.settled_minor == 1_200 and ok.released_minor == 800,
+        "within_budget_settles_from_actual": ok.outcome == "completed"
+        and ok.settled_minor == 1_200
+        and ok.released_minor == 800,
         "over_budget_denies_with_no_call": over.authorized is False and len(big.calls) == 0,
         "rejection_not_retryable_dead_letter": rej.failure_class.value == "permanent"
         and _retry_plan(rej, attempt=1, cap_attempts=5) == "dead_letter_permanent"
         and len(rej_t.calls) == 1,
         "transient_bounded_by_cap": _retry_plan(un, attempt=1, cap_attempts=3) == "schedule_retry"
         and _retry_plan(un, attempt=3, cap_attempts=3) == "dead_letter_exhausted",
-        "timeout_preserved_pending": to.outcome == "uncertain" and to.settled_minor is None and to.spent_minor == 2_000,
+        "timeout_preserved_pending": to.outcome == "uncertain"
+        and to.settled_minor is None
+        and to.spent_minor == 2_000,
         "reinvocation_idempotent": again.skipped is True and len(again_t.calls) == 0,
     }
     print(f"\nchecks: {checks}")
@@ -21442,12 +21460,161 @@ def _dca_130(ctx: CheckContext) -> dict:
         "on the stable logical invocation key; duplicated receipts cannot double-settle.)"
     )
     return {
-        "within_budget": {"outcome": ok.outcome, "reserved": ok.reserved_minor, "settled": ok.settled_minor, "released": ok.released_minor},
-        "over_budget": {"authorized": over.authorized, "phase": over.phase, "reason": over.reason, "calls": len(big.calls)},
-        "rejected": {"outcome": rej.outcome, "class": rej.failure_class.value, "calls": len(rej_t.calls)},
+        "within_budget": {
+            "outcome": ok.outcome,
+            "reserved": ok.reserved_minor,
+            "settled": ok.settled_minor,
+            "released": ok.released_minor,
+        },
+        "over_budget": {
+            "authorized": over.authorized,
+            "phase": over.phase,
+            "reason": over.reason,
+            "calls": len(big.calls),
+        },
+        "rejected": {
+            "outcome": rej.outcome,
+            "class": rej.failure_class.value,
+            "calls": len(rej_t.calls),
+        },
         "unavailable": {"outcome": un.outcome, "class": un.failure_class.value},
         "timeout": {"outcome": to.outcome, "settled": to.settled_minor, "spent": to.spent_minor},
         "idempotent": {"skipped": again.skipped, "calls": len(again_t.calls)},
+        "checks": checks,
+    }
+
+
+@register(
+    "DCA-131",
+    "minimize the AI-service context before egress: per the capability's allowlist, keep ONLY authorized "
+    "evidence + provenance references and DROP everything else (secrets, the internal send sentinel, "
+    "other-tenant evidence, unnecessary personal fields); scrub any secret/sentinel smuggled inside a kept "
+    "value; bound total size (oversize REFUSED). The DCA does this itself, before the gateway's own privacy "
+    "screens, so a RECORDING fake AI transport never observes a forbidden field. No AI, no network, no spend.",
+)
+def _dca_131(ctx: CheckContext) -> dict:
+    """Drive the DCA-131 minimizer through the DCA-128 facade over a RECORDING fake transport and PRINT the
+    BEFORE context the DCA held vs the AFTER context the fake actually observed — proving what was kept vs
+    stripped, never a bare PASS. The fake stands in for a recording AI HTTP service placed in front of the
+    gateway; no network, no model, no spend."""
+    from app.ai import (
+        INTERNAL_SEND_SENTINEL,
+        AiCapabilityFacade,
+        AiCapabilityRequest,
+        AiContractViolation,
+        FakeAiGatewayTransport,
+        dca_job_binding,
+    )
+    from app.ai.context_minimizer import DEFAULT_MAX_CONTEXT_CHARS, ContextMinimizer
+    from app.core.logging import Redactor
+    from app.identity.fake import BUSINESS_A
+
+    cap = "contact_research"  # the one DCA-128-allowlisted capability
+
+    # A mixed, deliberately dirty context: authorized evidence/provenance + a secret key + the internal
+    # send sentinel (as a key AND smuggled inside a value) + out-of-scope / other-tenant / personal fields.
+    secret = "svc-tok-SENTINEL-abc123"  # synthetic — must never appear in the egressed context
+    before = {
+        "org_name": "Synthetic Textiles Pvt Ltd",
+        "org_identifier": "U17120MH2026PTC900099",
+        "industry": "textiles",
+        "region": "Maharashtra",
+        "source_ref": "synthetic://mca/U17120MH2026PTC900099",
+        "evidence_ref": f"note {INTERNAL_SEND_SENTINEL} and token {secret}",
+        "authorization": f"Bearer {secret}",  # forbidden key
+        "send_sentinel": INTERNAL_SEND_SENTINEL,  # forbidden key
+        "founder_mobile": "9812345678",  # out-of-scope private mobile (not allowlisted)
+        "other_business_id": "22222222-2222-2222-2222-222222222222",  # other-tenant reference
+    }
+
+    # A recording fake transport, and a facade whose minimizer also knows the synthetic secret literal.
+    transport = FakeAiGatewayTransport()
+    minimizer = ContextMinimizer(redactor=Redactor(secrets=(secret,)))
+    facade = AiCapabilityFacade(transport, minimizer=minimizer)
+
+    request = AiCapabilityRequest(
+        capability=cap, business_id=BUSINESS_A, input_context=before, dry_run=True
+    )
+    minimized = minimizer.minimize(cap, before)
+    facade.invoke(request, dca_job_binding("inv-131", BUSINESS_A))
+    observed = transport.calls[0]["input_context"]  # what the fake AI service actually received
+
+    print(f"\ncapability: {cap}   egress size bound: {DEFAULT_MAX_CONTEXT_CHARS} chars")
+    print("\nBEFORE (context the DCA held):")
+    for k in before:
+        print(f"  - {k}")
+    print("\nAFTER (context the recording fake AI transport OBSERVED):")
+    for k, v in sorted(observed.items()):
+        print(f"  - {k} = {v!r}")
+    print("\nminimization account (names only, no raw values):")
+    print(f"  kept     : {minimized.kept_fields}")
+    print(f"  dropped  : {[(d.name, d.reason_code) for d in minimized.dropped]}")
+    print(f"  redacted : {sorted(minimized.redacted)}")
+    print(f"  size     : {minimized.size_chars} chars")
+
+    leaked = [
+        t
+        for t in (
+            secret,
+            INTERNAL_SEND_SENTINEL,
+            "9812345678",
+            "authorization",
+            "other_business_id",
+        )
+        if t in repr(transport.calls[0])
+    ]
+    print(f"\nforbidden-field leak check (expect none): {leaked or 'clean'}")
+
+    # Oversize is refused BEFORE egress — the fake observes nothing.
+    big_transport = FakeAiGatewayTransport()
+    big_facade = AiCapabilityFacade(big_transport)
+    refused = False
+    try:
+        big_facade.invoke(
+            AiCapabilityRequest(
+                capability=cap,
+                business_id=BUSINESS_A,
+                input_context={"org_name": "A" * (DEFAULT_MAX_CONTEXT_CHARS + 100)},
+            ),
+            dca_job_binding("inv-131-big", BUSINESS_A),
+        )
+    except AiContractViolation as exc:
+        refused = True
+        print(
+            f"\noversize context: REFUSED before egress ({exc}); gateway_calls={len(big_transport.calls)}"
+        )
+
+    checks = {
+        "only_allowlisted_fields_egressed": set(observed)
+        == {
+            "org_name",
+            "org_identifier",
+            "industry",
+            "region",
+            "source_ref",
+            "evidence_ref",
+        },
+        "no_forbidden_field_observed": not leaked,
+        "sentinel_and_secret_scrubbed_in_value": INTERNAL_SEND_SENTINEL
+        not in observed["evidence_ref"]
+        and secret not in observed["evidence_ref"],
+        "oversize_refused_with_no_egress": refused and len(big_transport.calls) == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no model, NO spend. DCA-131 MINIMIZES the AI-service context "
+        "to a capability's allowlisted authorized evidence + provenance references BEFORE egress: secrets, "
+        "the internal send sentinel, other-tenant evidence and unnecessary personal fields are dropped, a "
+        "secret/sentinel smuggled inside a kept value is scrubbed, and an oversize context is refused with "
+        "no call. The DCA performs this itself even though the gateway ALSO runs privacy screens, so a "
+        "recording fake AI service in front of the gateway cannot observe a forbidden field.)"
+    )
+    return {
+        "before_fields": sorted(before),
+        "observed_fields": sorted(observed),
+        "dropped": [(d.name, d.reason_code) for d in minimized.dropped],
+        "redacted": sorted(minimized.redacted),
+        "leaked": leaked,
         "checks": checks,
     }
 

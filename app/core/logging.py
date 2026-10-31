@@ -114,13 +114,24 @@ class Redactor:
         if len(text) >= self._MIN_SECRET_LEN:
             self._secrets.add(text)
 
-    def redact_text(self, text: str) -> str:
+    def redact_secrets(self, text: str) -> str:
+        """Replace ONLY registered secret literals (never emails/phones).
+
+        For callers that must scrub a smuggled secret/token out of a value while keeping legitimate
+        contact evidence intact (e.g. the DCA-131 context minimizer, where an allowlisted role email is
+        in-scope but a leaked service token is not). Emails and phones are left untouched here."""
         if not text:
             return text
         # Longest secrets first so a secret that contains another is not partially unmasked.
         for secret in sorted(self._secrets, key=len, reverse=True):
             if secret in text:
                 text = text.replace(secret, REDACTED)
+        return text
+
+    def redact_text(self, text: str) -> str:
+        if not text:
+            return text
+        text = self.redact_secrets(text)
         text = _EMAIL_RE.sub(EMAIL_MASK, text)
         text = _PHONE_CANDIDATE_RE.sub(_mask_phone, text)
         return text
