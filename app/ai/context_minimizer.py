@@ -178,6 +178,27 @@ CAPABILITY_CONTEXT_ALLOWLIST: dict[str, frozenset[str]] = {
             "permittedFields",
         }
     ),
+    # DCA-139 — the trusted context for a first-party acquisition plan is ONLY the business's own confirmed
+    # India ICP targeting, a light profile summary for localisation (business type / products / languages /
+    # value proposition) and the bounded allowlist of COMPLIANT first-party capture methods + the
+    # suggestion cap. No prospect contact data and no external content ever rides here; the model proposes
+    # only permitted first-party capture methods (gateway rule_check + the DCA re-enforce the bound), and
+    # fabricates no contacts.
+    "first_party_acquisition_plan": frozenset(
+        {
+            "icpVersion",
+            "industries",
+            "sizeBands",
+            "roles",
+            "geography",
+            "businessType",
+            "products",
+            "languages",
+            "valueProposition",
+            "permittedMethods",
+            "maxSuggestions",
+        }
+    ),
 }
 
 # The serialized-size bound for a minimized context (characters of its canonical JSON). Matches the AI

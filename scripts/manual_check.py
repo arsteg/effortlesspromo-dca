@@ -23129,6 +23129,154 @@ def _dca_138(ctx: CheckContext) -> dict:
     return {"checks": checks, "explanations": rows, "stored": stored}
 
 
+@register(
+    "DCA-139",
+    "DRAFT a first-party acquisition plan through the DCA AI chokepoint — a bounded PROPOSAL of COMPLIANT "
+    "first-party permission-capture methods (forms / QR / opt-in) grounded in the confirmed ICP + profile. "
+    "It is a DRAFT: it proposes ONLY first-party capture methods (any non-first-party / outbound tactic is "
+    "excluded), fabricates NO contacts and promises no ready-to-message list, is never executed / published "
+    "/ auto-approved, and generates NO send and NO recipient consent. Fixture transport only (no "
+    "network/model/spend).",
+)
+def _dca_139(ctx: CheckContext) -> dict:
+    """Drive the real DCA-139 first-party acquisition planner against a disposable DB with isolated
+    synthetic Businesses, using the deterministic fixture transport (no network/model/spend). Draft a plan
+    for a SALON (B2C, confirmed ICP + profile) and a B2B WHOLESALER, feeding the model a mix of permitted
+    first-party methods PLUS a non-first-party/outbound suggestion and a fabricated-contacts suggestion,
+    then PRINT each plan's kept first-party suggestions, what was EXCLUDED (and why), and that nothing was
+    executed/published/sent and no contacts were fabricated."""
+    from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
+    from app.db.models import AcquisitionPlan, IcpConfirmation, IcpDraft
+    from app.services.acquisition_planner import FIRST_PARTY_METHODS, draft_acquisition_plan
+    from app.services.profile_store import ProfileDraftInput, ProfileStore
+
+    salon = "00000000-0000-4000-8000-00000000000a"
+    wholesaler = "00000000-0000-4000-8000-00000000000b"
+
+    def _seed(session, business_id, *, industry, geography, products, business_type, languages):
+        session.add(
+            IcpDraft(
+                business_id=business_id,
+                version=1,
+                industries=[industry],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=[geography],
+                status="draft",
+            )
+        )
+        session.add(
+            IcpConfirmation(
+                business_id=business_id, version=1, actor_id="seed", actor_type="user"
+            )
+        )
+        ProfileStore(session, business_id).save_draft(
+            ProfileDraftInput(
+                products=products,
+                business_type=business_type,
+                value_proposition="first-party relationships",
+                languages=languages,
+            )
+        )
+
+    def _suggestion(method, *, offer="Opt-in capture", rationale="first-party", **extra):
+        base = {"method": method, "offer": offer, "placement": "owned channels",
+                "rationale": rationale, "confidence": 0.7}
+        base.update(extra)
+        return base
+
+    # The model proposes a mix: two permitted first-party methods, ONE non-first-party method, and ONE
+    # suggestion that tries to fabricate a contact list — the DCA keeps only the compliant first-party ones.
+    def _facade(permitted_methods):
+        suggestions = [
+            _suggestion(permitted_methods[0]),
+            _suggestion(permitted_methods[1], offer="QR opt-in on packaging and receipts"),
+            _suggestion("cold_email_blast", offer="Buy a purchased list and cold email everyone"),
+            _suggestion("website_form", contacts=[{"email": "someone@example.com"}]),
+        ]
+        output = {
+            "suggestions": suggestions,
+            "rationale": "compliant first-party capture only — permission is captured at opt-in",
+            "confidence": 0.8,
+        }
+        return AiCapabilityFacade(FakeAiGatewayTransport(structured_output=output))
+
+    runs = [
+        ("salon", salon, dict(industry="beauty services", geography="MH",
+                              products=["haircut", "spa"], business_type="salon",
+                              languages=["Marathi"]), ["qr_code", "whatsapp_opt_in"]),
+        ("wholesaler", wholesaler, dict(industry="textiles", geography="GJ",
+                                        products=["cotton fabric"], business_type="B2B wholesaler",
+                                        languages=["Gujarati"]), ["website_form", "newsletter_signup"]),
+    ]
+
+    print("\nfirst-party acquisition plans (fixture transport — no network/model/spend):")
+    rows: list[dict] = []
+    for label, business_id, seed_kwargs, permitted in runs:
+        with ctx.session_factory() as session:
+            _seed(session, business_id, **seed_kwargs)
+            session.flush()
+            result = draft_acquisition_plan(
+                session, _facade(permitted), business_id, invocation_key=f"dca139:{label}"
+            )
+            session.commit()
+        kept = [f"{s['method']}: {s['offer']}" for s in result.suggestions]
+        excluded = [f"{e.get('method')} ({e['reason']})" for e in result.excluded]
+        print(f"\n  {label} (confirmed ICP + profile):")
+        for line in kept:
+            print(f"      KEEP   {line}")
+        for line in excluded:
+            print(f"      DROP   {line}")
+        print(
+            f"      executed={result.plan.provenance['executed']} "
+            f"published={result.plan.provenance['published']} "
+            f"sent={result.plan.provenance['sent']} "
+            f"autoApproved={result.plan.provenance['autoApproved']} "
+            f"fabricatedContacts={result.plan.provenance['fabricatedContacts']}"
+        )
+        rows.append(
+            {
+                "business": label,
+                "kept_methods": [s["method"] for s in result.suggestions],
+                "excluded": result.excluded,
+                "status": result.plan.status,
+            }
+        )
+
+    with ctx.session_factory() as session:
+        stored = session.query(AcquisitionPlan).count()
+
+    by_label = {r["business"]: r for r in rows}
+    checks = {
+        "salon_plan_is_first_party_only": set(by_label["salon"]["kept_methods"])
+        <= set(FIRST_PARTY_METHODS),
+        "wholesaler_plan_is_first_party_only": set(by_label["wholesaler"]["kept_methods"])
+        <= set(FIRST_PARTY_METHODS),
+        "non_first_party_method_excluded": all(
+            "cold_email_blast" not in r["kept_methods"] for r in rows
+        ),
+        "no_fabricated_contacts_kept": all(
+            any(e["reason"] == "fabricated_contacts_dropped" for e in r["excluded"]) for r in rows
+        ),
+        "plans_are_drafts": all(r["status"] == "draft" for r in rows),
+        "one_plan_per_business": stored == 2,
+    }
+    print(f"\nstored acquisition plans: {stored}")
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; fixture transport — no network, no model, NO spend. DCA-139 DRAFTS a "
+        "first-party acquisition plan through the one DCA AI chokepoint: a bounded PROPOSAL of COMPLIANT "
+        "first-party permission-capture methods (forms / QR / opt-in) grounded in the confirmed ICP + "
+        "profile. It proposes ONLY first-party capture methods — any non-first-party / outbound-to-"
+        "strangers tactic is excluded; a B2C zero-data plan fabricates NO contacts and promises no "
+        "ready-to-message list; the plan is a draft, never executed / published / auto-approved; and it "
+        "generates NO send and NO recipient consent — acceptance of a prospect is not recipient consent, "
+        "and permission is captured at opt-in. Everything is tenant-scoped and idempotent per confirmed "
+        "ICP version.)"
+    )
+    return {"checks": checks, "plans": rows, "stored": stored}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

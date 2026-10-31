@@ -1152,6 +1152,65 @@ class DiscoveryPlan(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class AcquisitionPlan(TenantOwned, Base):
+    """DCA-139 — a bounded, reviewable FIRST-PARTY acquisition plan PROPOSAL (tenant-owned, RLS-protected).
+
+    One row is the current proposed plan for how the business could COMPLIANTLY acquire first-party leads
+    — a set of first-party permission-capture suggestions (forms / QR / opt-in, the stage-15 first-party
+    capture mechanisms), generated through the one DCA AI chokepoint (the ``first_party_acquisition_plan``
+    capability) and grounded in the business's CONFIRMED India ICP (:class:`IcpConfirmation`) + its own
+    profile draft. It is a PROPOSAL, not an execution: nothing here is ever published, NO contact is
+    fabricated, and NO message is sent. The plan is **never auto-approved** — promotion to an accepted /
+    executed plan is a DISABLED future capability (its own later story). The planner only ever stages
+    ``status='draft'`` rows, so a generated plan can never silently become an executing plan or grant any
+    acquisition/sending authority. (Acceptance of a prospect is not recipient consent; this plan grants
+    none — permission is captured at opt-in, never assumed.)
+
+    The plan is bounded *by construction* (DCA-139 acceptance): every ``suggestion`` proposes only a
+    COMPLIANT first-party capture ``method`` the business declared as permitted (never an
+    outbound-to-strangers / purchased-list / scraped tactic), it carries no contacts (a B2C zero-data plan
+    fabricates none), and the number of suggestions stays within ``suggestion_cap``. ``excluded`` records —
+    honestly, by stable reason code — every suggestion the model proposed that was clamped or dropped to
+    keep the plan first-party and in bounds; the model can never widen its own mandate.
+
+    Idempotent per confirmed ICP version: ``(business_id, icp_version)`` is unique, so a re-run for the
+    same confirmed ICP returns the EXISTING plan rather than inserting a duplicate (a new confirmed ICP
+    version is what triggers a fresh plan). Tenant-owned: it inherits the DCA-017 ``business_id`` column
+    and the DCA-018 RLS policy, so one business can never read another's plans. It holds only the
+    business's own targeting/plan metadata — no prospect contact data and no secrets.
+    """
+
+    __tablename__ = "acquisition_plans"
+    # One current acquisition plan per confirmed ICP version PER business (the idempotency key).
+    __table_args__ = (tenant_unique("icp_version", name="uq_acquisition_plan_icp_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The confirmed ICP version the plan was grounded against (traceability; the plan's targeting source).
+    icp_version: Mapped[int] = mapped_column(Integer)
+    # The business-profile draft version used for localisation context, or NULL when none was available.
+    profile_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # draft (reviewable proposal) vs a future accepted/executable plan. Promotion is disabled, so every
+    # row written here is 'draft'; nothing promotes a draft to an accepted/executing plan yet.
+    status: Mapped[str] = mapped_column(
+        String(16), default="draft", server_default="draft", index=True
+    )
+    # The bounded suggestion list actually kept: each a compliant first-party capture mechanism
+    # [{method, offer, placement, channel, rationale, confidence}]. Carries NO contacts/recipients.
+    suggestions: Mapped[list] = mapped_column(JSON, default=list)
+    # What the planner clamped/dropped to keep the plan first-party + in bounds: [{method?, reason, ...}].
+    excluded: Mapped[list] = mapped_column(JSON, default=list)
+    # The hard cap applied when the plan was generated (recorded for review/reproducibility).
+    suggestion_cap: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The model's plan rationale + self-reported overall confidence (an uncertainty signal).
+    rationale: Mapped[str] = mapped_column(Text, default="", server_default="")
+    overall_confidence: Mapped[float | None] = mapped_column(Float, default=None)
+    # DCA-037-style provenance of the generation (model/provider/prompt version, synthetic flag, counts).
+    source: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

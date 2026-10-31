@@ -77,6 +77,11 @@ DCA_JOB_ID_PREFIX = "dca:"
 # app/services/fit_explainer.py — EXPLAIN why a prospect fits the confirmed ICP, grounded in the
 # prospect's supported facts; it is advisory and can NEVER change channel eligibility, which the DCA
 # carries on a separate axis unchanged) is added here too. Listing a key only permits REQUESTING it.
+# The DCA-139 first-party acquisition-plan capability (``first_party_acquisition_plan``,
+# app/services/acquisition_planner.py — DRAFT a proposal of COMPLIANT first-party permission-capture
+# methods (forms / QR / opt-in) grounded in the confirmed ICP + profile; it is a proposal only, proposes
+# no outbound-to-strangers method, fabricates no contacts, and generates no send and no recipient consent)
+# is added here too. Listing a key only permits REQUESTING it and never enables a live/paid call.
 KNOWN_CAPABILITIES: frozenset[str] = frozenset(
     {
         "contact_research",
@@ -85,6 +90,7 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
         "unstructured_observation_extraction",
         "ambiguous_identity_match_suggestion",
         "business_fit_explanation",
+        "first_party_acquisition_plan",
     }
 )
 
