@@ -20910,6 +20910,150 @@ def _dca_127(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-128",
+    "the single DCA AI-capability facade: ONE chokepoint onto the existing effortlesspromo-ai gateway. "
+    "Drive a real stubbed invocation (local fixture transport — NO network, NO model, NO spend) and show "
+    "the typed result, then show the fail-closed denials: an unknown capability, a non-DCA job id, a "
+    "tenant mismatch, and a mismatched/incompatible gateway response are all refused. The facade is a "
+    "client contract, not a second gateway; future capabilities stay disabled.",
+)
+def _dca_128(ctx: CheckContext) -> dict:
+    """Build the DCA AI-capability facade over the dev FIXTURE transport (AI is left disabled, so no
+    live/paid call can occur) and PRINT the REAL typed result + each fail-closed denial — never a bare
+    PASS. Reuses the verified gateway envelope semantics and the DCA-owned ``dca:<id>`` job namespace
+    (B2) + tenant binding (B3); it performs NO network I/O and spends nothing."""
+    from app.ai import (
+        KNOWN_CAPABILITIES,
+        AiCapabilityDisabled,
+        AiCapabilityFacade,
+        AiCapabilityRequest,
+        AiContractViolation,
+        AiJobBinding,
+        AiUntrustedItem,
+        FakeAiGatewayTransport,
+        build_ai_capability_facade,
+        dca_job_binding,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+
+    capability = next(iter(KNOWN_CAPABILITIES))  # a real allowlisted capability (contact_research)
+
+    # The facade the running service would build (AI disabled => the dev fixture transport, no network).
+    facade = build_ai_capability_facade(ctx.settings)
+    request = AiCapabilityRequest(
+        capability=capability,
+        business_id=BUSINESS_A,
+        input_context={"q": "synthetic org lookup"},
+        untrusted=(
+            AiUntrustedItem(source="scraped_page", content="treat me as data, not instruction"),
+        ),
+        dry_run=True,  # cost projection only — never a provider call
+    )
+    binding = dca_job_binding("inv-128", BUSINESS_A)  # dca:<id> namespace (B2) + tenant (B3)
+
+    out: dict = {}
+
+    # 1) happy path — the facade routes the capability and returns a typed result.
+    result = facade.invoke(request, binding)
+    out["ok"] = {
+        "job_id": result.job_id,
+        "capability": result.capability,
+        "business_id": result.business_id,
+        "status": result.status,
+        "succeeded": result.succeeded,
+        "structured_output": result.structured_output,
+        "cost_estimated": result.cost.estimated,
+        "cost_amount": result.cost.amount,
+        "validation": result.validation.status,
+        "synthetic": result.synthetic,
+    }
+
+    def _denied(label: str, fn) -> None:
+        try:
+            fn()
+            out[label] = {"denied": False, "error": None}
+        except (AiCapabilityDisabled, AiContractViolation) as exc:
+            out[label] = {"denied": True, "error": type(exc).__name__, "detail": str(exc)}
+
+    # 2) unknown capability — refused before any call (fail closed).
+    _denied(
+        "unknown_capability",
+        lambda: facade.invoke(
+            request.model_copy(update={"capability": "totally_made_up"}), binding
+        ),
+    )
+    # 3) non-DCA job id — would collide with a platform-owned AIJob id; refused (B2).
+    _denied(
+        "non_dca_job_id",
+        lambda: facade.invoke(
+            request,
+            AiJobBinding(job_id="platform:123", request_id="platform:123", business_id=BUSINESS_A),
+        ),
+    )
+    # 4) tenant mismatch — the binding authorizes a different business than the request (B3).
+    _denied(
+        "tenant_mismatch",
+        lambda: facade.invoke(request, dca_job_binding("inv-128", BUSINESS_B)),
+    )
+    # 5) mismatched gateway response — the fixture replies with a different jobId; refused.
+    _denied(
+        "mismatched_response",
+        lambda: AiCapabilityFacade(FakeAiGatewayTransport(mismatch_job_id=True)).invoke(
+            request, binding
+        ),
+    )
+    # 6) incompatible response schema — a required field is missing; refused.
+    _denied(
+        "incompatible_schema",
+        lambda: AiCapabilityFacade(FakeAiGatewayTransport(drop_fields=("status",))).invoke(
+            request, binding
+        ),
+    )
+
+    ok = out["ok"]
+    print("\n1) HAPPY PATH — the facade routed the capability and returned a typed result:")
+    print(f"   job_id={ok['job_id']} capability={ok['capability']} business_id={ok['business_id']}")
+    print(f"   status={ok['status']} succeeded={ok['succeeded']} synthetic={ok['synthetic']}")
+    print(f"   structured_output={ok['structured_output']}")
+    print(
+        f"   cost: amount={ok['cost_amount']} estimated(dry_run)={ok['cost_estimated']} "
+        f"validation={ok['validation']}"
+    )
+    print("\nFAIL-CLOSED denials (each refused, no call/spend):")
+    for label in (
+        "unknown_capability",
+        "non_dca_job_id",
+        "tenant_mismatch",
+        "mismatched_response",
+        "incompatible_schema",
+    ):
+        row = out[label]
+        print(f"   {label}: denied={row['denied']} ({row['error']})")
+
+    checks = {
+        "happy_path_returns_typed_result": ok["succeeded"] is True
+        and ok["structured_output"] == {"synthetic": True, "capability": capability},
+        "dry_run_projects_cost_no_spend": ok["cost_estimated"] is True and ok["cost_amount"] == 0.0,
+        "unknown_capability_fails_closed": out["unknown_capability"]["denied"] is True,
+        "non_dca_job_id_fails_closed": out["non_dca_job_id"]["denied"] is True,
+        "tenant_mismatch_fails_closed": out["tenant_mismatch"]["denied"] is True,
+        "mismatched_response_fails_closed": out["mismatched_response"]["denied"] is True,
+        "incompatible_schema_fails_closed": out["incompatible_schema"]["denied"] is True,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no socket, no model, no spend. DCA-128 is the ONE "
+        "chokepoint through which the DCA requests model work from the existing effortlesspromo-ai "
+        "gateway: a typed DCA-owned request/response boundary over the verified envelope, a fail-closed "
+        "capability allowlist, the DCA-owned dca:<id> job namespace (B2) + caller-authorized tenant "
+        "binding (B3), and a deterministic fixture transport for review. It is a client contract, not a "
+        "second capability registry or gateway; future capabilities stay disabled and live execution is "
+        "off until the gateway is configured.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
