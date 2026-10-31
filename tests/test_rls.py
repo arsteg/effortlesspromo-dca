@@ -87,6 +87,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "discovery_plans",
         "unstructured_observation_extractions",
         "identity_match_suggestions",
+        "fit_explanations",
     }
 
 

@@ -22803,7 +22803,10 @@ def _dca_137(ctx: CheckContext) -> dict:
         external = [ExternalIdInput(scheme="cin", value=cin)] if cin else []
         obs = OrgObservationStore(session, biz_a).create(
             ObservationInput(
-                entity_type="legal_entity", display_name=name, state_code=state, external_ids=external
+                entity_type="legal_entity",
+                display_name=name,
+                state_code=state,
+                external_ids=external,
             ),
             actor=actor,
             now=now,
@@ -22823,20 +22826,34 @@ def _dca_137(ctx: CheckContext) -> dict:
     from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
 
     proposals = [
-        {"subjectAId": amb_a, "subjectBId": amb_b, "confidence": 0.78, "rationale": "same company name"},
-        {"subjectAId": conf_a, "subjectBId": conf_b, "confidence": 0.95, "rationale": "same company name"},
+        {
+            "subjectAId": amb_a,
+            "subjectBId": amb_b,
+            "confidence": 0.78,
+            "rationale": "same company name",
+        },
+        {
+            "subjectAId": conf_a,
+            "subjectBId": conf_b,
+            "confidence": 0.95,
+            "rationale": "same company name",
+        },
     ]
     facade = AiCapabilityFacade(
         FakeAiGatewayTransport(structured_output={"suggestions": proposals, "confidence": 0.8})
     )
 
     print("\norganization observations in synthetic Business A (the authorized candidates):")
-    print(f"  ambiguous pair (no conflicting id): {amb_a}  &  {amb_b}  (name='Acme Textiles Private Limited')")
+    print(
+        f"  ambiguous pair (no conflicting id): {amb_a}  &  {amb_b}  (name='Acme Textiles Private Limited')"
+    )
     print(
         f"  conflicting-CIN pair:               {conf_a}  &  {conf_b}  "
         f"(name='Globex Industries Private Limited', CIN {cin_one} vs {cin_two})"
     )
-    print("\nAI proposals (fixture transport — no network/model/spend) and the DCA's deterministic re-match:")
+    print(
+        "\nAI proposals (fixture transport — no network/model/spend) and the DCA's deterministic re-match:"
+    )
 
     out: dict = {}
     with ctx.session_factory() as session:
@@ -22906,7 +22923,11 @@ def _dca_137(ctx: CheckContext) -> dict:
     out = {
         "suggested_pairs": [sorted(list(p)) for p in kept_pairs],
         "dropped": [
-            {"pair": sorted([e["subjectAId"], e["subjectBId"]]), "reason": e["reason"], "detail": e.get("detail")}
+            {
+                "pair": sorted([e["subjectAId"], e["subjectBId"]]),
+                "reason": e["reason"],
+                "detail": e.get("detail"),
+            }
             for e in result.excluded
             if e.get("subjectAId") and e.get("subjectBId")
         ],
@@ -22936,6 +22957,176 @@ def _dca_137(ctx: CheckContext) -> dict:
         "everything is tenant-scoped and no permission is ever transferred.)"
     )
     return {"checks": checks, **out}
+
+
+@register(
+    "DCA-138",
+    "EXPLAIN business fit through the DCA AI chokepoint — a grounded, evidence-cited explanation of why a "
+    "prospect fits the confirmed ICP. It is ADVISORY and can NEVER change channel eligibility: the "
+    "caller's permission outcome is carried through UNCHANGED (a high-fit BLOCKED prospect stays blocked), "
+    "ungrounded claims are dropped (the gateway's 'valid' does not authorize a write), and sensitive "
+    "inferred traits are excluded BEFORE egress so they are never a scoring input. Fixture transport only "
+    "(no network/model/spend).",
+)
+def _dca_138(ctx: CheckContext) -> dict:
+    """Drive the real DCA-138 fit explainer against a disposable DB with isolated synthetic Business A,
+    using the deterministic fixture transport (no network/model/spend). Score a FITTING prospect, a
+    NON-FITTING prospect, and a HIGH-FIT but channel-BLOCKED prospect (whose supported facts also include
+    a SENSITIVE trait), then PRINT each one's grounded assessments + advisory fit band + the carried-through
+    eligibility (unchanged) — so a human sees the rationale and that a high fit changed no eligibility."""
+    from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
+    from app.compliance.policy_engine import PolicyDecision
+    from app.db.models import FitExplanation
+    from app.services.fit_explainer import (
+        EligibilityStatus,
+        SupportedFact,
+        explain_business_fit,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    icp = {
+        "industries": ["textiles"],
+        "sizeBands": ["small"],
+        "roles": ["owner"],
+        "geography": ["MH"],
+    }
+
+    def _assessment(field, ref, cited, verdict="met"):
+        return {
+            "criterion": field,
+            "field": field,
+            "factRef": ref,
+            "citedText": cited,
+            "verdict": verdict,
+            "inferenceLabel": "inferred",
+            "confidence": 0.8,
+        }
+
+    def _facade(assessments, fit_band):
+        output = {
+            "assessments": assessments,
+            "fitBand": fit_band,
+            "rationale": "advisory fit only — it changes no channel eligibility",
+            "confidence": 0.85,
+        }
+        return AiCapabilityFacade(FakeAiGatewayTransport(structured_output=output))
+
+    # Three prospects: a strong fit, a weak fit, and a strong-fit prospect that is BLOCKED and carries a
+    # sensitive trait (which must be excluded before egress).
+    fitting_facts = [
+        SupportedFact(ref="obs-1", field="industry", value="textiles"),
+        SupportedFact(ref="obs-2", field="state", value="MH"),
+    ]
+    nonfitting_facts = [
+        SupportedFact(ref="obs-3", field="industry", value="mining"),
+        SupportedFact(ref="obs-4", field="state", value="TN"),
+    ]
+    blocked_facts = [
+        SupportedFact(ref="obs-5", field="industry", value="textiles"),
+        SupportedFact(ref="obs-6", field="state", value="MH"),
+        SupportedFact(
+            ref="obs-7", field="director_religion", value="hindu"
+        ),  # sensitive → excluded
+    ]
+
+    runs = [
+        (
+            "prospect-fit",
+            fitting_facts,
+            EligibilityStatus(decision=PolicyDecision.ALLOW, reason="allowed_by_rule"),
+            _facade(
+                [_assessment("industry", "obs-1", "textiles"), _assessment("state", "obs-2", "MH")],
+                "high",
+            ),
+        ),
+        (
+            "prospect-nonfit",
+            nonfitting_facts,
+            EligibilityStatus(decision=PolicyDecision.ALLOW, reason="allowed_by_rule"),
+            _facade(
+                [
+                    _assessment("industry", "obs-3", "mining", "partial"),
+                    _assessment("state", "obs-4", "TN", "partial"),
+                ],
+                "low",
+            ),
+        ),
+        (
+            "prospect-blocked",
+            blocked_facts,
+            EligibilityStatus(decision=PolicyDecision.DENY, reason="denied_by_rule"),
+            _facade(
+                [_assessment("industry", "obs-5", "textiles"), _assessment("state", "obs-6", "MH")],
+                "high",
+            ),
+        ),
+    ]
+
+    print("\nconfirmed ICP (synthetic Business A):", icp)
+    print("\nfit explanations (fixture transport — no network/model/spend):")
+
+    rows: list[dict] = []
+    for subject_ref, facts, elig, facade in runs:
+        with ctx.session_factory() as session:
+            result = explain_business_fit(
+                session,
+                facade,
+                biz_a,
+                subject_ref=subject_ref,
+                supported_facts=facts,
+                eligibility=elig,
+                icp=icp,
+                icp_version=3,
+                invocation_key=f"dca138:{subject_ref}",
+            )
+            session.commit()
+        cited = [f"{a['field']}={a['verdict']}@{a['factRef']}" for a in result.grounded]
+        print(
+            f"  {subject_ref:18s} fit_band={result.fit_band:7s} "
+            f"eligibility={result.eligibility!r} (reason={result.eligibility_reason!r})"
+        )
+        print(f"      grounded assessments: {cited}")
+        if result.excluded_sensitive:
+            print(
+                f"      sensitive traits EXCLUDED before egress (never a scoring input): {result.excluded_sensitive}"
+            )
+        rows.append(
+            {
+                "subject": subject_ref,
+                "fit_band": result.fit_band,
+                "eligibility": result.eligibility,
+                "eligibility_reason": result.eligibility_reason,
+                "assessments": cited,
+                "excluded_sensitive": result.excluded_sensitive,
+            }
+        )
+
+    with ctx.session_factory() as session:
+        stored = session.query(FitExplanation).count()
+
+    by_subject = {r["subject"]: r for r in rows}
+    checks = {
+        "fitting_prospect_high_fit": by_subject["prospect-fit"]["fit_band"] == "high",
+        "nonfitting_prospect_not_high": by_subject["prospect-nonfit"]["fit_band"] != "high",
+        "blocked_prospect_high_fit": by_subject["prospect-blocked"]["fit_band"] == "high",
+        # The load-bearing guarantee: a HIGH fit did NOT change the BLOCKED eligibility.
+        "high_fit_did_not_unblock": by_subject["prospect-blocked"]["eligibility"] == "blocked",
+        "sensitive_trait_excluded": "director_religion"
+        in by_subject["prospect-blocked"]["excluded_sensitive"],
+        "one_explanation_per_prospect": stored == 3,
+    }
+    print(f"\nstored fit explanations: {stored}")
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; fixture transport — no network, no model, NO spend. DCA-138 EXPLAINS "
+        "business fit through the one DCA AI chokepoint: a grounded, evidence-cited explanation of why a "
+        "prospect fits the confirmed ICP. Fit describes DESIRABILITY only and is kept STRICTLY separate "
+        "from eligibility — the caller's permission outcome is carried through UNCHANGED, so a high-fit "
+        "BLOCKED prospect stays blocked; ungrounded claims are dropped (a gateway 'valid' does not "
+        "authorize a write); sensitive inferred traits are excluded before egress so they can never be a "
+        "scoring input; the explanation is advisory and never auto-acted; everything is tenant-scoped.)"
+    )
+    return {"checks": checks, "explanations": rows, "stored": stored}
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -162,6 +162,22 @@ CAPABILITY_CONTEXT_ALLOWLIST: dict[str, frozenset[str]] = {
             "candidates",
         }
     ),
+    # DCA-138 — the trusted context for a business-fit explanation is ONLY the prospect ref (opaque), the
+    # business's confirmed ICP criteria, the prospect's already-gathered SUPPORTED FACTS (each an opaque
+    # evidence ref + a NON-sensitive field + its value) and the permitted-field allowlist. No external
+    # content and no eligibility/permission input ever rides here: fit never reads eligibility (the DCA
+    # carries it on a separate axis, unchanged), and the sensitive inferred traits are excluded by the
+    # service BEFORE egress so they can never become a scoring input (gateway rule_check + DCA-133
+    # re-enforce the bound).
+    "business_fit_explanation": frozenset(
+        {
+            "prospectRef",
+            "icpVersion",
+            "icp",
+            "supportedFacts",
+            "permittedFields",
+        }
+    ),
 }
 
 # The serialized-size bound for a minimized context (characters of its canonical JSON). Matches the AI

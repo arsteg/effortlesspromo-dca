@@ -80,6 +80,7 @@ DCA_TABLES = {
     "discovery_plans",
     "unstructured_observation_extractions",
     "identity_match_suggestions",
+    "fit_explanations",
 }
 
 
@@ -2378,6 +2379,48 @@ def test_0056_creates_identity_match_suggestions_on_a_preexisting_database(clean
     assert (
         "uq_identity_match_suggestion_pair" in uniques
     )  # one suggestion per (tenant, canonical pair)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0057_creates_fit_explanations_on_a_preexisting_database(clean_schema):
+    """DCA-138 — the 0057 create branch (for a DB migrated before ``fit_explanations``).
+
+    ``fit_explanations`` is tenant-owned (RLS-protected), like ``identity_match_suggestions`` (0056). A
+    fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0057 is a
+    no-op there. To exercise 0057's real job, upgrade to head, drop the table + policy, stamp history back
+    to 0056, then upgrade to head again — 0057 must recreate the table (with its per-tenant per-subject
+    constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "fit_explanations" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0056_identity_match_suggestions")  # pretend we predate the fit-explanation table
+    command.upgrade(cfg, "head")  # 0057 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "fit_explanations" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {u["name"] for u in insp.get_unique_constraints("fit_explanations", schema=clean_schema)}
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'fit_explanations' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_fit_explanation_subject" in uniques  # one explanation per (tenant, subject)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

@@ -4219,6 +4219,97 @@ class IdentityMatchSuggestion(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class FitBand(str, Enum):
+    """DCA-138 — the advisory overall business-fit grade on a :class:`FitExplanation`.
+
+    Describes DESIRABILITY only (how well a prospect matches the confirmed ICP); it grants/changes NO
+    permission and is NEVER consulted for eligibility. ``UNKNOWN`` means there was nothing grounded to
+    grade. A top ``HIGH`` grade can never move a blocked contact's channel eligibility.
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    UNKNOWN = "unknown"
+
+
+class FitExplanation(TenantOwned, Base):
+    """DCA-138 — a grounded, evidence-cited BUSINESS-FIT explanation for one prospect (RLS).
+
+    One row is one advisory explanation of why a prospect fits (or does not fit) this business's
+    CONFIRMED ICP, produced through the one DCA AI chokepoint (the ``business_fit_explanation``
+    capability) and grounded strictly in the prospect's already-gathered SUPPORTED FACTS. It composes the
+    accepted AI seam end to end and performs no provider/model/paid work of its own. The load-bearing
+    guarantees (the DCA-138 acceptance criteria):
+
+    - **Fit is STRICTLY separate from eligibility — a high fit can NEVER change a channel restriction.**
+      Eligibility (the personal-data permission decision: may this record be acted on at all?) is a
+      DIFFERENT axis from fit (how desirable is the prospect?). This row CARRIES the caller's pre-decided
+      permission outcome through verbatim on the separate ``eligibility`` / ``eligibility_reason``
+      fields; it is NEVER derived from, or sent to the model with, the fit. So raising ``fit_band`` to
+      ``high`` leaves a ``blocked`` eligibility exactly ``blocked`` — fit describes desirability, it
+      grants nothing (mirrors the DCA-073 quality-summary separation).
+
+    - **Only grounded, cited claims survive; sensitive inferred traits are never a scoring input.** Each
+      kept ``assessment`` cites ONE supported fact (its ref + the exact span) and is labelled
+      ``inferred``; the DCA independently re-grounds every citation (DCA-133) and DROPS any ungrounded one
+      (recorded in ``dropped``) — a gateway "valid" verdict does not authorize a write. Sensitive /
+      prohibited fields (DCA-058) are excluded from the model context BEFORE egress, so they can never be
+      cited or scored on.
+
+    - **Advisory, not auto-acted, tenant-scoped, idempotent.** The explanation grants no acquisition /
+      sending authority and triggers nothing. The row is owned by exactly one ``business_id`` and read
+      only within it. ``(business_id, subject_type, subject_ref)`` is unique — one current explanation per
+      prospect per business, the idempotency key that makes a re-run return the existing row rather than a
+      duplicate.
+    """
+
+    __tablename__ = "fit_explanations"
+    # One current fit explanation per prospect subject PER business (idempotency key).
+    __table_args__ = (
+        tenant_unique("subject_type", "subject_ref", name="uq_fit_explanation_subject"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the fit-explanation record contract this row was written under.
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # organization | person — the kind of prospect subject. This story explains ORGANIZATION fit; the
+    # column is generic for a future extension.
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    # The prospect this explanation is about — an opaque subject id within THIS business (never a
+    # personal contact value).
+    subject_ref: Mapped[str] = mapped_column(String(64), index=True)
+    # The confirmed ICP version this explanation was grounded against, or NULL when none was supplied.
+    icp_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The advisory overall fit grade — desirability only; it grants/changes NO eligibility.
+    fit_band: Mapped[str] = mapped_column(
+        String(16), default=FitBand.UNKNOWN.value, server_default=FitBand.UNKNOWN.value, index=True
+    )
+    # A short, bounded model rationale for the fit (never free-form contact data).
+    rationale: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    # The GROUNDED assessments kept (each cites one supported fact): a JSON list of
+    # {criterion, field, factRef, citedText, verdict, inferenceLabel, confidence}. RLS-protected.
+    assessments: Mapped[list] = mapped_column(JSON, default=list)
+    # An honest record of every ungrounded claim the DCA re-grounding gate dropped (field + reason only —
+    # never a fabricated value promoted to an assessment).
+    dropped: Mapped[list] = mapped_column(JSON, default=list)
+    # The SEPARATE permission axis — the caller's pre-decided eligibility outcome, carried through
+    # UNCHANGED (never derived from the fit, never sent to the model). A ``high`` fit never flips this.
+    eligibility: Mapped[str] = mapped_column(
+        String(24), default="unknown", server_default="unknown"
+    )
+    eligibility_reason: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # The model's OWN self-reported overall confidence (an uncertainty signal; advisory, nullable).
+    overall_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Where this explanation came from (the capability key) + the AI prompt version + whether the result
+    # came from the dev/test fixture transport (never a real model) — provenance so a synthetic
+    # explanation can never be mistaken for a real one.
+    source: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    prompt_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    synthetic: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class RecurringSchedule(TenantOwned, Base):
     """DCA-107 — a durable, tenant-owned record of ONE per-business recurring schedule (RLS-protected).
 

@@ -73,6 +73,10 @@ DCA_JOB_ID_PREFIX = "dca:"
 # app/services/identity_match_suggester.py — propose ambiguous same-entity candidate pairs as REVIEW-only
 # suggestions that FEED the deterministic DCA-067/068 matchers; every proposal is re-vetted DCA-side and
 # a suggestion can never execute a merge) is added here too. Listing a key only permits REQUESTING it.
+# The DCA-138 business-fit explanation capability (``business_fit_explanation``,
+# app/services/fit_explainer.py — EXPLAIN why a prospect fits the confirmed ICP, grounded in the
+# prospect's supported facts; it is advisory and can NEVER change channel eligibility, which the DCA
+# carries on a separate axis unchanged) is added here too. Listing a key only permits REQUESTING it.
 KNOWN_CAPABILITIES: frozenset[str] = frozenset(
     {
         "contact_research",
@@ -80,6 +84,7 @@ KNOWN_CAPABILITIES: frozenset[str] = frozenset(
         "discovery_plan",
         "unstructured_observation_extraction",
         "ambiguous_identity_match_suggestion",
+        "business_fit_explanation",
     }
 )
 
