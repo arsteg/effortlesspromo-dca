@@ -17749,7 +17749,9 @@ def _dca_113(ctx: CheckContext) -> dict:
     # Seed the in-force caps: Rs 50 daily, Rs 10,000 monthly, Rs 50 per-run (in paise).
     with factory() as session:
         BudgetLimitStore(session, biz).save(
-            BudgetLimitInput(daily_cap_minor=5_000, monthly_cap_minor=1_000_000, per_run_cap_minor=5_000),
+            BudgetLimitInput(
+                daily_cap_minor=5_000, monthly_cap_minor=1_000_000, per_run_cap_minor=5_000
+            ),
             budget_actor,
         )
         session.commit()
@@ -17768,7 +17770,12 @@ def _dca_113(ctx: CheckContext) -> dict:
         with factory() as session:
             rows = BudgetReservationStore(session, biz).active()
             return [
-                {"id": r.id[:8], "key": r.idempotency_key, "amount": r.amount_minor, "day": r.day_key}
+                {
+                    "id": r.id[:8],
+                    "key": r.idempotency_key,
+                    "amount": r.amount_minor,
+                    "day": r.day_key,
+                }
                 for r in rows
             ]
 
@@ -17787,7 +17794,9 @@ def _dca_113(ctx: CheckContext) -> dict:
                 session.rollback()
                 return f"refused({exc.code})"
 
-    print(f"\nbusiness: ...{biz[-4:]}   in-force caps (paise): daily=5000 monthly=1_000_000 per_run=5000")
+    print(
+        f"\nbusiness: ...{biz[-4:]}   in-force caps (paise): daily=5000 monthly=1_000_000 per_run=5000"
+    )
     print(f"initial window: {_window()}")
 
     # 0) Authority FIRST: a read-only viewer cannot reserve — refused, and nothing changes.
@@ -18069,7 +18078,9 @@ def _dca_115(ctx: CheckContext) -> dict:
     def _record(key: str, **kw) -> str:
         with factory() as session:
             r = ProviderCallStore(session, biz).record(
-                ProviderCallIntent(call_key=key, capability=kw.pop("capability", "contact_research"), **kw),
+                ProviderCallIntent(
+                    call_key=key, capability=kw.pop("capability", "contact_research"), **kw
+                ),
                 admin,
                 now=now,
             )
@@ -18294,7 +18305,11 @@ def _dca_116(ctx: CheckContext) -> dict:
         with factory() as session:
             r = BudgetReconciliationStore(session, biz)._get(resv_id)
             assert r is not None
-            return {"status": r.status, "reserved": r.amount_minor, "settled": r.settled_amount_minor}
+            return {
+                "status": r.status,
+                "reserved": r.amount_minor,
+                "settled": r.settled_amount_minor,
+            }
 
     def _resolve(call_key, key, *, happened=None, actual=None) -> str:
         with factory() as session:
@@ -18324,10 +18339,14 @@ def _dca_116(ctx: CheckContext) -> dict:
     print(f"   before: remaining={_remaining()}  pcr={_pcr('call-ok')}  resv={_resv(r1)}")
     s1 = _resolve("call-ok", "receipt-1a", happened=True, actual=2_500)
     print(f"   resolve happened actual 2500 -> {s1}")
-    print(f"   after:  remaining={_remaining()}  pcr={_pcr('call-ok')}  resv={_resv(r1)}  (freed 1500)")
+    print(
+        f"   after:  remaining={_remaining()}  pcr={_pcr('call-ok')}  resv={_resv(r1)}  (freed 1500)"
+    )
     # 1b) Duplicate under the SAME receipt identity -> idempotent replay (no double-free).
     dup = _resolve("call-ok", "receipt-1a", happened=True, actual=2_500)
-    print(f"   duplicate same receipt receipt-1a -> {dup}  remaining={_remaining()}  (not double-freed)")
+    print(
+        f"   duplicate same receipt receipt-1a -> {dup}  remaining={_remaining()}  (not double-freed)"
+    )
     # 1c) A DIFFERENT receipt against the FINAL resolution is refused (resolved once).
     diff = _resolve("call-ok", "receipt-1b", happened=False)
     print(f"   different receipt receipt-1b -> {diff}  (REASON={REASON_ALREADY_RESOLVED})")
@@ -18383,7 +18402,6 @@ def _dca_116(ctx: CheckContext) -> dict:
         "final_remaining": _remaining(),
         "checks": checks,
     }
-
 
 
 @register(
@@ -18564,6 +18582,103 @@ def _row_result_ref(ctx: CheckContext, job_id: str) -> str | None:
     with ctx.session_factory() as session:
         row = session.get(DurableJobRequest, job_id)
         return row.result_ref if row is not None else None
+
+
+@register(
+    "DCA-118",
+    "validate network destinations: the centralized fetch client's pure, network-free destination "
+    "guard. Every would-be fetch URL - whoever produced it, including a model - is passed through the "
+    "guard FIRST, and only an explicit ALLOW may be connected to. Rejects non-http(s) schemes, embedded "
+    "credentials, non-web ports, non-allowlisted hosts, and every unsafe address class (private, "
+    "loopback, link-local, cloud-metadata, IPv6 unique-local, reserved) - and an allowlisted hostname "
+    "whose DNS answer points anywhere internal fails closed, so a model-supplied URL cannot bypass it. "
+    "Resolves nothing itself, opens no socket, fetches nothing - it only VALIDATES.",
+)
+def _dca_118(ctx: CheckContext) -> dict:
+    """Exercise the DCA-118 destination guard against local synthetic fixtures and PRINT the REAL
+    verdict + reason for a representative ALLOW and several blocked classes - never a bare PASS. No
+    network, no DNS, no socket, no fetch: the guard is a pure decider and the supplied ``resolved_ips``
+    stand in for a DNS answer the caller already had."""
+    from app.sources.destination_guard import validate_destination
+
+    allowlist = {"example.in", "data.example.in"}
+
+    # (label, url, resolved_ips) covering the allow path and each blocked class. The metadata/loopback
+    # DNS-answer cases show a legitimate-looking allowlisted URL being refused because of where it points.
+    cases = [
+        (
+            "allow: allowlisted host, public DNS answer",
+            "https://data.example.in/records",
+            ["93.184.216.34"],
+        ),
+        ("block: non-http scheme", "file:///etc/passwd", None),
+        ("block: credentials in url", "https://user:pass@example.in/", ["93.184.216.34"]),
+        ("block: non-web port", "https://example.in:8080/", ["93.184.216.34"]),
+        ("block: host not allowlisted", "https://evil.example.com/", ["93.184.216.34"]),
+        ("block: cloud-metadata literal", "http://169.254.169.254/latest/meta-data/", None),
+        ("block: loopback literal", "http://127.0.0.1/", None),
+        ("block: private rfc1918 literal", "http://10.0.0.5/", None),
+        ("block: link-local literal", "http://169.254.0.1/", None),
+        (
+            "block: allowlisted host but DNS points at metadata",
+            "https://data.example.in/",
+            ["169.254.169.254"],
+        ),
+        (
+            "block: mixed public+private DNS answer",
+            "https://example.in/",
+            ["93.184.216.34", "10.0.0.5"],
+        ),
+        ("block: allowlisted host, no DNS answer", "https://example.in/", None),
+    ]
+
+    print(
+        "\nDCA-118 network-destination guard (pure, network-free) - allowlist:", sorted(allowlist)
+    )
+    results: list[dict] = []
+    for label, url, ips in cases:
+        d = validate_destination(url, allowlist=allowlist, resolved_ips=ips)
+        verdict = d.verdict.value.upper()
+        reason = d.reason.value if d.reason is not None else "-"
+        print(f"  [{verdict:5}] {label}")
+        print(f"          url={url!r}  resolved_ips={ips}")
+        print(f"          reason={reason}  safe_ips={list(d.safe_ips)}")
+        results.append(
+            {
+                "label": label,
+                "url": url,
+                "verdict": verdict,
+                "reason": reason,
+                "safe_ips": list(d.safe_ips),
+            }
+        )
+
+    allow = results[0]
+    blocks = results[1:]
+    checks = {
+        "allowlisted_public_allowed": allow["verdict"] == "ALLOW"
+        and allow["safe_ips"] == ["93.184.216.34"],
+        "every_other_case_blocked": all(r["verdict"] == "DENY" for r in blocks),
+        "metadata_literal_reason": results[5]["reason"] == "cloud_metadata_address",
+        "metadata_via_dns_cannot_bypass": results[9]["reason"] == "cloud_metadata_address",
+        "mixed_dns_fails_closed": results[10]["reason"] == "private_address",
+        "scheme_credentials_port_allowlist": [r["reason"] for r in results[1:5]]
+        == ["scheme_not_allowed", "credentials_in_url", "port_not_allowed", "host_not_allowlisted"],
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no DNS lookup, no socket, no fetch, no AI/paid action. "
+        "DCA-118 is the centralized fetch client's DESTINATION GUARD: a pure, deterministic Python "
+        "decider that rejects a forbidden destination BEFORE any connection. It refuses non-http(s) "
+        "schemes, embedded credentials, non-web ports and non-allowlisted hosts, and classifies the "
+        "address(es) that would actually be connected to - refusing private / loopback / link-local / "
+        "cloud-metadata / IPv6-unique-local / reserved space. It performs NO DNS of its own (the caller "
+        "supplies the answer it already had) and verifies every resolved address is public, so one "
+        "poisoned record fails the whole destination and a model-supplied URL cannot bypass the guard. "
+        "Deciding ALLOW is permission to ATTEMPT a connection the caller must pin to the verified IPs; "
+        "the guard itself connects to, resolves and fetches NOTHING - actual fetching stays disabled.)"
+    )
+    return {"results": results, "checks": checks}
 
 
 def _build_parser() -> argparse.ArgumentParser:
