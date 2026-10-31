@@ -2178,6 +2178,68 @@ class OrgObservationImport(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class WebsiteFactExtraction(TenantOwned, Base):
+    """DCA-124 — the provenance linking one approved-website page to the org facts it produced
+    (tenant-owned, RLS-protected).
+
+    The second concrete source adapter
+    (:class:`~app.sources.website_extract.WebsiteFactExtractor`) extracts a bounded set of permitted
+    ORGANIZATION fields from an APPROVED + entitled business website, recording each extracted fact as a
+    provenanced :class:`FieldObservation` and the page itself as an :class:`EvidenceObject`. This table
+    is the run-level SOURCE ATTRIBUTION the acceptance criterion requires: one row records WHICH page was
+    extracted for WHICH organization observation, under WHICH catalog source / terms version, the
+    ``evidence_id`` the facts cite, how many permitted company fields were recorded and how many contact
+    fragments were DROPPED (the organization-only guard, so an operator can see no contact field leaked).
+    It holds only organization provenance (a catalog source key, a page locator, a content digest and
+    counts); NO personal contact data — the adapter is organization-only (DCA-122) and can never write a
+    contact field.
+
+    **Idempotent re-extraction.** ``(business_id, source_key, subject_id, page_ref)`` is unique, so one
+    page maps to at most ONE extraction run for one organization within a business. Re-extracting the
+    same page finds the existing row and SKIPS it (reusing its evidence) rather than re-authorizing a
+    crawl slot or writing duplicate facts — the extraction is deterministic and replay-safe. ``page_ref``
+    is the checkpointable locator a later refresh re-locates the page by.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one business can never read another's extraction provenance. The same
+    page URL may legitimately recur across tenants, each mapping to that tenant's own observation.
+    """
+
+    __tablename__ = "website_fact_extractions"
+    # One provenance row per extracted page WITHIN a business — the idempotency key that makes a
+    # re-extraction a no-op instead of a duplicate. The same (source, subject, page) may recur across
+    # tenants, each mapping to that tenant's own organization observation.
+    __table_args__ = (
+        tenant_unique(
+            "source_key", "subject_id", "page_ref", name="uq_website_fact_extraction_page"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The organization observation (OrgObservation.id within this business) the facts are about.
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The catalog Source (DCA-044) the website is approved+entitled under — the rights-gated source key.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The SourceTerms version the page was extracted under (source attribution).
+    source_version: Mapped[int] = mapped_column(Integer)
+    # The checkpointable page locator (the page URL) — how a later refresh re-locates the page.
+    page_ref: Mapped[str] = mapped_column(String(500), index=True)
+    # The normalized host the page was served from (advisory; the crawl limits key off it).
+    host: Mapped[str] = mapped_column(String(255), default="", server_default="")
+    # The evidence object (EvidenceObject.id within this business) the extracted facts cite/ground on.
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    # A non-reversible SHA-256 (hex) of the extracted page content — ties the run to the exact bytes.
+    content_digest: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # How many permitted ORGANIZATION fields were recorded as field observations from this page.
+    fields_recorded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # How many personal/contact fragments were DETECTED and DROPPED (never recorded) — the org-only
+    # guard made auditable. A non-zero value is the witness that contact fields were refused, not leaked.
+    contact_fields_dropped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The version of the extraction contract this provenance row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class ContactChannel(str, Enum):
     """DCA-060 — the channel type of a tenant-private contact point (controlled vocabulary).
 
