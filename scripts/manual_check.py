@@ -18164,6 +18164,227 @@ def _dca_115(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-116",
+    "reconcile ambiguous (UNCERTAIN) provider outcomes: once the truth is known, resolve a dispatched "
+    "then-unconfirmed provider call AND its DCA-114-preserved uncertain hold together. A SUPPORTED "
+    "provider's receipt confirms it HAPPENED -> CONFIRMED + settle the hold at the actual cost, or did "
+    "NOT happen -> VOID + release the hold; an UNSUPPORTED provider is routed to NEEDS_REVIEW with nothing "
+    "settled/released/retried (never claims certainty without evidence, no uncontrolled repeat charge). "
+    "Idempotent on the receipt identity; a conflicting resolution of a FINAL outcome is REFUSED; authority "
+    "(budget.manage) is checked FIRST. Adjusts only the record/ledger - it performs/retries/spends/sends nothing.",
+)
+def _dca_116(ctx: CheckContext) -> dict:
+    """Drive the DCA-116 resolver directly against the ephemeral synthetic DB and PRINT the REAL
+    before/after provider-call + reservation + budget-remaining rows - never a bare PASS. Shows: a
+    supported provider confirmed-HAPPENED settles the tied uncertain hold (unused difference freed); a
+    duplicate under the same receipt identity is an idempotent replay and a conflicting resolution under a
+    different identity is REFUSED (resolved once); a supported confirmed-NOT-HAPPENED releases the whole
+    hold; and an UNSUPPORTED provider is left visibly pending NEEDS_REVIEW with the hold preserved and no
+    retry. Nothing is performed, retried, spent or sent (the DCA has no such path)."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.cost.provider_call import (
+        ProviderCallActor,
+        ProviderCallIntent,
+        ProviderCallStore,
+        ProviderCallTransition,
+    )
+    from app.cost.provider_reconcile import (
+        REASON_ALREADY_RESOLVED,
+        OutcomeEvidence,
+        OutcomeResolutionActor,
+        OutcomeResolutionError,
+        UncertainOutcomeResolver,
+    )
+    from app.cost.reconcile import (
+        BudgetReconciliationStore,
+        ReconcileOutcome,
+        ReconciliationActor,
+        ReconciliationRequest,
+    )
+    from app.cost.reserve import BudgetReservationStore, ReservationActor, ReservationRequest
+    from app.db.models import ProviderCallStatus
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz = "11111111-1111-1111-1111-11111111b116"
+    subject = "00000000-0000-4000-9000-0000000a0116"
+    res_admin = ReservationActor(subject=subject, roles=("admin",))
+    rec_admin = ReconciliationActor(subject=subject, roles=("admin",))
+    call_admin = ProviderCallActor(subject=subject, roles=("admin",))
+    resolve_admin = OutcomeResolutionActor(subject=subject, roles=("admin",))
+    budget_actor = AuditActor(id="00000000-0000-4000-9000-0000000b0116", type=ActorType.USER)
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)  # 2026-10-31 14:30 IST
+
+    # Seed generous in-force caps (paise) so the three sequential holds below all fit.
+    with factory() as session:
+        BudgetLimitStore(session, biz).save(
+            BudgetLimitInput(
+                daily_cap_minor=50_000, monthly_cap_minor=1_000_000, per_run_cap_minor=50_000
+            ),
+            budget_actor,
+        )
+        session.commit()
+
+    def _remaining() -> int:
+        with factory() as session:
+            return BudgetReservationStore(session, biz).window(now=now).daily_remaining_minor or 0
+
+    def _setup_uncertain(call_key: str, amount: int, provider: str) -> str:
+        """Reserve a hold, dispatch-then-lose the provider call (UNCERTAIN) and mark the hold UNCERTAIN
+        via the REAL DCA-113/114/115 stores — the exact ambiguous state DCA-116 reconciles. Returns the
+        reservation id."""
+        with factory() as session:
+            resv = BudgetReservationStore(session, biz).reserve(
+                ReservationRequest(
+                    idempotency_key=f"{call_key}-resv", amount_minor=amount, provider=provider
+                ),
+                res_admin,
+                now=now,
+            )
+            session.commit()
+            resv_id = resv.id
+            BudgetReconciliationStore(session, biz).reconcile(
+                ReconciliationRequest(resv_id, f"{call_key}-mark", ReconcileOutcome.MARK_UNCERTAIN),
+                rec_admin,
+                now=now,
+            )
+            session.commit()
+            store = ProviderCallStore(session, biz)
+            store.record(
+                ProviderCallIntent(
+                    call_key=call_key,
+                    capability="contact_research",
+                    provider=provider,
+                    reservation_id=resv_id,
+                ),
+                call_admin,
+                now=now,
+            )
+            store.transition(
+                ProviderCallTransition(call_key, ProviderCallStatus.IN_FLIGHT), call_admin, now=now
+            )
+            store.transition(
+                ProviderCallTransition(
+                    call_key, ProviderCallStatus.UNCERTAIN, outcome_code="gateway_timeout"
+                ),
+                call_admin,
+                now=now,
+            )
+            session.commit()
+            return resv_id
+
+    def _pcr(call_key: str) -> dict:
+        with factory() as session:
+            r = UncertainOutcomeResolver(session, biz).by_key(call_key)
+            assert r is not None
+            return {
+                "status": r.status,
+                "resolution": r.resolution or "(unresolved)",
+                "resolution_key": r.resolution_key,
+                "outcome": r.resolution_outcome_code,
+            }
+
+    def _resv(resv_id: str) -> dict:
+        with factory() as session:
+            r = BudgetReconciliationStore(session, biz)._get(resv_id)
+            assert r is not None
+            return {"status": r.status, "reserved": r.amount_minor, "settled": r.settled_amount_minor}
+
+    def _resolve(call_key, key, *, happened=None, actual=None) -> str:
+        with factory() as session:
+            try:
+                res = UncertainOutcomeResolver(session, biz).resolve(
+                    OutcomeEvidence(call_key, key, happened=happened, actual_minor=actual),
+                    resolve_admin,
+                    now=now,
+                )
+                session.commit()
+                tag = "replay" if res.replayed else "applied"
+                return (
+                    f"{tag} resolution={res.resolution} supported={res.supported} "
+                    f"review={res.routed_to_review} settled={res.settled_minor} "
+                    f"released={res.released_minor}"
+                )
+            except OutcomeResolutionError as exc:
+                session.rollback()
+                return f"refused({exc.code})"
+
+    print(f"\nbusiness: ...{biz[-4:]}   in-force caps (paise): daily=50000")
+    print(f"initial daily remaining: {_remaining()}")
+
+    # 1) Supported provider, receipt confirms it HAPPENED -> CONFIRMED + settle the tied hold.
+    r1 = _setup_uncertain("call-ok", 4_000, "platform")
+    print("\n1) supported provider, receipt confirms HAPPENED (reserved 4000, actual 2500):")
+    print(f"   before: remaining={_remaining()}  pcr={_pcr('call-ok')}  resv={_resv(r1)}")
+    s1 = _resolve("call-ok", "receipt-1a", happened=True, actual=2_500)
+    print(f"   resolve happened actual 2500 -> {s1}")
+    print(f"   after:  remaining={_remaining()}  pcr={_pcr('call-ok')}  resv={_resv(r1)}  (freed 1500)")
+    # 1b) Duplicate under the SAME receipt identity -> idempotent replay (no double-free).
+    dup = _resolve("call-ok", "receipt-1a", happened=True, actual=2_500)
+    print(f"   duplicate same receipt receipt-1a -> {dup}  remaining={_remaining()}  (not double-freed)")
+    # 1c) A DIFFERENT receipt against the FINAL resolution is refused (resolved once).
+    diff = _resolve("call-ok", "receipt-1b", happened=False)
+    print(f"   different receipt receipt-1b -> {diff}  (REASON={REASON_ALREADY_RESOLVED})")
+
+    # 2) Supported provider, receipt confirms it did NOT happen -> VOID + release the whole hold.
+    r2 = _setup_uncertain("call-void", 1_000, "platform")
+    before_void = _remaining()
+    s2 = _resolve("call-void", "receipt-2", happened=False)
+    print("\n2) supported provider, receipt confirms NOT happened (reserved 1000 -> release):")
+    print(f"   resolve not-happened -> {s2}  remaining {before_void} -> {_remaining()}  (freed)")
+    print(f"   pcr={_pcr('call-void')}  resv={_resv(r2)}")
+
+    # 3) UNSUPPORTED provider -> routed to NEEDS_REVIEW; hold preserved, nothing settled/released/retried.
+    r3 = _setup_uncertain("call-review", 1_000, "vendor_x")
+    before_rev = _remaining()
+    s3 = _resolve("call-review", "receipt-3", happened=True, actual=1)
+    print("\n3) UNSUPPORTED provider 'vendor_x' with evidence -> routed to review (left pending):")
+    print(f"   resolve -> {s3}  remaining {before_rev} -> {_remaining()}  (preserved)")
+    print(f"   pcr={_pcr('call-review')}  resv={_resv(r3)}  (hold still UNCERTAIN, no retry)")
+
+    checks = {
+        "confirmed_happened_settles": _pcr("call-ok")["resolution"] == "confirmed"
+        and _resv(r1)["settled"] == 2_500
+        and _resv(r1)["status"] == "settled",
+        "duplicate_is_idempotent_replay": dup.startswith("replay"),
+        "resolved_once": diff == f"refused({REASON_ALREADY_RESOLVED})",
+        "not_happened_releases": _pcr("call-void")["resolution"] == "void"
+        and _resv(r2)["status"] == "released",
+        "unsupported_routed_to_review": _pcr("call-review")["resolution"] == "needs_review"
+        and _resv(r3)["status"] == "uncertain"
+        and before_rev == _remaining(),
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no spend, no send, and NO actual "
+        "provider/model call is ever made or RETRIED. DCA-116 RECONCILES an ambiguous (UNCERTAIN) provider "
+        "outcome once the truth is known, tying the DCA-115 provider-call record and the DCA-114-preserved "
+        "uncertain hold together: a SUPPORTED provider's receipt confirms it HAPPENED (CONFIRMED + settle "
+        "the hold at the actual cost, unused difference freed) or did NOT happen (VOID + release the whole "
+        "hold); an UNSUPPORTED provider is routed to NEEDS_REVIEW with nothing settled/released/retried "
+        "(certainty is never claimed without evidence; there is no uncontrolled repeat charge). It is "
+        "idempotent on the receipt identity and a conflicting resolution of a FINAL outcome is REFUSED, "
+        "serialized under FOR UPDATE locks (proven on real Postgres in tests/test_provider_outcome_resolve.py); "
+        "authority (budget.manage) is checked FIRST. Resolving adjusts only the record/ledger - the UNCERTAIN "
+        "lifecycle status is never reopened and nothing is performed, retried, spent or sent.)"
+    )
+    return {
+        "confirmed_happened": s1,
+        "duplicate_replay": dup,
+        "conflicting_refused": diff,
+        "not_happened_released": s2,
+        "unsupported_review": s3,
+        "final_remaining": _remaining(),
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest

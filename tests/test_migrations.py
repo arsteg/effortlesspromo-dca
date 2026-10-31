@@ -1917,6 +1917,82 @@ def test_0046_creates_provider_call_records_on_a_preexisting_database(clean_sche
 
 
 @requires_pg
+def test_0047_adds_resolution_columns_on_a_preexisting_database(clean_schema):
+    """DCA-116 — the 0047 add-column branch (for a DB migrated before the resolution columns existed).
+
+    A fresh DB gets ``provider_call_records`` WITH the DCA-116 resolution columns from the metadata
+    baseline (0001), so 0047 is a no-op there. To exercise 0047's real job, upgrade to head, DROP the
+    columns, seed one pre-existing UNCERTAIN record, stamp history back to 0046, then upgrade to head
+    again — 0047 must re-add exactly those columns and backfill the existing row to "unresolved" ("" with
+    NULLs), with no new table and no RLS change (the 0046 policy still covers the table).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "provider_call_records" '
+                'DROP COLUMN "resolution", DROP COLUMN "resolution_key", '
+                'DROP COLUMN "resolution_outcome_code", DROP COLUMN "resolution_actor_id", '
+                'DROP COLUMN "resolution_actor_type", DROP COLUMN "resolution_at"'
+            )
+        )
+        # Seed one pre-existing (pre-resolution) UNCERTAIN record to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO provider_call_records "
+                "(id, business_id, schema_version, call_key, request_id, capability, intent, provider, "
+                "model, source_version, status, dispatched, actor_id, actor_type, created_at, "
+                "updated_at) VALUES "
+                "('pcr-legacy', 'biz-legacy', 1, 'legacy-call', 'req-legacy', 'contact_research', '', "
+                "'platform', '', '', 'uncertain', true, 'admin-legacy', 'user', now(), now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0046_provider_call_records")  # pretend we predate the resolution columns
+    command.upgrade(cfg, "head")  # 0047 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("provider_call_records", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT resolution, resolution_key, resolution_outcome_code, resolution_at "
+                "FROM provider_call_records WHERE id = 'pcr-legacy'"
+            )
+        ).first()
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'provider_call_records' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert {
+        "resolution",
+        "resolution_key",
+        "resolution_outcome_code",
+        "resolution_actor_id",
+        "resolution_actor_type",
+        "resolution_at",
+    }.issubset(cols)  # columns re-added
+    assert backfilled == ("", None, None, None)  # pre-existing record backfilled to "unresolved"
+    assert policies == {"provider_call_records"}  # tenant-owned RLS unchanged by the add-column migration
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 

@@ -856,6 +856,40 @@ class ProviderCallStatus(str, Enum):
         return frozenset({cls.SUCCEEDED.value, cls.FAILED.value, cls.UNCERTAIN.value})
 
 
+class ProviderCallResolution(str, Enum):
+    """DCA-116 — how an AMBIGUOUS (``UNCERTAIN``) provider outcome was later reconciled, once the truth
+    is known. This is a SEPARATE dimension from the DCA-115 lifecycle :class:`ProviderCallStatus`: the
+    ``UNCERTAIN`` status is terminal and is NEVER reopened; DCA-116 records the confirmed resolution of
+    the ambiguity alongside it (and settles/releases the tied DCA-113 hold accordingly), WITHOUT ever
+    performing or retrying a paid call (execution stays a disabled future capability).
+
+    The single sanctioned writer is :class:`~app.cost.provider_reconcile.UncertainOutcomeResolver`, which
+    resolves ONLY an ``UNCERTAIN`` record and never claims certainty without evidence:
+
+    - ``UNRESOLVED`` — the ambiguity has not been reconciled yet (the default while a call is still
+      ``UNCERTAIN``).
+    - ``NEEDS_REVIEW`` — the provider does NOT support a status/receipt lookup, so the outcome CANNOT be
+      confirmed automatically; it is routed to human review and nothing is settled, released or retried
+      (no uncontrolled repeat charge). NOT a final resolution — an operator may resolve it later with
+      explicit evidence.
+    - ``CONFIRMED`` — final. Evidence (a supported provider's receipt/status) confirmed the call DID
+      happen; the tied hold is SETTLED at the actual cost (the unused difference released).
+    - ``VOID`` — final. Evidence confirmed the call did NOT happen; the tied hold is RELEASED in full.
+    """
+
+    UNRESOLVED = ""
+    NEEDS_REVIEW = "needs_review"
+    CONFIRMED = "confirmed"
+    VOID = "void"
+
+    @classmethod
+    def final_values(cls) -> frozenset[str]:
+        """The FINAL resolution values — a resolution in any of these is settled truth and can never be
+        changed; a later resolution that conflicts with it is refused (DCA-116). ``NEEDS_REVIEW`` and
+        ``UNRESOLVED`` are deliberately NOT final (a reviewed call may still be resolved with evidence)."""
+        return frozenset({cls.CONFIRMED.value, cls.VOID.value})
+
+
 class ProviderCallRecord(TenantOwned, Base):
     """DCA-115 — the authoritative lifecycle record of ONE external provider call (tenant-owned, RLS).
 
@@ -953,6 +987,39 @@ class ProviderCallRecord(TenantOwned, Base):
     # transition happens.
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+    # --- DCA-116 ambiguous-outcome resolution (all defaulted: "" / NULL while the call is UNCERTAIN) ---
+    # How an UNCERTAIN (ambiguous) outcome was later reconciled once the truth is known — a SEPARATE
+    # dimension from the terminal lifecycle ``status`` above (the UNCERTAIN status is never reopened):
+    # "" (unresolved) | needs_review (unsupported provider, routed to human review) | confirmed (evidence
+    # confirmed the call happened — the tied hold is settled) | void (evidence confirmed it did not — the
+    # tied hold is released). Only the sanctioned DCA-116 resolver writes this; it never performs/retries
+    # a paid call.
+    resolution: Mapped[str] = mapped_column(
+        String(16),
+        default=ProviderCallResolution.UNRESOLVED.value,
+        server_default=ProviderCallResolution.UNRESOLVED.value,
+        index=True,
+    )
+    # The opaque idempotency/evidence token for the ONE resolution (the receipt/status identity). A replay
+    # under the SAME key returns the existing resolution; a DIFFERENT key against a FINAL resolution is
+    # refused. NULL until the ambiguity is reconciled.
+    resolution_key: Mapped[str | None] = mapped_column(String(128), default=None, index=True)
+    # A stable OUTCOME / evidence code recorded on the resolution (opaque; e.g. "receipt_confirmed",
+    # "receipt_absent", "unsupported_provider"). NULL until reconciled.
+    resolution_outcome_code: Mapped[str | None] = mapped_column(String(64), default=None)
+    # WHO reconciled the ambiguity — an opaque subject id (never a name/email) plus its kind, screened by
+    # the audit sink in the SAME unit of work. NULL until reconciled.
+    resolution_actor_id: Mapped[str | None] = mapped_column(String(128), default=None)
+    resolution_actor_type: Mapped[str | None] = mapped_column(String(32), default=None)
+    # WHEN the ambiguity was reconciled / routed to review (NULL until reconciled).
+    resolution_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+    @property
+    def is_resolved(self) -> bool:
+        """Whether an ambiguous (UNCERTAIN) outcome has reached a FINAL DCA-116 resolution
+        (confirmed / void). ``needs_review`` and the unresolved default are deliberately not final."""
+        return self.resolution in ProviderCallResolution.final_values()
 
     @property
     def is_terminal(self) -> bool:
