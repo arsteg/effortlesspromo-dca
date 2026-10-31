@@ -1211,6 +1211,112 @@ class AcquisitionPlan(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class DiscoveryRunStatus(str, Enum):
+    """DCA-140 — lifecycle state of a bounded discovery run (the orchestration envelope the later
+    DCA-141..149 pipeline steps fill in).
+
+    A run is CREATED in :attr:`PENDING` and **nothing executes** at creation: DCA-140 persists the run
+    *request* only. The forward states are scaffolding for the later, still-disabled pipeline steps —
+    :attr:`PLANNED` (DCA-141 persists the plan into the run), :attr:`RUNNING` (a task executes), and the
+    terminal :attr:`COMPLETED` / :attr:`FAILED` / :attr:`CANCELLED` (DCA-149 finalises). No path in THIS
+    story ever advances a run past PENDING or runs / sends / spends anything.
+
+    :meth:`active_values` is the "a logical run is in progress" marker the overlap guard reads: a second
+    run for the same confirmed-ICP scope cannot be created while one is still active, so duplicate active
+    scope can never start redundant work. :meth:`terminal_values` are the settled states a finished run
+    rests in (and which free the scope for a fresh run).
+    """
+
+    PENDING = "pending"
+    PLANNED = "planned"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @classmethod
+    def active_values(cls) -> frozenset[str]:
+        """The non-terminal states — a run in any of these is an active logical run (blocks overlap)."""
+        return frozenset({cls.PENDING.value, cls.PLANNED.value, cls.RUNNING.value})
+
+    @classmethod
+    def terminal_values(cls) -> frozenset[str]:
+        """The settled states — a run here is finished and no longer occupies its logical scope."""
+        return frozenset({cls.COMPLETED.value, cls.FAILED.value, cls.CANCELLED.value})
+
+
+class DiscoveryRunRequest(TenantOwned, Base):
+    """DCA-140 — a bounded discovery RUN request (tenant-owned, RLS-protected): the orchestration
+    envelope for ONE acquisition cycle that the later DCA-141..149 pipeline steps progressively fill.
+
+    One row records a business's *intent* to run a bounded discovery cycle, grounded in its CONFIRMED
+    India ICP (:class:`IcpConfirmation`) and bounded, at creation, to the sources it is ALREADY
+    approved+entitled to and to explicit scope/budget caps. It is created in :attr:`DiscoveryRunStatus.
+    PENDING` and **nothing executes**: creating a run persists the request only — it runs no task,
+    enqueues no job, suggests no prospect, sends no message and spends nothing (``provenance`` pins
+    ``executed`` / ``sent`` / ``spent`` all ``False``). Advancing it — persisting a plan, executing a
+    task, converting to observations, resolving, suggesting, finalising — is the later, still-disabled
+    pipeline (each its own story).
+
+    Bounded *by construction* (DCA-140 acceptance):
+
+    - **Grounded in confirmed targeting.** ``icp_version`` is the one confirmed ICP version the run is
+      scoped to. An unconfirmed profile cannot start a run (the creator refuses before any row is staged).
+    - **Bounded source scope.** ``source_scope`` is the approved+entitled source/field allowlist resolved
+      at creation — the run can reference no source outside it (no scope expansion).
+    - **Bounded limits.** ``target_cap`` / ``task_cap`` / ``query_cap`` are the (clamped) scope ceilings
+      and ``per_run_budget_minor`` (INR paise, from the business's :class:`BudgetLimit`) the spend
+      ceiling a future disabled spend path would honour. A requested value over a ceiling is **clamped**
+      down (``clamped`` + a ``clamp_notes`` record), never widened — over-scope / over-budget can never
+      inflate a run.
+    - **No overlapping logical runs.** Only ONE active run may exist per ``(business_id, icp_version)`` at
+      a time; the creator refuses a second one (a Postgres partial unique index backs the app-level guard
+      for concurrency). Duplicate active scope cannot start redundant work.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy, so one
+    business can never read or start another's runs. It holds only the business's own targeting/scope/
+    limit metadata — no prospect contact data and no secrets.
+    """
+
+    __tablename__ = "discovery_run_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The confirmed ICP version this run is grounded in — the logical scope key the overlap guard dedupes
+    # on. A run is created only against a CONFIRMED targeting version (an unconfirmed profile is refused).
+    icp_version: Mapped[int] = mapped_column(Integer)
+    # Initial state is PENDING: the run is CREATED but NOT executing. Nothing in DCA-140 advances it.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=DiscoveryRunStatus.PENDING.value,
+        server_default=DiscoveryRunStatus.PENDING.value,
+        index=True,
+    )
+    # The bounded source scope resolved at creation: the sources (and permitted fields) the business is
+    # ALREADY approved+entitled to for discovery — [{sourceKey, permittedFields:[...]}]. The run can
+    # reference no source outside this set.
+    source_scope: Mapped[list] = mapped_column(JSON, default=list)
+    # The effective (clamped) scope ceilings the run is bounded by, recorded for review/reproducibility.
+    target_cap: Mapped[int] = mapped_column(Integer)
+    task_cap: Mapped[int] = mapped_column(Integer)
+    query_cap: Mapped[int] = mapped_column(Integer)
+    # The INR per-run spend ceiling the run is bounded by (from the business's BudgetLimit), in minor
+    # units (paise), or NULL when no budget is configured. A run SPENDS NOTHING; this is the ceiling a
+    # future (disabled) spend path would honour. ``budget_limit_version`` records which version bounded it.
+    per_run_budget_minor: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    budget_limit_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    # What the caller requested before clamping (the "requested" side of the honest clamp record).
+    requested: Mapped[dict] = mapped_column(JSON, default=dict)
+    # Whether any requested limit exceeded a bound and was clamped down (over-scope / over-budget).
+    clamped: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    # The per-item record of everything clamped to keep the run in bounds:
+    # [{field, requested, effective, reason}]. Nothing is clamped silently.
+    clamp_notes: Mapped[list] = mapped_column(JSON, default=list)
+    # Run provenance + the load-bearing invariants (executed / sent / spent = False, feature/entitlement
+    # state, the applied caps and source keys).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

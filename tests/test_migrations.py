@@ -82,6 +82,7 @@ DCA_TABLES = {
     "identity_match_suggestions",
     "fit_explanations",
     "acquisition_plans",
+    "discovery_run_requests",
 }
 
 

@@ -89,6 +89,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "identity_match_suggestions",
         "fit_explanations",
         "acquisition_plans",
+        "discovery_run_requests",
     }
 
 

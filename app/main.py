@@ -20,6 +20,7 @@ from app.api.routes import (
     budget,
     deletion_propagation,
     discovery_plans,
+    discovery_runs,
     dispatch_recheck,
     eligibility,
     grievances,
@@ -144,6 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(profiles.router)
     app.include_router(icp.router)
     app.include_router(discovery_plans.router)
+    app.include_router(discovery_runs.router)
     app.include_router(records.router)
     app.include_router(eligibility.router)
     app.include_router(activation_references.router)

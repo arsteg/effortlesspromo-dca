@@ -23166,9 +23166,7 @@ def _dca_139(ctx: CheckContext) -> dict:
             )
         )
         session.add(
-            IcpConfirmation(
-                business_id=business_id, version=1, actor_id="seed", actor_type="user"
-            )
+            IcpConfirmation(business_id=business_id, version=1, actor_id="seed", actor_type="user")
         )
         ProfileStore(session, business_id).save_draft(
             ProfileDraftInput(
@@ -23180,8 +23178,13 @@ def _dca_139(ctx: CheckContext) -> dict:
         )
 
     def _suggestion(method, *, offer="Opt-in capture", rationale="first-party", **extra):
-        base = {"method": method, "offer": offer, "placement": "owned channels",
-                "rationale": rationale, "confidence": 0.7}
+        base = {
+            "method": method,
+            "offer": offer,
+            "placement": "owned channels",
+            "rationale": rationale,
+            "confidence": 0.7,
+        }
         base.update(extra)
         return base
 
@@ -23202,12 +23205,30 @@ def _dca_139(ctx: CheckContext) -> dict:
         return AiCapabilityFacade(FakeAiGatewayTransport(structured_output=output))
 
     runs = [
-        ("salon", salon, dict(industry="beauty services", geography="MH",
-                              products=["haircut", "spa"], business_type="salon",
-                              languages=["Marathi"]), ["qr_code", "whatsapp_opt_in"]),
-        ("wholesaler", wholesaler, dict(industry="textiles", geography="GJ",
-                                        products=["cotton fabric"], business_type="B2B wholesaler",
-                                        languages=["Gujarati"]), ["website_form", "newsletter_signup"]),
+        (
+            "salon",
+            salon,
+            dict(
+                industry="beauty services",
+                geography="MH",
+                products=["haircut", "spa"],
+                business_type="salon",
+                languages=["Marathi"],
+            ),
+            ["qr_code", "whatsapp_opt_in"],
+        ),
+        (
+            "wholesaler",
+            wholesaler,
+            dict(
+                industry="textiles",
+                geography="GJ",
+                products=["cotton fabric"],
+                business_type="B2B wholesaler",
+                languages=["Gujarati"],
+            ),
+            ["website_form", "newsletter_signup"],
+        ),
     ]
 
     print("\nfirst-party acquisition plans (fixture transport — no network/model/spend):")
@@ -23275,6 +23296,140 @@ def _dca_139(ctx: CheckContext) -> dict:
         "ICP version.)"
     )
     return {"checks": checks, "plans": rows, "stored": stored}
+
+
+@register(
+    "DCA-140",
+    "CREATE a bounded discovery RUN — the orchestration envelope the later DCA-141..149 pipeline fills. "
+    "The run is CREATED in the not-yet-executing PENDING state, grounded in the confirmed ICP and bounded "
+    "to the business's approved+entitled source scope within clamped scope / budget caps. Over-scope / "
+    "over-budget requests are CLAMPED (recorded), an unconfirmed profile and a duplicate active scope are "
+    "REFUSED, and creating a run executes nothing (no job, no suggestion, NO send, NO spend). Local "
+    "synthetic only.",
+)
+def _dca_140(ctx: CheckContext) -> dict:
+    """Drive the real DCA-140 run creator against a disposable DB with isolated synthetic Businesses.
+    Business A (confirmed ICP + a per-run budget cap) creates a bounded run while requesting an
+    over-scope target cap and an over-budget run spend — PRINT the created PENDING run row, the clamped
+    caps and the honest clamp notes, and that nothing executed. Then show the two headline denials: a
+    second run on the SAME scope is refused (duplicate active scope), and Business B (no confirmed ICP)
+    cannot start a run at all."""
+    from app.db.models import (
+        DiscoveryRunRequest,
+        DurableJobRequest,
+        IcpConfirmation,
+        IcpDraft,
+        TenantAgent,
+    )
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+    from app.services.discovery_run import MAX_TARGET_CAP, create_discovery_run
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    biz_b = "00000000-0000-4000-8000-00000000000b"
+
+    def _seed(session, business_id, *, confirm_icp, budget_per_run=None):
+        session.add(TenantAgent(business_id=business_id, country="IN", enabled=True))
+        if confirm_icp:
+            session.add(
+                IcpDraft(
+                    business_id=business_id,
+                    version=1,
+                    industries=["information technology"],
+                    size_bands=["small"],
+                    roles=["owner"],
+                    geography=["KA"],
+                    status="draft",
+                )
+            )
+            session.add(
+                IcpConfirmation(
+                    business_id=business_id, version=1, actor_id="seed", actor_type="user"
+                )
+            )
+        if budget_per_run is not None:
+            from app.audit.sink import ActorType, AuditActor
+
+            BudgetLimitStore(session, business_id).save(
+                BudgetLimitInput(
+                    daily_cap_minor=budget_per_run * 10,
+                    monthly_cap_minor=budget_per_run * 100,
+                    per_run_cap_minor=budget_per_run,
+                ),
+                AuditActor(id="seed", type=ActorType.USER),
+            )
+
+    # The DCA-021 platform feature gate is OFF by default (production-safe); turn it ON for this local
+    # synthetic scenario so a run can be created. Entitlement enforcement stays off (no paid work).
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    print("\nbounded discovery runs (local synthetic — nothing executed, sent or spent):")
+
+    # Business A — a bounded run, requesting an over-scope target cap and an over-budget run spend.
+    with ctx.session_factory() as session:
+        _seed(session, biz_a, confirm_icp=True, budget_per_run=50_000)
+        session.flush()
+        a_first = create_discovery_run(
+            session, settings, biz_a, target_cap=999_999, requested_budget_minor=999_999
+        )
+        session.commit()
+        run = a_first.run
+        assert run is not None  # a valid create always produces a run
+        print("\n  Business A — valid create:")
+        print(f"      runId={run.id}")
+        print(f"      status={run.status}  (initial, not-yet-executing)")
+        print(f"      icpVersion={run.icp_version}")
+        print(f"      targetCap={run.target_cap} (requested 999999, ceiling {MAX_TARGET_CAP})")
+        print(
+            f"      perRunBudgetMinor={run.per_run_budget_minor} (requested 999999, per-run cap 50000)"
+        )
+        print(f"      clamped={run.clamped}  clampNotes={run.clamp_notes}")
+        print(f"      sourceScope={run.source_scope}")
+        print(
+            f"      executed={run.provenance['executed']} sent={run.provenance['sent']} "
+            f"spent={run.provenance['spent']} autoApproved={run.provenance['autoApproved']}"
+        )
+
+        # Duplicate active scope — a second run on the SAME confirmed-ICP scope is refused.
+        a_dup = create_discovery_run(session, settings, biz_a)
+        print("\n  Business A — duplicate active scope:")
+        print(f"      run={a_dup.run}  refused_reason={a_dup.refused_reason!r}")
+
+        jobs = session.query(DurableJobRequest).count()
+        a_runs = session.query(DiscoveryRunRequest).filter_by(business_id=biz_a).count()
+
+    # Business B — no confirmed ICP: an unconfirmed profile cannot start a run.
+    with ctx.session_factory() as session:
+        _seed(session, biz_b, confirm_icp=False)
+        session.flush()
+        b_result = create_discovery_run(session, settings, biz_b)
+        session.commit()
+        b_runs = session.query(DiscoveryRunRequest).filter_by(business_id=biz_b).count()
+    print("\n  Business B — unconfirmed profile:")
+    print(f"      run={b_result.run}  refused_reason={b_result.refused_reason!r}")
+
+    checks = {
+        "run_created_pending": run.status == "pending",
+        "target_cap_clamped": run.target_cap == MAX_TARGET_CAP and run.clamped,
+        "budget_clamped_to_per_run_cap": run.per_run_budget_minor == 50_000,
+        "nothing_executed": run.provenance["executed"] is False,
+        "no_jobs_enqueued": jobs == 0,
+        "duplicate_active_scope_refused": a_dup.refused_reason == "duplicate_active_run",
+        "only_one_run_for_a": a_runs == 1,
+        "unconfirmed_profile_refused": b_result.refused_reason == "no_confirmed_icp",
+        "no_run_for_b": b_runs == 0,
+    }
+    print(f"\nstored runs: A={a_runs}  B={b_runs}  jobs_enqueued={jobs}")
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend. DCA-140 CREATES a bounded discovery run: "
+        "the orchestration envelope the later DCA-141..149 pipeline fills. The run is created in the "
+        "not-yet-executing PENDING state, grounded in the confirmed ICP and bounded to the approved+"
+        "entitled source scope within clamped scope / budget caps — an over-scope / over-budget request "
+        "is clamped down, never widened. An unconfirmed profile and a duplicate active scope are refused "
+        "with NO state change, and creating a run executes nothing: no task is run, no job is enqueued, no "
+        "prospect is suggested, no message is sent and nothing is spent.)"
+    )
+    return {"checks": checks, "a_runs": a_runs, "b_runs": b_runs, "jobs": jobs}
 
 
 def _build_parser() -> argparse.ArgumentParser:
