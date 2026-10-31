@@ -22,9 +22,15 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_session
 from app.api.idempotency import IdempotencyContext, commit_idempotent, idempotency
 from app.core.logging import get_correlation_id
+from app.ai import AiCapabilityFacade
 from app.core.security import require_service_auth
 from app.db.models import BusinessProfileDraft, TenantAgent
 from app.profiles import PlatformProfileClient
+from app.services.profile_drafter import (
+    REASON_CAPABILITY_DISABLED,
+    RetrievedEvidence,
+    draft_profile_from_evidence,
+)
 from app.services.profile_importer import (
     REASON_IMPORT_CONTRACT_DISABLED,
     ProfileImportError,
@@ -48,6 +54,14 @@ def _platform_profile_client(request: Request) -> PlatformProfileClient | None:
 ProfileClientDep = Annotated[PlatformProfileClient | None, Depends(_platform_profile_client)]
 
 
+def _ai_capability_facade(request: Request) -> AiCapabilityFacade | None:
+    """The DCA-128 AI-capability facade, or ``None`` when AI is disabled (fail-closed)."""
+    return getattr(request.app.state, "ai_capability_facade", None)
+
+
+AiFacadeDep = Annotated[AiCapabilityFacade | None, Depends(_ai_capability_facade)]
+
+
 class ProfileDraftBody(BaseModel):
     products: list[str] = []
     businessType: str = ""
@@ -56,6 +70,22 @@ class ProfileDraftBody(BaseModel):
     confirmedFacts: list[str] = []
     # Aspects the caller explicitly declares not-yet-known; the store also auto-retains any empty one.
     unknowns: list[str] = []
+
+
+class DraftEvidenceItem(BaseModel):
+    ref: str
+    content: str
+    permittedFields: list[str] = []
+    rightsValid: bool = True
+    provenance: str | None = None
+
+
+class DraftFromEvidenceBody(BaseModel):
+    businessName: str
+    domain: str | None = None
+    evidence: list[DraftEvidenceItem] = []
+    # Advisory hint of which profile aspects to draft (the model returns unknowns for the rest).
+    draftFields: list[str] = []
 
 
 def _require_tenant(session: Session, business_id: str) -> TenantAgent:
@@ -145,6 +175,77 @@ def import_profile(
     # Flush so the DB-assigned fields (created_at) are populated for the response view.
     session.flush()
     return commit_idempotent(session, idem, _draft_view(draft), status_code=201)
+
+
+@router.post("/{business_id}/profile/draft-from-evidence", status_code=201)
+def draft_from_evidence(
+    business_id: str,
+    body: DraftFromEvidenceBody,
+    request: Request,
+    session: SessionDep,
+    idem: IdempotencyDep,
+    facade: AiFacadeDep,
+) -> dict:
+    """DCA-134 — draft a business profile grounded in authorised evidence (AI-capability integration).
+
+    Runs the ``business_profile_draft`` capability through the one DCA AI facade: the business identity
+    is the trusted context, the supplied evidence bodies ride the untrusted channel, and each
+    model-proposed claim is independently re-grounded against the evidence (DCA-133) before anything is
+    stored. The result is a NEW, reviewable draft version carrying its uncertainty (confidence) and
+    references (grounded citations) plus what was dropped and why — never an auto-confirmed profile.
+    Retry-safe (DCA-035).
+
+    Fail-closed with NO state change on refusal: the capability/transport disabled → 503; a rejected
+    (unsafe/invalid) gateway output → 502. Both refuse before any draft is staged.
+    """
+    _require_tenant(session, business_id)
+    evidence = [
+        RetrievedEvidence(
+            ref=item.ref,
+            content=item.content,
+            permitted_fields=frozenset(item.permittedFields),
+            rights_valid=item.rightsValid,
+            provenance=(item.provenance or "").strip(),
+        )
+        for item in body.evidence
+    ]
+    # A deterministic DCA-owned invocation key so a retry replays the same gateway request id. Prefer the
+    # client's Idempotency-Key (one logical draft = one invocation); else a per-request correlation id.
+    correlation_id = get_correlation_id()
+    invocation_key = (idem.key or correlation_id or f"{business_id}:draft").strip()
+    result = draft_profile_from_evidence(
+        session,
+        facade,
+        business_id,
+        business_name=body.businessName,
+        evidence=evidence,
+        invocation_key=f"profile-draft:{business_id}:{invocation_key}",
+        domain=body.domain,
+        draft_fields=body.draftFields,
+        correlation_id=correlation_id,
+    )
+    if result.draft is None:
+        # Fail-closed: a disabled capability is 503; an unsafe/invalid gateway output is 502. Nothing staged.
+        status = 503 if result.refused_reason == REASON_CAPABILITY_DISABLED else 502
+        raise HTTPException(status_code=status, detail=result.refused_reason)
+    session.flush()  # materialize created_at for the response view
+    view = _draft_view(result.draft)
+    view["grounding"] = {
+        "grounded": [
+            {
+                "field": f.field_key,
+                "citationRef": f.citation_ref,
+                "inferenceLabel": f.inference_label,
+            }
+            for f in result.grounded
+        ],
+        "dropped": [{"field": v.fact.field_key, "reason": v.reason} for v in result.dropped],
+        "heldForReview": bool(result.outcome.held_for_review) if result.outcome else False,
+        "overallConfidence": result.overall_confidence,
+        "modelProvider": result.model_provider,
+        "synthetic": result.synthetic,
+    }
+    return commit_idempotent(session, idem, view, status_code=201)
 
 
 @router.get("/{business_id}/profile/drafts")

@@ -21937,6 +21937,167 @@ def _dca_133(ctx: CheckContext) -> dict:
     return {"accepted_fields": accepted_fields, "verdicts": rows, "checks": checks}
 
 
+@register(
+    "DCA-134",
+    "draft a business profile WITH EVIDENCE through the DCA AI chokepoint: authorised website/Brand-KB "
+    "evidence in, a reviewable DRAFT out — each surviving claim grounded in a cited span the DCA "
+    "re-validates (DCA-133); an invented/hallucinated/unrelated/unknown claim is DROPPED (recorded, "
+    "never written); the draft carries its uncertainty + references and is NEVER auto-confirmed; a "
+    "rejected gateway output and the disabled capability both stage NO draft. Fixture transport only "
+    "(no network, no model, NO spend).",
+)
+def _dca_134(ctx: CheckContext) -> dict:
+    """Drive the real DCA-134 business-profile drafting over the HTTP API against synthetic A, using the
+    deterministic fixture transport (no network/model/spend) wired to return a realistic model draft —
+    two genuinely grounded claims plus a hallucinated, an unrelated-field and an unknown claim. PRINT
+    the stored draft and, per model claim, whether it was GROUNDED (kept) or DROPPED (with its reason),
+    so a human sees grounded-vs-dropped and the draft's uncertainty/references rather than a bare PASS.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
+    from app.main import create_app
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    base = f"/v1/tenants/{biz_a}/profile"
+
+    page = (
+        "About Acme Teas Pvt Ltd.\n"
+        "We sell small-batch Indian teas sourced direct from growers.\n"
+        "Industry: retail.\n"
+        "FSSAI licensed and GST registered in Karnataka."
+    )
+    # A realistic model draft: two grounded claims + a hallucinated span + an unrelated field + a null.
+    claims: list[dict] = [
+        {"field": "value_proposition", "value": "small-batch Indian teas", "citationRef": "ev-1",
+         "citedText": "We sell small-batch Indian teas sourced direct from growers.",
+         "inferenceLabel": "observed", "confidence": 0.86},
+        {"field": "business_type", "value": "retail", "citationRef": "ev-1",
+         "citedText": "Industry: retail.", "inferenceLabel": "observed", "confidence": 0.8},
+        {"field": "products", "value": "rockets", "citationRef": "ev-1",
+         "citedText": "We sell rockets to the moon.", "inferenceLabel": "observed", "confidence": 0.9},
+        {"field": "cin", "value": "U17110KA2010PTC000000", "citationRef": "ev-1",
+         "citedText": "Industry: retail.", "inferenceLabel": "observed", "confidence": 0.7},
+        {"field": "gstin", "value": None, "citationRef": "ev-1",
+         "citedText": "GST registered in Karnataka.", "inferenceLabel": "observed", "confidence": 0.3},
+    ]
+    model_output = {"claims": claims, "unknowns": ["languages"], "confidence": 0.78}
+    permitted = ["value_proposition", "business_type", "products"]
+    evidence_body = {
+        "businessName": "Acme Teas",
+        "evidence": [{
+            "ref": "ev-1", "content": page,
+            "permittedFields": permitted,
+            "rightsValid": True, "provenance": "website:acme-about",
+        }],
+        "draftFields": ["value_proposition", "business_type", "products", "languages"],
+    }
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        client.post("/v1/tenants", json={"businessId": biz_a}, headers=auth)
+
+        print("\nauthorised evidence the DCA retrieved (the ONLY material a claim may cite):")
+        print(f"  - ref='ev-1'  rights_valid=True  permitted_fields={permitted}")
+        print("    content:")
+        for line in page.splitlines():
+            print(f"      | {line}")
+
+        # Wire the fixture transport to return the realistic model draft (untrusted evidence taints →
+        # held for review). No network, no model, no spend.
+        app.state.ai_capability_facade = AiCapabilityFacade(
+            FakeAiGatewayTransport(
+                structured_output=model_output, validation={"humanReviewRequired": True, "taint": True}
+            )
+        )
+
+        resp = client.post(f"{base}/draft-from-evidence", json=evidence_body, headers=auth)
+        body = resp.json()
+        print(f"\n1) draft-from-evidence           -> HTTP {resp.status_code}")
+        grounding = body.get("grounding", {})
+        grounded_fields = {g["field"] for g in grounding.get("grounded", [])}
+        dropped = {d["field"]: d["reason"] for d in grounding.get("dropped", [])}
+
+        print("\nper model-claim disposition (the independent DCA-133 grounding gate decides):")
+        for claim in claims:
+            f = claim["field"]
+            disp = "GROUNDED" if f in grounded_fields else "DROPPED "
+            reason = "-" if f in grounded_fields else dropped.get(f, "?")
+            print(f"  - {f:<18} value={str(claim['value'])!r:<26} -> {disp}  reason={reason}")
+
+        print("\nstored DRAFT (version "
+              f"{body.get('version')}, status={body.get('status')!r}):")
+        print(f"  value_proposition = {body.get('valueProposition')!r}")
+        print(f"  business_type     = {body.get('businessType')!r}")
+        print(f"  products          = {body.get('products')}  (hallucinated 'rockets' dropped)")
+        print(f"  unknowns          = {body.get('unknowns')}")
+        print(f"  overall_confidence= {grounding.get('overallConfidence')}   held_for_review={grounding.get('heldForReview')}")
+        print(f"  references (kept) = {body.get('provenance', {}).get('references')}")
+
+        confirmed = client.get(f"{base}/confirmed", headers=auth).json()
+        print(f"\n2) GET confirmed profile         -> confirmed={confirmed['confirmed']} (drafting never confirms)")
+
+        # Denial 1: a rejected gateway output stages NO draft.
+        app.state.ai_capability_facade = AiCapabilityFacade(
+            FakeAiGatewayTransport(
+                structured_output=model_output,
+                validation={"validationStatus": "failed", "validationReport": {"status": "failed"}},
+            )
+        )
+        rejected = client.post(f"{base}/draft-from-evidence", json=evidence_body, headers=auth)
+        # Denial 2: the capability disabled stages NO draft.
+        app.state.ai_capability_facade = None
+        disabled = client.post(f"{base}/draft-from-evidence", json=evidence_body, headers=auth)
+        versions_after = [r["version"] for r in client.get(f"{base}/drafts", headers=auth).json()]
+        print(f"\n3) rejected gateway output       -> HTTP {rejected.status_code} ({rejected.json()['error']['message']})")
+        print(f"4) capability disabled           -> HTTP {disabled.status_code} ({disabled.json()['error']['message']})")
+        print(f"   draft versions after denials  -> {versions_after} (unchanged; denials stage nothing)")
+
+        out = {
+            "grounded_fields": sorted(grounded_fields),
+            "dropped": dropped,
+            "draft": {
+                "version": body.get("version"), "status": body.get("status"),
+                "value_proposition": body.get("valueProposition"),
+                "business_type": body.get("businessType"),
+                "products": body.get("products"), "unknowns": body.get("unknowns"),
+            },
+            "overall_confidence": grounding.get("overallConfidence"),
+            "held_for_review": grounding.get("heldForReview"),
+            "confirmed": confirmed["confirmed"],
+            "rejected_status": rejected.status_code,
+            "disabled_status": disabled.status_code,
+            "versions_after_denials": versions_after,
+        }
+    finally:
+        app.state.engine.dispose()
+
+    checks = {
+        "only_grounded_kept": out["grounded_fields"] == ["business_type", "value_proposition"],
+        "hallucinated_dropped": out["dropped"].get("products") == "citation_not_in_source",
+        "unrelated_field_dropped": out["dropped"].get("cin") == "field_not_permitted",
+        "unknown_null_dropped": out["dropped"].get("gstin") == "unknown_fact_null",
+        "draft_not_confirmed": out["confirmed"] is False and out["draft"]["status"] == "draft",
+        "held_for_review": out["held_for_review"] is True,
+        "rejected_stages_nothing": out["rejected_status"] == 502,
+        "disabled_stages_nothing": out["disabled_status"] == 503,
+        "only_one_version": out["versions_after_denials"] == [1],
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; fixture transport — no network, no model, NO spend. DCA-134 drafts a "
+        "business profile from authorised evidence through the one DCA AI chokepoint: each model claim "
+        "must CITE a span the DCA re-grounds (DCA-133) before it is kept; invented/hallucinated/"
+        "unrelated/unknown claims are DROPPED and never written; the output stays a reviewable DRAFT "
+        "with its uncertainty + references and is NEVER auto-confirmed; a rejected gateway output or a "
+        "disabled capability stages nothing.)"
+    )
+    return {"checks": checks, **out}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

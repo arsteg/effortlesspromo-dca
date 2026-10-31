@@ -109,6 +109,19 @@ CAPABILITY_CONTEXT_ALLOWLIST: dict[str, frozenset[str]] = {
             "provenance",
         }
     ),
+    # DCA-134 — the trusted context for business-profile drafting is ONLY the business's own identity +
+    # the refs/field-hints that steer the draft. The authorised website / Brand-KB evidence BODIES never
+    # ride here: they go to the untrusted channel (DCA-132), so no raw evidence text is ever egressed as
+    # trusted instruction context.
+    "business_profile_draft": frozenset(
+        {
+            "businessName",
+            "domain",
+            # refs the model may cite (bodies are untrusted) + which aspects to draft
+            "evidenceRefs",
+            "draftFields",
+        }
+    ),
 }
 
 # The serialized-size bound for a minimized context (characters of its canonical JSON). Matches the AI

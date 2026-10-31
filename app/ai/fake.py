@@ -40,6 +40,12 @@ class FakeAiGatewayTransport:
     - ``mismatch_capability`` — reply with a DIFFERENT ``capability`` (mismatched response → fail closed).
     - ``drop_fields`` — omit required envelope fields (an incompatible schema → fail closed).
     - ``fail`` — reply with a body-level ``status=failed`` + error (a legitimate outcome, returned as data).
+    - ``structured_output`` — the ``structuredOutput`` to return on a completed envelope (default: an
+      obviously-synthetic stub). A capability-specific contract test (e.g. DCA-134 business-profile
+      drafting) supplies a realistic, schema-shaped payload so the DCA consumer is exercised against the
+      actual output shape rather than an empty stub — the gateway still owns the real schema/validation.
+    - ``validation`` — envelope validation/taint/injection/human-review flags to merge in, so a test can
+      drive the DCA boundary's hold/reject dispositions deterministically without a real gateway.
 
     ``enabled`` defaults True so dev/test can drive the facade; ``synthetic`` is read by the facade to
     flag every result as a fixture answer.
@@ -56,6 +62,8 @@ class FakeAiGatewayTransport:
         drop_fields: tuple[str, ...] = (),
         fail: bool = False,
         version: str = SYNTHETIC_VERSION,
+        structured_output: dict[str, Any] | None = None,
+        validation: dict[str, Any] | None = None,
     ) -> None:
         self._enabled = enabled
         self._mismatch_job_id = mismatch_job_id
@@ -63,6 +71,8 @@ class FakeAiGatewayTransport:
         self._drop_fields = drop_fields
         self._fail = fail
         self._version = version
+        self._structured_output = structured_output
+        self._validation = validation or {}
         self.calls: list[dict[str, Any]] = []  # every call recorded for inspection (never a send)
 
     @property
@@ -103,7 +113,11 @@ class FakeAiGatewayTransport:
             "status": "failed" if self._fail else "completed",
             "structuredOutput": None
             if self._fail
-            else {"synthetic": True, "capability": capability},
+            else (
+                self._structured_output
+                if self._structured_output is not None
+                else {"synthetic": True, "capability": capability}
+            ),
             "confidence": None if self._fail else 0.99,
             "modelProvider": self._version,
             "modelId": "stub-model",
@@ -128,6 +142,9 @@ class FakeAiGatewayTransport:
                 "message": "fixture transport failure",
                 "retryable": False,
             }
+        # Merge any test-supplied validation/taint/human-review flags so the DCA boundary's hold/reject
+        # dispositions can be driven deterministically (e.g. untrusted evidence → humanReviewRequired).
+        envelope.update(self._validation)
         for field in self._drop_fields:
             envelope.pop(field, None)
         return envelope

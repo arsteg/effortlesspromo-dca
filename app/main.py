@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.ai import AiContractDisabled, build_ai_capability_facade
 from app.api.idempotency import install_idempotency
 from app.api.routes import (
     activation_references,
@@ -123,6 +124,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # when the contract is disabled — production, until the live adapter ships — so propagation fails
     # closed rather than acknowledging against a synthetic destination).
     app.state.deletion_destination_client = build_deletion_destination_client(settings)
+    # DCA-134: the single DCA AI-capability facade used to draft a business profile from evidence
+    # (the dev/test fixture transport when AI is off; the live gateway only when configured). None in
+    # production when no gateway is configured — AI-dependent drafting then fails closed.
+    try:
+        app.state.ai_capability_facade = build_ai_capability_facade(settings)
+    except AiContractDisabled:
+        app.state.ai_capability_facade = None
     # DCA-012: resolve/publish the per-request correlation id (reaches endpoints, handlers, logs).
     app.add_middleware(CorrelationIdMiddleware)
     # DCA-011: one standardized error envelope + correlation id for every error response.

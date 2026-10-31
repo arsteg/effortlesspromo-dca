@@ -55,12 +55,14 @@ DCA_JOB_ID_PREFIX = "dca:"
 # The capabilities the DCA facade is permitted to REQUEST from the gateway. This is a fail-closed
 # allowlist, NOT a capability registry: it carries no schema, prompt, or routing — those live in the
 # effortlesspromo-ai gateway. Only a key listed here may be requested; everything else fails closed as
-# unknown. It is intentionally narrow (future capabilities stay disabled): the only entry is the one a
-# through-DCA-127 accepted story already references — the licensed-provider organization fetch
-# (``contact_research``, app/sources/licensed_provider.py, whose live paid call is itself disabled). A
-# later AI-capability story adds its reviewed key here; listing a key only permits REQUESTING it and
-# never enables a live/paid call (that stays gated on the transport being configured — off by default).
-KNOWN_CAPABILITIES: frozenset[str] = frozenset({"contact_research"})
+# unknown. It is intentionally narrow (future capabilities stay disabled): the entries are the ones a
+# through-DCA-134 accepted story already references — the licensed-provider organization fetch
+# (``contact_research``, app/sources/licensed_provider.py, whose live paid call is itself disabled) and
+# the DCA-134 business-profile drafting capability (``business_profile_draft``,
+# app/services/profile_drafter.py — a draft-only, evidence-grounded capability). A later AI-capability
+# story adds its reviewed key here; listing a key only permits REQUESTING it and never enables a
+# live/paid call (that stays gated on the transport being configured — off by default).
+KNOWN_CAPABILITIES: frozenset[str] = frozenset({"contact_research", "business_profile_draft"})
 
 # Terminal envelope statuses the DCA understands. Anything else is an incompatible contract extension.
 _COMPLETED = "completed"
