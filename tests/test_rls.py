@@ -83,6 +83,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "website_fact_extractions",
         "licensed_provider_fetches",
         "contact_imports",
+        "source_result_cache",
     }
 
 
@@ -648,6 +649,57 @@ def test_host_crawl_state_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_CRAWL_STATE, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_CACHE = (
+    "INSERT INTO source_result_cache "
+    "(id, business_id, source_key, source_version, operation, field_key, purpose, cache_key, "
+    "negative, result_kind, result_ref, result_digest, result_payload, retention_mode, "
+    "retention_reason, rights_basis, fetched_at, fresh_until, schema_version, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 'synthetic_source', 1, 'collect', '', 'prospecting', "
+    "'cache-key-1', false, 'org_profile', 'ref://x', 'digest-x', '{}', 'raw_retained', '', "
+    "'approved_source:synthetic_source/collect/prospecting', now(), now() + interval '1 day', 1, now())"
+)
+
+
+@requires_pg
+def test_source_result_cache_is_tenant_isolated(rls_db):
+    """DCA-127 — a cache entry is tenant-owned: each tenant can read only its OWN cached results (RLS on
+    real Postgres), so one business can never read another's cached source result (the same cache_key
+    recurs per tenant, each bound to that tenant's own entitlement)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_CACHE, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_CACHE, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM source_result_cache").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM source_result_cache").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_source_result_cache_write_check_rejects_foreign_owner(rls_db):
+    """A cache entry can never be stamped for another tenant: writing a B-owned row while scoped to A
+    violates the WITH CHECK clause (defence-in-depth beneath the cache's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_CACHE, (B,))
         conn.rollback()
     finally:
         conn.close()

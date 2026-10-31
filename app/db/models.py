@@ -2768,6 +2768,109 @@ class EvidenceObject(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class SourceResultCacheEntry(TenantOwned, Base):
+    """DCA-127 — a cache of ONE source-fetch result, keyed so it can only serve an entitled, fresh,
+    same-terms-version result to its owning business (tenant-owned, RLS-protected).
+
+    One row caches the result of ONE logical source fetch (the organization/field/license-aware result a
+    source adapter would produce) so a repeat request does not re-fetch. The single sanctioned writer /
+    reader (:class:`~app.services.source_result_cache.SourceResultCache`) makes the cache SAFE in three
+    load-bearing ways, which together are the DCA-127 acceptance criterion:
+
+    - **A hit can never exceed current entitlement or survive source revocation.** Entitlement is
+      rechecked on the READ, not trusted from the WRITE: a lookup re-runs the DCA-048 rights gate
+      (source approved+ENABLED, in-force platform ceiling, the business's enabled entitlement, the
+      purpose) at the moment of the read, so a business that is no longer entitled — or whose source
+      approval was revoked — gets a MISS, never another result. The entry is pinned to the terms
+      ``source_version`` it was cached under, and a read resolves the CURRENT in-force terms version; a
+      newer approved version makes the old entry unreachable (a miss), so a hit can never serve a result
+      the current entitlement would not grant.
+    - **A stale/expired entry is a miss, never served.** ``fresh_until`` is the freshness deadline
+      derived from the source's cited terms (its retention/freshness window), bounded by a configured
+      maximum; a read at/after ``fresh_until`` is a MISS. Negative (no-result) entries carry a BOUNDED
+      negative TTL and expire the same way, so a transient "nothing found" is never cached forever.
+    - **Writes respect retention (no-retention ⇒ only a ref/digest).** The retention ``mode`` is DERIVED
+      from the cited terms at write time (the same DCA-062 screen): when raw retention is prohibited the
+      result ``payload`` is left ``NULL`` and never written, while the locator ``result_ref`` and the
+      non-reversible ``result_digest`` ARE kept — so even a cache hit on a no-retention source serves
+      only a reference, never a prohibited raw copy.
+
+    **Cross-entitlement isolation.** The entry is owned by exactly one ``business_id`` and read only
+    within it (DCA-017/018), so one business can never read another's cached result — the same
+    ``cache_key`` legitimately recurs across tenants, each bound to that tenant's own entitlement. The
+    rights recheck + terms-version pin are a second, in-tenant guard on top of RLS.
+
+    **Idempotent put.** ``(business_id, source_key, source_version, cache_key)`` is unique: a re-put with
+    the same key finds the existing entry and is a no-op (no duplicate, no second audit), so caching is
+    replay-safe. The cache stores and serves PROVIDED results only — it performs no fetch, so paid/live
+    acquisition stays a disabled future capability.
+    """
+
+    __tablename__ = "source_result_cache"
+    # One cache entry per logical request WITHIN a business and terms version — the idempotency key that
+    # makes a re-put a no-op. source_version is part of the key so a result cached under a newer approved
+    # terms version is a DISTINCT row (the old one is never overwritten and never served once superseded).
+    __table_args__ = (
+        tenant_unique(
+            "source_key", "source_version", "cache_key", name="uq_source_result_cache_entry"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The catalog Source (DCA-044) the result was fetched under — the rights-gated source key.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The SourceTerms version (DCA-045) the result was fetched/cached under. A read pins the CURRENT
+    # in-force version, so an entry cached under a superseded version is unreachable (the entitlement +
+    # terms-version binding that stops a hit exceeding current entitlement).
+    source_version: Mapped[int] = mapped_column(Integer)
+    # The SourceOperation the result was fetched under (e.g. "collect") — rechecked on read against the
+    # business's current entitlement, so a hit can never exceed the current per-operation grant.
+    operation: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # The specific field the right is checked on ("" = the source-wide grant) — part of the rights recheck.
+    field_key: Mapped[str] = mapped_column(String(200), default="", server_default="", index=True)
+    # The purpose the fetch served (rights are purpose-bound; rechecked on read).
+    purpose: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    # The caller's opaque request fingerprint — the per-(business, source, version) dedup/idempotency key.
+    cache_key: Mapped[str] = mapped_column(String(200), index=True)
+    # True for a NEGATIVE (no-result) cache entry: the source was consulted and returned nothing. It
+    # carries a BOUNDED negative TTL via fresh_until and holds no payload.
+    negative: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa_false(), nullable=False
+    )
+    # A short descriptive kind of the cached result (e.g. "org_profile"); the retention screen keys the
+    # per-kind store override off it, mirroring DCA-062.
+    result_kind: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True)
+    # The locator/reference for the result — ALWAYS kept (both modes), so a no-retention entry is still
+    # traceable from its reference alone.
+    result_ref: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    # A non-reversible SHA-256 (hex) of the cached result bytes — ALWAYS kept (both modes), so a result
+    # can be verified / matched without retaining the raw payload.
+    result_digest: Mapped[str] = mapped_column(
+        String(64), default="", server_default="", index=True
+    )
+    # The cached result payload — kept ONLY when the licence permits raw retention; NULL (never written)
+    # for a REFERENCE_ONLY (no-retention) entry and for a negative entry. Potentially business data:
+    # RLS-protected, never audited.
+    result_payload: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # raw_retained | reference_only — DERIVED from the source terms at write time (EvidenceRetentionMode),
+    # never caller-chosen (the DCA-062 license-aware retention screen).
+    retention_mode: Mapped[str] = mapped_column(String(16), index=True)
+    # A stable code recording WHY the payload was dropped (store_not_permitted / no_retention_policy /
+    # zero_retention_window), or "" when the payload was retained. Auditable why-reference-only.
+    retention_reason: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The recorded rights/retention basis for the cached result (provenance, not an authorization).
+    rights_basis: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    # When the result was fetched from the source (freshness is measured from here).
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The freshness deadline: a read at/after this moment is STALE and MISSES (and is never served). It
+    # is derived from the source's cited terms window, bounded by a configured maximum (positive entries)
+    # or the configured bounded negative TTL (negative entries) — so an entry can never be served forever.
+    fresh_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    # The version of the cache-entry contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class FieldCorrection(TenantOwned, Base):
     """DCA-070 — an authorized user's correction of a field value, VERSIONED (tenant-owned, RLS).
 

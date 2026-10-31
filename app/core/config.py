@@ -238,6 +238,18 @@ class Settings(BaseSettings):
         "application/ld+json",
     ]
 
+    # --- source-result cache (DCA-127) — bounded freshness; serves PROVIDED results only ---
+    # The cache for source-fetch results only serves a result that is still FRESH per the source's cited
+    # terms. These bound how long a cached result may be served (never unbounded, validated positive at
+    # boot): the DEFAULT positive freshness used when the cited terms set no retention/freshness window;
+    # a HARD MAXIMUM that clamps every positive entry (even one whose terms window is longer); and the
+    # BOUNDED negative-result TTL so a transient "nothing found" expires rather than being cached forever.
+    # The cache stores/serves provided results only — it performs no fetch, so paid/live acquisition stays
+    # disabled.
+    source_result_cache_default_fresh_seconds: int = 86400  # 24h default positive freshness
+    source_result_cache_max_fresh_seconds: int = 2592000  # 30d hard cap on any positive entry
+    source_result_cache_negative_ttl_seconds: int = 3600  # 1h bounded negative-result TTL
+
     # --- scope guards ---
     allowed_countries: list[str] = ["IN"]  # India-only build (DCA story boundary)
     candidate_ttl_days: int = 30
@@ -571,6 +583,22 @@ def validate_required(settings: Settings) -> None:
     if settings.retrieval_max_decompression_ratio <= 1:
         raise RuntimeError(
             "EFFORTLESSPROMO_DCA_RETRIEVAL_MAX_DECOMPRESSION_RATIO must be greater than 1"
+        )
+
+    # DCA-127: the source-result cache freshness bounds must be genuinely bounded. A non-positive value
+    # would make a cached result immediately stale (disabling the cache) or — were it unbounded — let a
+    # stale result be served forever. Fail fast, naming only the offending key.
+    if settings.source_result_cache_default_fresh_seconds <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_SOURCE_RESULT_CACHE_DEFAULT_FRESH_SECONDS must be positive"
+        )
+    if settings.source_result_cache_max_fresh_seconds <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_SOURCE_RESULT_CACHE_MAX_FRESH_SECONDS must be positive"
+        )
+    if settings.source_result_cache_negative_ttl_seconds <= 0:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_SOURCE_RESULT_CACHE_NEGATIVE_TTL_SECONDS must be positive"
         )
 
     if settings.is_production:

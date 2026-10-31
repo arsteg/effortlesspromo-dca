@@ -20570,6 +20570,346 @@ def _dca_126(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-127",
+    "cache only entitled, fresh source results: a cached source-fetch result is served ONLY to the "
+    "business still entitled to it (rights rechecked on READ), only while it is still FRESH (per the "
+    "source's cited terms, bounded), and only for the CURRENT in-force terms version. A stale/expired or "
+    "revoked/de-entitled entry is a MISS (never served); negative results carry a bounded TTL and expire; "
+    "a no-retention source caches only a reference + digest (mirroring DCA-062); the put is idempotent; "
+    "and one business can never read another's cached result. The cache serves PROVIDED results only — no "
+    "fetch, so paid/live acquisition stays disabled.",
+)
+def _dca_127(ctx: CheckContext) -> dict:
+    """Drive the real DCA-127 source-result cache against a disposable DB with isolated synthetic
+    Businesses A/B and PRINT the REAL cache hit / stale-miss / revoked-miss / version-pin miss /
+    cross-tenant miss / no-retention reference-only hit / negative-expiry outcomes — never a bare PASS.
+    No network, no socket, no fetch: the cache stores and serves PROVIDED results only. In the running
+    service no source is ever ENABLED, so a cache read denies at the rights gate (here we synthetically
+    enable one source so the hit branch is reachable)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import Source, SourceResultCacheEntry, SourceStatus
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_result_cache import CacheResultInput, SourceResultCache
+    from app.services.source_revocation import RevokerPrincipal, SourceRevocationStore
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0127", type=ActorType.USER)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0127", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    revoker = RevokerPrincipal(subject="op-001", roles=("platform_operator",))
+    payload = {"legal_name": "Synthetic Cache Target Pvt Ltd", "industry": "Information Technology"}
+
+    def _catalogue_approve_enable(key: str, *, store: bool) -> None:
+        with ctx.session_factory() as session:
+            SourceCatalogStore(session).create_draft(
+                SourceDraftInput(
+                    key=key,
+                    kind="commercial",
+                    access_method="api",
+                    name="Synthetic Cache Source",
+                    trust_tier="licensed_provider",
+                    india_coverage={"nationwide": True},
+                )
+            )
+            SourceTermsStore(session).add_version(
+                SourceTermsInput(
+                    source_key=key,
+                    operations={"collect": True, "store": store},
+                    purposes=["prospecting"],
+                    contract_evidence={"reference": "LICENSE-2026", "kind": "data_license"},
+                )
+            )
+            SourceApprovalStore(session).approve(
+                key,
+                1,
+                SourceApprovalReview(
+                    reviewer_id="op-001",
+                    evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                    reviewed_at=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                ),
+                operator,
+            )
+            src = session.query(Source).filter(Source.key == key).one()
+            src.status = SourceStatus.ENABLED.value
+            src.enabled = True
+            BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+                BusinessSourceEntitlementInput(
+                    source_key=key,
+                    enabled=True,
+                    operations={"collect": True},
+                    purposes=["prospecting"],
+                ),
+                admin,
+                now=now,
+            )
+            session.commit()
+
+    def _put(key: str, cache_key: str, *, negative: bool = False) -> None:
+        with ctx.session_factory() as session:
+            SourceResultCache(session, BUSINESS_A, settings=ctx.settings).put(
+                CacheResultInput(
+                    source_key=key,
+                    source_version=1,
+                    purpose="prospecting",
+                    cache_key=cache_key,
+                    fetched_at=now,
+                    operation="collect",
+                    payload=None if negative else dict(payload),
+                    negative=negative,
+                    result_kind="org_profile",
+                    result_ref=f"cache://{key}/{cache_key}",
+                ),
+                actor,
+                now=now,
+            )
+            session.commit()
+
+    out: dict = {}
+
+    # --- A) a positive, retained source (store granted) ---
+    key_a = "synthetic_cache_source"
+    _catalogue_approve_enable(key_a, store=True)
+    _put(key_a, "req-1")
+
+    # 1) fresh entitled HIT — the retained payload is served.
+    with ctx.session_factory() as session:
+        hit = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_a, "collect", "prospecting", "req-1", now=now
+        )
+        out["fresh_hit"] = {
+            "hit": hit.hit,
+            "payload": hit.payload,
+            "mode": hit.retention_mode,
+            "version": hit.source_version,
+        }
+
+    # 2) STALE miss — a read past the freshness window returns nothing.
+    with ctx.session_factory() as session:
+        stale = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_a, "collect", "prospecting", "req-1", now=now + timedelta(days=2)
+        )
+        out["stale_miss"] = {"hit": stale.hit, "reason": stale.reason, "phase": stale.phase}
+
+    # 3) CROSS-TENANT miss — B (also entitled) cannot read A's cached result.
+    with ctx.session_factory() as session:
+        BusinessSourceEntitlementStore(session, BUSINESS_B).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=key_a,
+                enabled=True,
+                operations={"collect": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        b = SourceResultCache(session, BUSINESS_B, settings=ctx.settings).get(
+            key_a, "collect", "prospecting", "req-1", now=now
+        )
+        b_rows = SourceResultCache(session, BUSINESS_B, settings=ctx.settings).entries_for(key_a)
+        out["cross_tenant_miss"] = {"hit": b.hit, "reason": b.reason, "b_rows": len(b_rows)}
+
+    # 4) VERSION-PIN miss — a newer approved terms version makes the v1 entry unreachable.
+    with ctx.session_factory() as session:
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=key_a,
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "LICENSE-2026b", "kind": "data_license"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            key_a,
+            2,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-12", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        pinned = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_a, "collect", "prospecting", "req-1", now=now
+        )
+        out["version_pin_miss"] = {
+            "hit": pinned.hit,
+            "reason": pinned.reason,
+            "phase": pinned.phase,
+        }
+
+    # 5) REVOKED miss — revoking the platform approval pulls the right; the hit becomes a miss.
+    #    (Both approvals revoked so no in-force ceiling remains.)
+    with ctx.session_factory() as session:
+        store = SourceRevocationStore(session)
+        store.revoke(key_a, 2, revoker, reason="rights_withdrawn", now=now)
+        store.revoke(key_a, 1, revoker, reason="rights_withdrawn", now=now)
+        session.commit()
+    with ctx.session_factory() as session:
+        revoked = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_a, "collect", "prospecting", "req-1", now=now
+        )
+        out["revoked_miss"] = {
+            "hit": revoked.hit,
+            "reason": revoked.reason,
+            "phase": revoked.phase,
+        }
+
+    # --- B) a no-retention source (store WITHHELD) + a negative entry ---
+    key_b = "synthetic_cache_no_retention"
+    _catalogue_approve_enable(key_b, store=False)
+    _put(key_b, "req-ref")
+    _put(key_b, "neg-1", negative=True)
+
+    # 6) no-retention HIT — only a reference + digest are kept/served, never the raw payload.
+    with ctx.session_factory() as session:
+        ref = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_b, "collect", "prospecting", "req-ref", now=now
+        )
+        row = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).entry_for(
+            key_b, 1, "req-ref"
+        )
+        assert row is not None  # just written above
+        out["no_retention_hit"] = {
+            "hit": ref.hit,
+            "mode": ref.retention_mode,
+            "payload": ref.payload,
+            "ref": ref.result_ref,
+            "stored_payload_is_none": row.result_payload is None,
+            "digest_kept": bool(row.result_digest),
+        }
+
+    # 7) NEGATIVE entry — a cached "no result" that is bounded and expires.
+    with ctx.session_factory() as session:
+        neg = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_b, "collect", "prospecting", "neg-1", now=now + timedelta(minutes=30)
+        )
+        neg_expired = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).get(
+            key_b, "collect", "prospecting", "neg-1", now=now + timedelta(hours=2)
+        )
+        out["negative"] = {
+            "hit_within_ttl": neg.hit,
+            "is_negative": neg.negative,
+            "expired_after_ttl": neg_expired.hit,
+            "expired_reason": neg_expired.reason,
+        }
+
+    # 8) IDEMPOTENT put — a re-put under the same key is a no-op (one row).
+    with ctx.session_factory() as session:
+        first = SourceResultCache(session, BUSINESS_A, settings=ctx.settings).entry_for(
+            key_a, 1, "req-1"
+        )
+        SourceResultCache(session, BUSINESS_A, settings=ctx.settings).put(
+            CacheResultInput(
+                source_key=key_a,
+                source_version=1,
+                purpose="prospecting",
+                cache_key="req-1",
+                fetched_at=now,
+                operation="collect",
+                payload=dict(payload),
+                result_kind="org_profile",
+                result_ref=f"cache://{key_a}/req-1",
+            ),
+            actor,
+            now=now,
+        )
+        rows = (
+            session.query(SourceResultCacheEntry)
+            .filter(
+                SourceResultCacheEntry.business_id == BUSINESS_A,
+                SourceResultCacheEntry.source_key == key_a,
+                SourceResultCacheEntry.cache_key == "req-1",
+            )
+            .count()
+        )
+        session.rollback()
+        out["idempotent_put"] = {"rows_for_key": rows, "first_existed": first is not None}
+
+    fh = out["fresh_hit"]
+    print("\n1) FRESH entitled HIT — the retained result is served from cache:")
+    print(f"   hit={fh['hit']} mode={fh['mode']} version={fh['version']} payload={fh['payload']}")
+    sm = out["stale_miss"]
+    print("\n2) STALE miss — a read past the freshness window serves nothing:")
+    print(f"   hit={sm['hit']} reason={sm['reason']} phase={sm['phase']}")
+    ct = out["cross_tenant_miss"]
+    print("\n3) CROSS-TENANT miss — Business B cannot read A's cached result (same cache_key):")
+    print(f"   hit={ct['hit']} reason={ct['reason']} B_rows_visible={ct['b_rows']}")
+    vp = out["version_pin_miss"]
+    print("\n4) VERSION-PIN miss — a newer approved terms version makes the v1 entry unreachable:")
+    print(f"   hit={vp['hit']} reason={vp['reason']} phase={vp['phase']}")
+    rm = out["revoked_miss"]
+    print("\n5) REVOKED miss - revoking the platform approval pulls the right (hit -> miss):")
+    print(f"   hit={rm['hit']} reason={rm['reason']} phase={rm['phase']}")
+    nr = out["no_retention_hit"]
+    print("\n6) NO-RETENTION HIT — only a reference + digest are kept/served (DCA-062 mirror):")
+    print(f"   hit={nr['hit']} mode={nr['mode']} served_payload={nr['payload']} ref={nr['ref']}")
+    print(
+        f"   stored_payload_is_none={nr['stored_payload_is_none']} digest_kept={nr['digest_kept']}"
+    )
+    ng = out["negative"]
+    print("\n7) NEGATIVE entry — a bounded cached 'no result' that expires:")
+    print(
+        f"   hit_within_ttl={ng['hit_within_ttl']} is_negative={ng['is_negative']} "
+        f"expired_after_ttl={ng['expired_after_ttl']} expired_reason={ng['expired_reason']}"
+    )
+    ip = out["idempotent_put"]
+    print("\n8) IDEMPOTENT put — a re-put under the same key is a no-op:")
+    print(f"   rows_for_key={ip['rows_for_key']} (one row, no duplicate)")
+
+    checks = {
+        "fresh_entitled_hit_serves_payload": fh["hit"] is True and fh["payload"] == payload,
+        "stale_entry_is_a_miss": sm["hit"] is False and sm["reason"] == "stale_or_expired",
+        "cross_tenant_cannot_read": ct["hit"] is False and ct["b_rows"] == 0,
+        "version_pin_blocks_old_entry": vp["hit"] is False and vp["reason"] == "not_cached",
+        "revocation_turns_hit_into_miss": rm["hit"] is False and rm["phase"] == "rights",
+        "no_retention_keeps_only_reference": nr["hit"] is True
+        and nr["payload"] is None
+        and nr["mode"] == "reference_only"
+        and nr["stored_payload_is_none"] is True
+        and nr["digest_kept"] is True,
+        "negative_is_bounded_and_expires": ng["hit_within_ttl"] is True
+        and ng["is_negative"] is True
+        and ng["expired_after_ttl"] is False,
+        "put_is_idempotent": ip["rows_for_key"] == 1,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no socket, no fetch. DCA-127 caches source-fetch results "
+        "SAFELY: a hit is served only to a business still ENTITLED (rights rechecked on READ, so a lost "
+        "entitlement or revoked/expired approval is a miss), only for the CURRENT in-force terms version "
+        "(a newer version makes an old entry unreachable), and only while FRESH per the source's cited "
+        "terms (a stale entry — and a bounded negative entry past its TTL — is a miss, never served). A "
+        "no-retention source caches only a reference + digest (mirroring DCA-062), so a hit never serves a "
+        "prohibited raw copy. The put is idempotent, and one business can never read another's cached "
+        "result. The cache serves PROVIDED results only — it performs no fetch, so paid/live acquisition "
+        "stays a disabled future capability.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

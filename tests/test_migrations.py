@@ -76,6 +76,7 @@ DCA_TABLES = {
     "website_fact_extractions",
     "licensed_provider_fetches",
     "contact_imports",
+    "source_result_cache",
 }
 
 
@@ -2228,6 +2229,51 @@ def test_0052_creates_contact_imports_on_a_preexisting_database(clean_schema):
         ).first()
     eng.dispose()
     assert "uq_contact_import_row" in uniques  # one provenance row per (tenant, dataset, row)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0053_creates_source_result_cache_on_a_preexisting_database(clean_schema):
+    """DCA-127 — the 0053 create branch (for a DB migrated before ``source_result_cache`` existed).
+
+    ``source_result_cache`` is tenant-owned (RLS-protected), like ``contact_imports`` (0052). A fresh DB
+    gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0053 is a no-op
+    there. To exercise 0053's real job, upgrade to head, drop the table + policy, stamp history back to
+    0052, then upgrade to head again — 0053 must recreate the table (with its per-tenant
+    (source_key, source_version, cache_key) constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "source_result_cache" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0052_contact_imports")  # pretend we predate the cache table
+    command.upgrade(cfg, "head")  # 0053 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "source_result_cache" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("source_result_cache", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'source_result_cache' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_source_result_cache_entry" in uniques
+    )  # one entry per (tenant, source, version, cache_key)
     assert policy is not None  # RLS re-established, not just the bare table
 
 
