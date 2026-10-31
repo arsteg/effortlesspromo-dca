@@ -22764,6 +22764,180 @@ def _dca_136(ctx: CheckContext) -> dict:
     return {"checks": checks, **out}
 
 
+@register(
+    "DCA-137",
+    "SUGGEST ambiguous identity matches through the DCA AI chokepoint — feeding, NEVER replacing, the "
+    "deterministic DCA-067/068 matchers. The AI proposes candidate PAIRS as REVIEW-only suggestions; the "
+    "DCA re-runs its own deterministic matcher over every pair and keeps only the ones NOT refuted. A "
+    "confident AI proposal over a CONFLICTING typed-identifier pair is DROPPED (an AI suggestion can "
+    "never override a NO_MATCH); a suggestion is review-only and NEVER executes a merge (the DCA-071 "
+    "merge refuses an AI actor); nothing is cross-tenant. Fixture transport only (no network/model/spend).",
+)
+def _dca_137(ctx: CheckContext) -> dict:
+    """Drive the real DCA-137 ambiguous identity-match suggester against a disposable DB with isolated
+    synthetic Business A, using the deterministic fixture transport (no network/model/spend) wired to
+    PROPOSE two candidate pairs: an AMBIGUOUS same-name pair (no conflicting identifier) and a same-name
+    pair with DIFFERENT legal-entity CINs. PRINT, per AI proposal, the deterministic re-match verdict and
+    whether it became a REVIEW suggestion or was DROPPED, then show that NO merge was executed and that
+    the DCA-071 merge refuses an AI actor — so a human sees review-only vs refuted, not a bare PASS."""
+    from datetime import UTC, datetime
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import IdentityMatchSuggestion, IdentityMerge
+    from app.services.identity_match_suggester import suggest_identity_matches
+    from app.services.identity_merge import (
+        IdentityMergeAuthorizationError,
+        IdentityMergeInput,
+        IdentityMergeStore,
+        IdentityReviewer,
+    )
+    from app.services.org_observation import ExternalIdInput, ObservationInput, OrgObservationStore
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0137", type=ActorType.USER)
+    cin_one = "U17120MH2026PTC900099"
+    cin_two = "U17120MH2026PTC900100"  # a DIFFERENT valid legal-entity CIN → deterministic NO_MATCH
+
+    def _org(session, name: str, *, cin: str | None = None, state: str = "") -> str:
+        external = [ExternalIdInput(scheme="cin", value=cin)] if cin else []
+        obs = OrgObservationStore(session, biz_a).create(
+            ObservationInput(
+                entity_type="legal_entity", display_name=name, state_code=state, external_ids=external
+            ),
+            actor=actor,
+            now=now,
+        )
+        session.flush()
+        return obs.id
+
+    # 1) Seed four organization observations: an ambiguous same-name pair (no identifiers) and a same-name
+    #    pair with conflicting CINs. All in Business A (tenant-scoped).
+    with ctx.session_factory() as session:
+        amb_a = _org(session, "Acme Textiles Private Limited", state="MH")
+        amb_b = _org(session, "Acme Textiles Private Limited", state="KA")
+        conf_a = _org(session, "Globex Industries Private Limited", cin=cin_one, state="MH")
+        conf_b = _org(session, "Globex Industries Private Limited", cin=cin_two, state="MH")
+        session.commit()
+
+    from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
+
+    proposals = [
+        {"subjectAId": amb_a, "subjectBId": amb_b, "confidence": 0.78, "rationale": "same company name"},
+        {"subjectAId": conf_a, "subjectBId": conf_b, "confidence": 0.95, "rationale": "same company name"},
+    ]
+    facade = AiCapabilityFacade(
+        FakeAiGatewayTransport(structured_output={"suggestions": proposals, "confidence": 0.8})
+    )
+
+    print("\norganization observations in synthetic Business A (the authorized candidates):")
+    print(f"  ambiguous pair (no conflicting id): {amb_a}  &  {amb_b}  (name='Acme Textiles Private Limited')")
+    print(
+        f"  conflicting-CIN pair:               {conf_a}  &  {conf_b}  "
+        f"(name='Globex Industries Private Limited', CIN {cin_one} vs {cin_two})"
+    )
+    print("\nAI proposals (fixture transport — no network/model/spend) and the DCA's deterministic re-match:")
+
+    out: dict = {}
+    with ctx.session_factory() as session:
+        result = suggest_identity_matches(
+            session,
+            facade,
+            biz_a,
+            candidate_ids=[amb_a, amb_b, conf_a, conf_b],
+            invocation_key="dca137:manual",
+            now=now,
+        )
+        kept_pairs = {frozenset((s.subject_a_id, s.subject_b_id)): s for s in result.suggestions}
+        dropped = {
+            frozenset((str(e.get("subjectAId")), str(e.get("subjectBId")))): e
+            for e in result.excluded
+            if e.get("subjectAId") and e.get("subjectBId")
+        }
+        for p in proposals:
+            pair = frozenset((str(p["subjectAId"]), str(p["subjectBId"])))
+            if pair in kept_pairs:
+                s = kept_pairs[pair]
+                print(
+                    f"  PROPOSED {p['subjectAId']} & {p['subjectBId']} (ai_conf={p['confidence']}) "
+                    f"-> deterministic '{s.match_outcome}' => REVIEW SUGGESTION (status={s.status!r})"
+                )
+            else:
+                e = dropped.get(pair, {})
+                print(
+                    f"  PROPOSED {p['subjectAId']} & {p['subjectBId']} (ai_conf={p['confidence']}) "
+                    f"-> deterministic '{e.get('detail','?')}' => DROPPED ({e.get('reason','?')}) "
+                    "— an AI suggestion cannot override a NO_MATCH"
+                )
+        session.commit()  # persist the review-only suggestion (the caller owns the unit of work)
+        merges_after_suggest = session.query(IdentityMerge).count()
+
+    # Attempt to execute a merge on the review suggestion with an AI/automation actor — refused.
+    ai_refused = None
+    with ctx.session_factory() as session:
+        ai_reviewer = IdentityReviewer(
+            subject="ai-bot", roles=("admin",), actor_type=ActorType.SERVICE.value
+        )
+        try:
+            IdentityMergeStore(session, biz_a).merge(
+                IdentityMergeInput(
+                    subject_type="organization",
+                    primary_subject_id=amb_a,
+                    duplicate_subject_id=amb_b,
+                ),
+                ai_reviewer,
+            )
+        except IdentityMergeAuthorizationError as exc:
+            ai_refused = exc.code
+        session.rollback()
+
+    with ctx.session_factory() as session:
+        suggestion_count = session.query(IdentityMatchSuggestion).count()
+
+    print(
+        f"\nstored review suggestions: {suggestion_count}  "
+        f"(merges recorded by suggesting: {merges_after_suggest})"
+    )
+    print(
+        f"AI actor attempting to EXECUTE a merge on the suggestion -> refused with {ai_refused!r} "
+        "(a suggestion can never execute a merge)"
+    )
+
+    out = {
+        "suggested_pairs": [sorted(list(p)) for p in kept_pairs],
+        "dropped": [
+            {"pair": sorted([e["subjectAId"], e["subjectBId"]]), "reason": e["reason"], "detail": e.get("detail")}
+            for e in result.excluded
+            if e.get("subjectAId") and e.get("subjectBId")
+        ],
+        "merges_after_suggest": merges_after_suggest,
+        "suggestion_count": suggestion_count,
+        "ai_merge_refused": ai_refused,
+    }
+    checks = {
+        "ambiguous_pair_suggested": frozenset((amb_a, amb_b)) in kept_pairs,
+        "conflicting_pair_not_suggested": frozenset((conf_a, conf_b)) not in kept_pairs,
+        "conflicting_pair_refuted_no_match": any(
+            d["reason"] == "deterministic_refutation" and d["detail"] == "no_match"
+            for d in out["dropped"]
+        ),
+        "exactly_one_review_suggestion": out["suggestion_count"] == 1,
+        "no_merge_executed": out["merges_after_suggest"] == 0,
+        "ai_actor_cannot_merge": out["ai_merge_refused"] == "identity_merge_ai_actor_forbidden",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; fixture transport — no network, no model, NO spend. DCA-137 SUGGESTS "
+        "ambiguous identity matches through the one DCA AI chokepoint to FEED the deterministic DCA-067/068 "
+        "matchers: the AI proposes candidate pairs as REVIEW-only suggestions, the DCA re-runs its own "
+        "deterministic matcher over every pair and a strong refutation (a conflicting typed identifier "
+        "NO_MATCH) always wins — that pair is DROPPED, never stored; a suggestion is review-only and can "
+        "never execute a merge, which the human-authorized DCA-071 merge enforces by refusing an AI actor; "
+        "everything is tenant-scoped and no permission is ever transferred.)"
+    )
+    return {"checks": checks, **out}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

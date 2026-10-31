@@ -151,6 +151,17 @@ CAPABILITY_CONTEXT_ALLOWLIST: dict[str, frozenset[str]] = {
             "evidenceRefs",
         }
     ),
+    # DCA-137 — the trusted context for ambiguous identity-match suggestions is ONLY the subject kind and
+    # the authorized candidate descriptors (an opaque id + company-fact name/state per candidate). No
+    # personal contact data and no external content ever rides here; the model proposes which candidate
+    # pairs are ambiguous matches worth review, and the DCA re-vets every pair deterministically (DCA-067)
+    # before storing a review-only suggestion — a suggestion can never execute a merge.
+    "ambiguous_identity_match_suggestion": frozenset(
+        {
+            "subjectType",
+            "candidates",
+        }
+    ),
 }
 
 # The serialized-size bound for a minimized context (characters of its canonical JSON). Matches the AI

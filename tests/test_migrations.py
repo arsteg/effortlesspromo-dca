@@ -79,6 +79,7 @@ DCA_TABLES = {
     "source_result_cache",
     "discovery_plans",
     "unstructured_observation_extractions",
+    "identity_match_suggestions",
 }
 
 
@@ -2308,9 +2309,7 @@ def test_0055_creates_unstructured_observation_extractions_on_a_preexisting_data
 
     eng = create_engine(PG_URL)
     insp = inspect(eng)
-    assert "unstructured_observation_extractions" in set(
-        insp.get_table_names(schema=clean_schema)
-    )
+    assert "unstructured_observation_extractions" in set(insp.get_table_names(schema=clean_schema))
     uniques = {
         u["name"]
         for u in insp.get_unique_constraints(
@@ -2330,6 +2329,55 @@ def test_0055_creates_unstructured_observation_extractions_on_a_preexisting_data
     assert (
         "uq_unstructured_observation_extraction" in uniques
     )  # one run per (tenant, source, subject, content)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0056_creates_identity_match_suggestions_on_a_preexisting_database(clean_schema):
+    """DCA-137 — the 0056 create branch (for a DB migrated before ``identity_match_suggestions``).
+
+    ``identity_match_suggestions`` is tenant-owned (RLS-protected), like ``identity_merges`` (0041). A
+    fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0056 is a
+    no-op there. To exercise 0056's real job, upgrade to head, drop the table + policy, stamp history back
+    to 0055, then upgrade to head again — 0056 must recreate the table (with its per-tenant canonical-pair
+    constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text('DROP TABLE IF EXISTS "identity_match_suggestions" CASCADE')
+        )  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0055_unstructured_observations")  # pretend we predate the suggestion table
+    command.upgrade(cfg, "head")  # 0056 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "identity_match_suggestions" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("identity_match_suggestions", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'identity_match_suggestions' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_identity_match_suggestion_pair" in uniques
+    )  # one suggestion per (tenant, canonical pair)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

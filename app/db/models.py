@@ -4126,6 +4126,99 @@ class IdentityMerge(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class IdentityMatchSuggestionStatus(str, Enum):
+    """DCA-137 — the lifecycle state of an AI-proposed ambiguous identity-match suggestion.
+
+    - ``PROPOSED`` — a review-only candidate the AI surfaced and the deterministic DCA-067 matcher did
+      NOT refute. It is a PROPOSAL for a human reviewer, NOT a merge: acting on it (recording an
+      :class:`IdentityMerge`) stays the separate, human-authorized DCA-071 action, and a suggestion can
+      never execute one. Dismissal/acceptance by a reviewer are future review actions not written here.
+    """
+
+    PROPOSED = "proposed"
+
+
+class IdentityMatchSuggestion(TenantOwned, Base):
+    """DCA-137 — an AI-proposed, deterministically-vetted AMBIGUOUS identity-match SUGGESTION (RLS).
+
+    One row is ONE candidate pair of this business's observed identities (two :class:`OrgObservation`
+    rows) that the AI surfaced as a *possible* same-entity match worth human review. It FEEDS — never
+    replaces — the deterministic DCA-067/068 matchers and the review-only DCA-071 merge:
+
+    - **A suggestion is a REVIEW proposal only; it can NEVER execute a merge.** This row records only
+      that the AI proposed the pair for review; it creates NO :class:`IdentityMerge`, collapses no
+      observations, and sends nothing. Recording a merge remains the deliberate, HUMAN-authorized
+      DCA-071 action — which itself refuses an AI/automation actor outright — so an AI suggestion can
+      never become an automatic collapse.
+
+    - **A strong deterministic refutation always wins.** The single sanctioned writer
+      (:class:`~app.services.identity_match_suggester.IdentityMatchSuggestionStore` /
+      :func:`~app.services.identity_match_suggester.suggest_identity_matches`) re-runs the pure DCA-067
+      matcher over the two STORED observations and keeps the suggestion ONLY when the conclusion is
+      compatible — a ``MATCH`` or an ambiguous ``REVIEW`` candidate. A ``NO_MATCH`` (a CONFLICTING typed
+      registration identifier) or an ``INSUFFICIENT`` pair is DROPPED before any row is staged: an AI
+      suggestion can never override the deterministic NO_MATCH. ``match_outcome`` / ``match_confidence`` /
+      ``evidence`` snapshot the deterministic conclusion (company facts only, never a raw personal value).
+
+    - **No permission is ever transferred.** Like the matchers and the merge, surfacing a suggestion
+      links nothing and touches no :class:`ConsentReceipt` / :class:`ProcessingRestriction` — one
+      identity's consent/suppression never reaches another.
+
+    - **Business-private, tenant-scoped, idempotent.** The row is owned by exactly one ``business_id`` and
+      read only within it; both subjects are resolved WITHIN this business (a cross-tenant / unknown id
+      reads as not-found and is excluded, never suggested). ``(business_id, subject_type,
+      subject_a_id, subject_b_id)`` is unique with a CANONICAL pair order (``subject_a_id`` sorts before
+      ``subject_b_id``), so the same ambiguous pair is suggested at most once and a re-run returns the
+      existing row rather than a duplicate.
+    """
+
+    __tablename__ = "identity_match_suggestions"
+    # A canonical-ordered pair is suggested at most once PER business (idempotency key).
+    __table_args__ = (
+        tenant_unique(
+            "subject_type",
+            "subject_a_id",
+            "subject_b_id",
+            name="uq_identity_match_suggestion_pair",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the suggestion-record contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # organization | person — the kind of identity suggested. This story proposes ORGANIZATION pairs
+    # (the AI reasons over company-fact descriptors only); the column is generic for a future extension.
+    subject_type: Mapped[str] = mapped_column(String(16), index=True)
+    # The two candidate identities (OrgObservation.id in THIS business), stored in a CANONICAL order
+    # (subject_a_id <= subject_b_id) so a pair is order-independent and suggested at most once.
+    subject_a_id: Mapped[str] = mapped_column(String(36), index=True)
+    subject_b_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The DETERMINISTIC DCA-067 conclusion that let the suggestion stand: "match" or "review" (an
+    # ambiguous candidate). A "no_match"/"insufficient" pair is dropped by the writer and never stored.
+    match_outcome: Mapped[str] = mapped_column(String(16), index=True)
+    # The deterministic matcher's confidence grade for that conclusion.
+    match_confidence: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # The model's OWN self-reported confidence for this pair (an uncertainty signal; advisory, nullable).
+    ai_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # A snapshot of the deterministic matcher's evidence signals (kind/strength/relation/detail) — company
+    # facts only, never a raw personal contact value (the matcher keeps these opaque). RLS-protected.
+    evidence: Mapped[list] = mapped_column(JSON, default=list)
+    # A short, opaque model rationale for surfacing the pair (bounded; never free-form contact data).
+    rationale: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    # proposed — a review-only candidate on every row here; acting on it is the separate human DCA-071 merge.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=IdentityMatchSuggestionStatus.PROPOSED.value,
+        server_default=IdentityMatchSuggestionStatus.PROPOSED.value,
+        index=True,
+    )
+    # The AI prompt version + whether the result came from the dev/test fixture transport (never a real
+    # model) — provenance so a synthetic suggestion can never be mistaken for a real one.
+    prompt_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    synthetic: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class RecurringSchedule(TenantOwned, Base):
     """DCA-107 — a durable, tenant-owned record of ONE per-business recurring schedule (RLS-protected).
 

@@ -69,12 +69,17 @@ DCA_JOB_ID_PREFIX = "dca:"
 # the deterministic DCA-124 website extractor: permitted organization fields extracted from
 # already-fetched approved content, each citation-grounded before it becomes a field observation) is
 # added here too. Listing a key only permits REQUESTING it and never enables a live/paid call.
+# The DCA-137 ambiguous identity-match suggestion capability (``ambiguous_identity_match_suggestion``,
+# app/services/identity_match_suggester.py — propose ambiguous same-entity candidate pairs as REVIEW-only
+# suggestions that FEED the deterministic DCA-067/068 matchers; every proposal is re-vetted DCA-side and
+# a suggestion can never execute a merge) is added here too. Listing a key only permits REQUESTING it.
 KNOWN_CAPABILITIES: frozenset[str] = frozenset(
     {
         "contact_research",
         "business_profile_draft",
         "discovery_plan",
         "unstructured_observation_extraction",
+        "ambiguous_identity_match_suggestion",
     }
 )
 
