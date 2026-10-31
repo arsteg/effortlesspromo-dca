@@ -2240,6 +2240,87 @@ class WebsiteFactExtraction(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class LicensedProviderFetch(TenantOwned, Base):
+    """DCA-125 — the run-level provenance of one LICENSED-PROVIDER organization fetch (tenant-owned, RLS).
+
+    The third concrete source adapter
+    (:class:`~app.sources.licensed_provider.LicensedProviderAdapter`) enriches an organization
+    observation the business already holds with organization-level fields fetched from ONE paid/licensed
+    B2B data provider — behind the DCA-122 adapter contract and the DCA-048 rights gate, and WITH the
+    paid call flowing through the DCA-113 budget reservation + DCA-115 provider-call lifecycle + DCA-114
+    reconciliation so spend stays bounded and tracked. **No real/paid provider call is ever made**: the
+    live adapter is DISABLED and the only client is a synthetic fake (refused in production) — the live
+    licensed-provider egress stays a disabled future capability.
+
+    This table is the run-level SOURCE ATTRIBUTION the acceptance criterion requires: one row records
+    WHICH organization observation was enriched from WHICH catalog source / terms version via WHICH
+    provider, the ``reservation_id`` the paid call drew on and the ``provider_call_id`` lifecycle record,
+    the provider-reported ``outcome`` and the resulting ``call_status``, how many permitted organization
+    fields were recorded vs contact fragments DROPPED (the organization-only guard, DCA-122), and the
+    bounded spend (``reserved_minor`` / ``settled_minor``). It holds only organization provenance and
+    opaque cost references — NO personal contact data and NO raw provider payload.
+
+    **Idempotent re-fetch.** ``(business_id, source_key, subject_id, fetch_key)`` is unique, so one logical
+    fetch maps to at most ONE run for one organization within a business. Re-running the same fetch finds
+    the existing row and SKIPS it (reusing its outcome) rather than reserving budget or calling the
+    provider again — the fetch is deterministic and replay-safe. ``needs_review`` marks a run whose
+    provider outcome was UNCERTAIN (the hold is preserved, awaiting the DCA-116 resolver); it never
+    retries or spends more on its own.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one business can never read another's fetch provenance. The same provider
+    + fetch key may legitimately recur across tenants, each mapping to that tenant's own observation.
+    """
+
+    __tablename__ = "licensed_provider_fetches"
+    # One provenance row per logical fetch WITHIN a business — the idempotency key that makes a re-fetch a
+    # no-op (no second reservation, no second provider call) instead of a duplicate. The same
+    # (source, subject, fetch) may recur across tenants, each mapping to that tenant's own observation.
+    __table_args__ = (
+        tenant_unique("source_key", "subject_id", "fetch_key", name="uq_licensed_provider_fetch"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The organization observation (OrgObservation.id within this business) the fetched facts are about.
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The catalog Source (DCA-044) the provider is approved+entitled under — the rights-gated source key.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The SourceTerms version the fetch was authorized under (source attribution).
+    source_version: Mapped[int] = mapped_column(Integer)
+    # The provider / cost bucket the paid call was attributed to (opaque; the DCA-113/115 cost bucket).
+    provider: Mapped[str] = mapped_column(
+        String(64), default="platform", server_default="platform", index=True
+    )
+    # The caller's opaque idempotency token for this logical fetch (the per-business dedup key).
+    fetch_key: Mapped[str] = mapped_column(String(128), index=True)
+    # The DCA-113 BudgetReservation hold the paid call drew on, and the DCA-115 ProviderCallRecord that
+    # tracked the call lifecycle — opaque references into the cost ledger (never a payload).
+    reservation_id: Mapped[str] = mapped_column(String(36), index=True)
+    provider_call_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The provider-reported outcome (succeeded | failed | uncertain) and the resulting DCA-115 lifecycle
+    # status the provider call ended in — opaque codes.
+    outcome: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    call_status: Mapped[str] = mapped_column(String(16), default="", server_default="")
+    # How many permitted ORGANIZATION fields were recorded as field observations from the fetch.
+    fields_recorded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # How many personal/contact fields the provider returned were DETECTED and DROPPED (never recorded) —
+    # the org-only guard made auditable. A non-zero value is the witness that contact fields were refused.
+    contact_fields_dropped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The bounded spend in INR MINOR units (paise): the amount RESERVED up front and the amount the hold
+    # was SETTLED at once the actual cost was known (NULL while the outcome is UNCERTAIN — the full hold is
+    # preserved and nothing is settled until the DCA-116 resolver confirms it).
+    reserved_minor: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    settled_minor: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # True when the provider outcome was UNCERTAIN: the hold is preserved and the run awaits the DCA-116
+    # ambiguous-outcome resolver — it never retries or spends more on its own.
+    needs_review: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=sa_false(), nullable=False
+    )
+    # The version of the fetch-provenance contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class ContactChannel(str, Enum):
     """DCA-060 — the channel type of a tenant-private contact point (controlled vocabulary).
 

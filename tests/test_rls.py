@@ -81,6 +81,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "provider_call_records",
         "host_crawl_state",
         "website_fact_extractions",
+        "licensed_provider_fetches",
     }
 
 

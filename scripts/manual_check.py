@@ -19942,6 +19942,365 @@ def _dca_124(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-125",
+    "enrich an organization from ONE licensed provider (the third concrete source adapter): an "
+    "ORGANIZATION-ONLY adapter fetches company fields from a PAID/licensed B2B provider behind the "
+    "DCA-122 contract and the DCA-048 rights gate, with the metered call flowing through the DCA-113 "
+    "budget reservation + DCA-115 provider-call lifecycle + DCA-114 reconciliation so spend is bounded "
+    "and tracked. Each returned company field becomes a provenanced observation; a personal/contact "
+    "field is DROPPED. NO real/paid call — the ONLY provider client is a synthetic fake (refused in "
+    "production); an unentitled OR over-budget fetch reserves/calls/writes NOTHING; a re-fetch is "
+    "idempotent.",
+)
+def _dca_125(ctx: CheckContext) -> dict:
+    """Drive the real DCA-125 licensed-provider adapter against a disposable DB with isolated synthetic
+    Businesses A/B and PRINT the REAL recorded observations, the provider-call lifecycle row, the bounded
+    + reconciled spend (reserved/settled/released), the dropped contact field, the idempotent re-fetch AND
+    both denials (an over-budget fetch and an unentitled source) — never a bare PASS. No network, no
+    socket, no real/paid provider call: the provider is a SYNTHETIC fake (refused in production); in the
+    running service no source is ever ENABLED, so production fetches deny at the rights gate (here we
+    synthetically enable one source so the allow branch is reachable)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import (
+        BudgetReservation,
+        FieldObservation,
+        ProviderCallRecord,
+        Source,
+        SourceStatus,
+    )
+    from app.identity.fake import BUSINESS_A, BUSINESS_B
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+    from app.sources.licensed_provider import (
+        LicensedProviderActor,
+        LicensedProviderAdapter,
+        LicensedProviderFetchRequest,
+    )
+    from app.sources.licensed_provider_fake import SyntheticLicensedProviderClient
+
+    source_key = "synthetic_b2b_provider"
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    actor = LicensedProviderActor(
+        subject="00000000-0000-4000-9000-0000000a0125", roles=("owner", "admin")
+    )
+    audit_actor = AuditActor(id="00000000-0000-4000-9000-0000000a0125", type=ActorType.USER)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0125", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+
+    def _request(
+        subject_id: str, *, fetch_key: str = "fetch-1", estimated_cost_minor: int = 2_000
+    ) -> LicensedProviderFetchRequest:
+        # 2_000 = ₹20.00 reserved up front; the fake reports ₹12.00 actual on success.
+        return LicensedProviderFetchRequest(
+            subject_observation_id=subject_id,
+            source_key=source_key,
+            source_version=1,
+            purpose="prospecting",
+            org_ref="CIN-U72900MH2026PTC000125",
+            fetch_key=fetch_key,
+            estimated_cost_minor=estimated_cost_minor,
+            scope="MH",
+        )
+
+    # 1) platform ceiling: an APPROVED + (test-only) ENABLED licensed source; A entitled + budgeted, B not.
+    with ctx.session_factory() as session:
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="commercial",
+                access_method="api",
+                name="Synthetic Licensed B2B Provider",
+                trust_tier="licensed_provider",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "store": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "LICENSE-2026", "kind": "data_license"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        src = session.query(Source).filter(Source.key == source_key).one()
+        src.status = SourceStatus.ENABLED.value
+        src.enabled = True
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=source_key,
+                enabled=True,
+                operations={"collect": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        BudgetLimitStore(session, BUSINESS_A).save(
+            BudgetLimitInput(
+                daily_cap_minor=100_000, monthly_cap_minor=1_000_000, per_run_cap_minor=100_000
+            ),
+            audit_actor,
+        )
+        a_subject = (
+            OrgObservationStore(session, BUSINESS_A)
+            .create(
+                ObservationInput(
+                    entity_type="legal_entity", display_name="Synthetic B2B Target Pvt Ltd"
+                ),
+                actor=audit_actor,
+                now=now,
+            )
+            .id
+        )
+        b_subject = (
+            OrgObservationStore(session, BUSINESS_B)
+            .create(
+                ObservationInput(
+                    entity_type="legal_entity", display_name="Synthetic B2B Target Pvt Ltd"
+                ),
+                actor=audit_actor,
+                now=now,
+            )
+            .id
+        )
+        session.commit()
+
+    out: dict = {}
+
+    # 2) ALLOW: Business A fetches — permitted company fields recorded, contact dropped, hold reconciled.
+    with ctx.session_factory() as session:
+        result = LicensedProviderAdapter(
+            session, BUSINESS_A, SyntheticLicensedProviderClient()
+        ).fetch(_request(a_subject), actor, now=now)
+        session.commit()
+        out["fetch"] = {
+            "authorized": result.authorized,
+            "phase": result.phase,
+            "outcome": result.outcome,
+            "call_status": result.call_status,
+            "fields": result.fields_recorded,
+            "contacts_dropped": result.contact_fields_dropped,
+            "reserved": result.reserved_minor,
+            "settled": result.settled_minor,
+            "released": result.released_minor,
+            "spent": result.spent_minor,
+            "facts": list(result.recorded),
+        }
+
+    # 3) the real recorded observations + the provider-call lifecycle row + the reconciled reservation.
+    with ctx.session_factory() as session:
+        fields = (
+            session.query(FieldObservation)
+            .filter(FieldObservation.business_id == BUSINESS_A)
+            .order_by(FieldObservation.field_key)
+            .all()
+        )
+        call = (
+            session.query(ProviderCallRecord)
+            .filter(ProviderCallRecord.business_id == BUSINESS_A)
+            .one()
+        )
+        reservation = (
+            session.query(BudgetReservation)
+            .filter(BudgetReservation.business_id == BUSINESS_A)
+            .one()
+        )
+        out["observations"] = [
+            {
+                "field": f.field_key,
+                "value": f.field_value,
+                "source": f"{f.source_key}@{f.source_version}",
+            }
+            for f in fields
+        ]
+        out["call"] = {
+            "status": call.status,
+            "dispatched": call.dispatched,
+            "cost_possible": call.cost_possible,
+            "provider": call.provider,
+            "reservation_id": call.reservation_id,
+            "total_tokens": call.total_tokens,
+        }
+        out["reservation"] = {
+            "status": reservation.status,
+            "reserved": reservation.amount_minor,
+            "settled": reservation.settled_amount_minor,
+            "overspend": reservation.overspend_minor,
+        }
+
+    # 4) IDEMPOTENT re-fetch: the same fetch key again — skipped, no second reservation/call/facts.
+    with ctx.session_factory() as session:
+        again = LicensedProviderAdapter(
+            session, BUSINESS_A, SyntheticLicensedProviderClient()
+        ).fetch(_request(a_subject), actor, now=now)
+        session.commit()
+        out["refetch"] = {"skipped": again.skipped, "fields": again.fields_recorded}
+
+    # 5) DENIAL (budget): an estimate above the per-run cap is refused BEFORE the call — no spend.
+    with ctx.session_factory() as session:
+        over = LicensedProviderAdapter(
+            session, BUSINESS_A, SyntheticLicensedProviderClient()
+        ).fetch(
+            _request(a_subject, fetch_key="fetch-over", estimated_cost_minor=5_000_000),
+            actor,
+            now=now,
+        )
+        calls_after = (
+            session.query(ProviderCallRecord)
+            .filter(ProviderCallRecord.business_id == BUSINESS_A)
+            .count()
+        )
+        session.rollback()
+        out["denied_budget"] = {
+            "authorized": over.authorized,
+            "phase": over.phase,
+            "reason": over.reason,
+            "spent": over.spent_minor,
+            "provider_calls_total": calls_after,  # still just the one from the allow run
+        }
+
+    # 6) DENIAL (rights): Business B is NOT entitled -> un-authorized, nothing reserved/called/written.
+    with ctx.session_factory() as session:
+        denied = LicensedProviderAdapter(
+            session, BUSINESS_B, SyntheticLicensedProviderClient()
+        ).fetch(_request(b_subject), actor, now=now)
+        b_fields = (
+            session.query(FieldObservation)
+            .filter(FieldObservation.business_id == BUSINESS_B)
+            .count()
+        )
+        b_reservations = (
+            session.query(BudgetReservation)
+            .filter(BudgetReservation.business_id == BUSINESS_B)
+            .count()
+        )
+        session.rollback()
+        out["denied_rights"] = {
+            "authorized": denied.authorized,
+            "phase": denied.phase,
+            "reason": denied.reason,
+            "b_fields": b_fields,
+            "b_reservations": b_reservations,
+        }
+
+    f = out["fetch"]
+    print(
+        "\n1) platform ceiling: APPROVED + (test-only) ENABLED 'synthetic_b2b_provider'; A entitled + budgeted, B not."
+    )
+    print(
+        "\n2) ALLOW — Business A fetches from the licensed provider (SYNTHETIC fake; no paid call):"
+    )
+    print(
+        f"   authorized={f['authorized']} phase={f['phase']} outcome={f['outcome']} "
+        f"call_status={f['call_status']}"
+    )
+    print(
+        f"   company_fields_recorded={f['fields']} contact_fields_dropped={f['contacts_dropped']}"
+    )
+    print(
+        f"   spend (INR minor): reserved={f['reserved']} settled={f['settled']} "
+        f"released={f['released']} spent={f['spent']}"
+    )
+    print(
+        "\n3) recorded ORGANIZATION field observations (observed, citing the provider-call provenance):"
+    )
+    for o in out["observations"]:
+        print(f"   {o['field']:20} = {o['value'][:40]:40} <- {o['source']}")
+    c = out["call"]
+    print(
+        f"   provider-call: status={c['status']} dispatched={c['dispatched']} "
+        f"cost_possible={c['cost_possible']} provider={c['provider']} tokens={c['total_tokens']}"
+    )
+    rv = out["reservation"]
+    print(
+        f"   reservation: status={rv['status']} reserved={rv['reserved']} "
+        f"settled={rv['settled']} overspend={rv['overspend']}"
+    )
+    r = out["refetch"]
+    print("\n4) IDEMPOTENT re-fetch (same fetch key again):")
+    print(
+        f"   skipped={r['skipped']} fields_recorded={r['fields']} (no second reservation/call/facts)"
+    )
+    db = out["denied_budget"]
+    print(
+        "\n5) DENIAL (budget) — an estimate above the per-run cap is refused BEFORE the paid call:"
+    )
+    print(
+        f"   authorized={db['authorized']} phase={db['phase']} reason={db['reason']} "
+        f"spent={db['spent']} provider_calls_total={db['provider_calls_total']}"
+    )
+    dr = out["denied_rights"]
+    print(
+        "\n6) DENIAL (rights) — Business B is NOT entitled (fetch reserves/calls/writes nothing):"
+    )
+    print(
+        f"   authorized={dr['authorized']} phase={dr['phase']} reason={dr['reason']} "
+        f"B fields={dr['b_fields']} B reservations={dr['b_reservations']}"
+    )
+
+    checks = {
+        "approved_fetch_recorded_five_company_fields": f["fields"] == 5,
+        "contact_field_dropped_not_recorded": f["contacts_dropped"] == 1,
+        "spend_reconciled_and_bounded": f["settled"] == 1_200
+        and f["released"] == 800
+        and f["spent"] == 1_200,
+        "provider_call_succeeded_and_linked": out["call"]["status"] == "succeeded"
+        and out["call"]["reservation_id"] is not None,
+        "reservation_settled": out["reservation"]["status"] == "settled"
+        and out["reservation"]["settled"] == 1_200,
+        "refetch_is_idempotent": r["skipped"] is True and r["fields"] == 0,
+        "over_budget_made_no_call_no_spend": db["authorized"] is False
+        and db["phase"] == "budget"
+        and db["spent"] == 0
+        and db["provider_calls_total"] == 1,
+        "unentitled_wrote_nothing": dr["authorized"] is False
+        and dr["phase"] == "rights"
+        and dr["b_fields"] == 0
+        and dr["b_reservations"] == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no socket, NO real/paid provider call. DCA-125 is the third "
+        "concrete source adapter: it enriches an organization from ONE paid/licensed B2B provider behind "
+        "the DCA-122 contract and the DCA-048 rights gate, with the metered call flowing through the "
+        "DCA-113 budget reservation + DCA-115 provider-call lifecycle + DCA-114 reconciliation so spend is "
+        "bounded (never past the caps) and tracked. The provider is reached only through a port whose ONLY "
+        "implementation is a synthetic fake (refused in production) — the live licensed-provider egress "
+        "stays a disabled future capability. The adapter is organization-only (DCA-122) and DROPS any "
+        "personal/contact field; an unentitled OR over-budget fetch reserves/calls/writes NOTHING; and a "
+        "re-fetch is idempotent on the fetch key.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

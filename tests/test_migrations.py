@@ -74,6 +74,7 @@ DCA_TABLES = {
     "provider_call_records",
     "host_crawl_state",
     "website_fact_extractions",
+    "licensed_provider_fetches",
 }
 
 
@@ -2137,6 +2138,52 @@ def test_0050_creates_website_fact_extractions_on_a_preexisting_database(clean_s
     assert (
         "uq_website_fact_extraction_page" in uniques
     )  # one provenance row per (tenant, source, subject, page)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0051_creates_licensed_provider_fetches_on_a_preexisting_database(clean_schema):
+    """DCA-125 — the 0051 create branch (for a DB migrated before ``licensed_provider_fetches`` existed).
+
+    ``licensed_provider_fetches`` is tenant-owned (RLS-protected), like ``website_fact_extractions``
+    (0050). A fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so
+    0051 is a no-op there. To exercise 0051's real job, upgrade to head, drop the table + policy, stamp
+    history back to 0050, then upgrade to head again — 0051 must recreate the table (with its per-tenant
+    (source_key, subject_id, fetch_key) constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "licensed_provider_fetches" CASCADE'))  # policy too
+    eng.dispose()
+
+    command.stamp(cfg, "0050_website_fact_extractions")  # pretend we predate the fetch table
+    command.upgrade(cfg, "head")  # 0051 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "licensed_provider_fetches" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("licensed_provider_fetches", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'licensed_provider_fetches' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_licensed_provider_fetch" in uniques
+    )  # one provenance row per (tenant, source, subject, fetch)
     assert policy is not None  # RLS re-established, not just the bare table
 
 
