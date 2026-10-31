@@ -19246,6 +19246,146 @@ def _dca_121(ctx: CheckContext) -> dict:
     return out
 
 
+@register(
+    "DCA-122",
+    "define the Python source-adapter capability contract: a typed descriptor each concrete adapter "
+    "(DCA-123..127) declares - what source kind/access method and which operations (capability listing, "
+    "estimation, org discovery/enrichment, OPTIONAL contact enrichment, change/deletion) it supports, "
+    "plus the source rights it needs - and a registry that VALIDATES a declaration is coherent before "
+    "storing it. An org-only adapter cannot declare (or perform) contact enrichment, an operation "
+    "cannot be claimed without declaring the right it needs, and an unsupported operation fails "
+    "EXPLICITLY. Pure definitions: no live adapter is wired and nothing fetches.",
+)
+def _dca_122(ctx: CheckContext) -> dict:
+    """Exercise the DCA-122 capability contract against local synthetic descriptors and PRINT the REAL
+    registered capabilities + each rejection reason - never a bare PASS. No DB, no network, no socket,
+    no fetch, no AI/paid action: these are pure declarations; concrete adapters stay disabled."""
+    from app.db.models import SourceAccessMethod, SourceKind, SourceOperation
+    from app.sources.capabilities import (
+        CONCRETE_ADAPTERS_ENABLED,
+        AdapterOperation,
+        BaseSourceAdapter,
+        CapabilityRegistry,
+        CapabilityValidationError,
+        DiscoveryQuery,
+        SourceAdapterCapability,
+        UnsupportedCapabilityError,
+    )
+
+    org_only = SourceAdapterCapability(
+        key="synthetic.org_registry",
+        source_kind=SourceKind.OFFICIAL,
+        access_method=SourceAccessMethod.BULK_DOWNLOAD,
+        operations=frozenset(
+            {
+                AdapterOperation.LIST_CAPABILITIES,
+                AdapterOperation.ESTIMATE,
+                AdapterOperation.DISCOVER_ORGANIZATIONS,
+                AdapterOperation.ENRICH_ORGANIZATION,
+            }
+        ),
+        required_rights=frozenset({SourceOperation.COLLECT}),
+        handles_personal_contacts=False,
+        trust_tier="official_registry",
+    )
+    with_contacts = SourceAdapterCapability(
+        key="synthetic.licensed_provider",
+        source_kind=SourceKind.COMMERCIAL,
+        access_method=SourceAccessMethod.API,
+        operations=frozenset(
+            {
+                AdapterOperation.LIST_CAPABILITIES,
+                AdapterOperation.DISCOVER_ORGANIZATIONS,
+                AdapterOperation.ENRICH_ORGANIZATION,
+                AdapterOperation.ENRICH_CONTACT,
+            }
+        ),
+        required_rights=frozenset({SourceOperation.COLLECT}),
+        handles_personal_contacts=True,
+        trust_tier="licensed",
+    )
+
+    registry = CapabilityRegistry()
+    registry.register(org_only)
+    registry.register(with_contacts)
+
+    print("\nDCA-122 source-adapter capability registry (pure declarations; no fetch):")
+    print(f"  CONCRETE_ADAPTERS_ENABLED = {CONCRETE_ADAPTERS_ENABLED}")
+    registered: list[dict] = []
+    for cap in registry.all():
+        ops = sorted(op.value for op in cap.operations)
+        rights = sorted(r.value for r in cap.required_rights)
+        print(f"  [{cap.key}]")
+        print(f"      kind={cap.source_kind.value}  access={cap.access_method.value}")
+        print(f"      operations={ops}")
+        print(f"      required_rights={rights}  org_only={cap.is_organization_only}")
+        registered.append({"key": cap.key, "operations": ops, "org_only": cap.is_organization_only})
+
+    # A rejected, INVALID declaration: an organization-only adapter that tries to claim contact
+    # enrichment. It must be refused with a stable code and leave the registry untouched.
+    sneaky = SourceAdapterCapability(
+        key="synthetic.sneaky_org",
+        source_kind=SourceKind.OFFICIAL,
+        access_method=SourceAccessMethod.BULK_DOWNLOAD,
+        operations=frozenset({AdapterOperation.LIST_CAPABILITIES, AdapterOperation.ENRICH_CONTACT}),
+        required_rights=frozenset({SourceOperation.COLLECT}),
+        handles_personal_contacts=False,
+    )
+    rejected: dict = {}
+    before = len(registry)
+    try:
+        registry.register(sneaky)
+    except CapabilityValidationError as exc:
+        rejected = {"key": sneaky.key, "code": exc.code, "message": str(exc)}
+    print("\n  REJECTED invalid declaration (org-only adapter claiming contact enrichment):")
+    print(f"      key={rejected.get('key')}  code={rejected.get('code')}")
+    print(f"      message={rejected.get('message')}")
+    print(f"      registry size unchanged: {before} -> {len(registry)}")
+
+    # Runtime refusal: a synthetic org-only adapter refuses contact enrichment EXPLICITLY (no silent
+    # empty result), while a supported operation runs. Nothing fetches - discovery returns a fixture.
+    class _FakeOrgOnly(BaseSourceAdapter):
+        @property
+        def capability(self) -> SourceAdapterCapability:
+            return org_only
+
+        def _do_discover_organizations(self, query: DiscoveryQuery) -> list:
+            return [{"org_name": "Synthetic Org Pvt Ltd", "source_ref": "synthetic://org/900122"}]
+
+    adapter = _FakeOrgOnly()
+    discovered = adapter.discover_organizations(DiscoveryQuery(industries=("textiles",)))
+    contact_denied = ""
+    try:
+        adapter.enrich_contact("org-ref")
+    except UnsupportedCapabilityError as exc:
+        contact_denied = exc.code
+    print("\n  synthetic org-only adapter at runtime (no fetch; discovery returns a fixture):")
+    print(f"      discover_organizations -> {len(discovered)} synthetic record(s)")
+    print(f"      enrich_contact -> refused EXPLICITLY with code={contact_denied!r}")
+
+    checks = {
+        "two_capabilities_registered": [r["key"] for r in registered]
+        == ["synthetic.licensed_provider", "synthetic.org_registry"],
+        "org_only_flag_correct": {r["key"]: r["org_only"] for r in registered}
+        == {"synthetic.licensed_provider": False, "synthetic.org_registry": True},
+        "invalid_declaration_rejected": rejected.get("code") == "personal_contact_not_declared",
+        "rejection_stored_nothing": before == len(registry) == 2,
+        "unsupported_op_failed_explicitly": contact_denied == "operation_not_supported",
+        "supported_op_ran": len(discovered) == 1,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no DB, no network, no socket, no fetch, no AI/paid action. DCA-122 "
+        "DEFINES the source-adapter capability contract - a typed descriptor each concrete adapter "
+        "declares, a Protocol/ABC it implements, and a registry that validates a declaration is coherent. "
+        "An organization-only adapter can neither DECLARE nor PERFORM contact enrichment, an operation "
+        "cannot be claimed without declaring the source right it depends on, and an unsupported operation "
+        "fails EXPLICITLY instead of returning a silent empty result. No live adapter is wired and nothing "
+        "fetches: every concrete adapter (DCA-123..127) stays a disabled future capability.)"
+    )
+    return {"registered": registered, "rejected": rejected, "checks": checks}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
