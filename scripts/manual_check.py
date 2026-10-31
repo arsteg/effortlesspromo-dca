@@ -18681,6 +18681,139 @@ def _dca_118(ctx: CheckContext) -> dict:
     return {"results": results, "checks": checks}
 
 
+@register(
+    "DCA-119",
+    "revalidate redirects and resolved addresses: re-run the DCA-118 destination guard on EVERY hop of "
+    "a redirect chain - the initial URL and each redirect target, with each hop's freshly-resolved "
+    "IP(s) - so an initially permitted URL cannot redirect or rebind into a forbidden address. Refuses "
+    "a redirect into a private/loopback/cloud-metadata address at that hop (with the guard's own "
+    "reason), a chain over the redirect cap (too_many_redirects), an https->http downgrade "
+    "(scheme_downgrade) and credentials appearing mid-chain (credentials_in_url). Follows no redirect, "
+    "resolves nothing, opens no socket, fetches nothing - it only VALIDATES.",
+)
+def _dca_119(ctx: CheckContext) -> dict:
+    """Exercise the DCA-119 redirect-chain re-guard against local synthetic fixtures and PRINT the REAL
+    per-hop verdicts for a safe chain plus a redirect-to-private block and the other blocked classes -
+    never a bare PASS. No network, no DNS, no redirect-following, no socket, no fetch: the guard is a
+    pure decider and the supplied per-hop ``resolved_ips`` stand in for DNS answers the caller already
+    had."""
+    from app.sources.redirect_guard import (
+        DEFAULT_MAX_REDIRECTS,
+        RedirectHop,
+        validate_redirect_chain,
+    )
+
+    allowlist = {"example.in", "data.example.in"}
+    public = ("93.184.216.34",)
+
+    def hop(url: str, ips: tuple[str, ...] | None = None) -> RedirectHop:
+        return RedirectHop.of(url, ips)
+
+    # (label, chain) covering the allow path and each blocked class. Each chain's hop 0 is the initial
+    # request URL; later hops are redirect targets. The blocked chains all START at a safe-looking,
+    # allowlisted, public hop 0 - showing a permitted URL cannot redirect/rebind into a forbidden one.
+    over_cap = [hop("https://example.in/", public)] + [
+        hop("https://example.in/", public) for _ in range(DEFAULT_MAX_REDIRECTS + 1)
+    ]
+    chains = [
+        (
+            "allow: safe http->https->www chain, every hop public",
+            [
+                hop("http://example.in/", ("8.8.8.8",)),
+                hop("https://example.in/", ("8.8.8.8",)),
+                hop("https://data.example.in/records", public),
+            ],
+        ),
+        (
+            "block: redirect target is a loopback literal",
+            [hop("https://data.example.in/go", public), hop("http://127.0.0.1/admin", None)],
+        ),
+        (
+            "block: redirect target is the cloud-metadata service",
+            [hop("https://example.in/", public), hop("http://169.254.169.254/latest/", None)],
+        ),
+        (
+            "block: same host rebinds to a private address on the 2nd hop",
+            [
+                hop("https://data.example.in/", public),
+                hop("https://data.example.in/", ("10.0.0.5",)),
+            ],
+        ),
+        (
+            "block: redirect target host not on the allowlist",
+            [hop("https://example.in/", public), hop("https://evil.example.com/", public)],
+        ),
+        (
+            "block: https -> http scheme downgrade mid-chain",
+            [hop("https://example.in/", public), hop("http://example.in/", public)],
+        ),
+        (
+            "block: credentials appear in a mid-chain URL",
+            [hop("https://example.in/", public), hop("https://user:pass@example.in/", public)],
+        ),
+        (
+            f"block: more than {DEFAULT_MAX_REDIRECTS} redirects (over the cap)",
+            over_cap,
+        ),
+    ]
+
+    print(
+        "\nDCA-119 redirect-chain re-guard (pure, network-free) - allowlist:",
+        sorted(allowlist),
+        f"- redirect cap: {DEFAULT_MAX_REDIRECTS}",
+    )
+    results: list[dict] = []
+    for label, chain in chains:
+        d = validate_redirect_chain(chain, allowlist=allowlist)
+        verdict = d.verdict.value.upper()
+        reason = d.reason_code or "-"
+        print(f"  [{verdict:5}] {label}  ({len(chain)} hops)")
+        for i, h in enumerate(chain):
+            marker = "<-- blocked here" if d.blocked_index == i else ""
+            print(
+                f"          hop[{i}] {h.url!r}  resolved_ips={list(h.resolved_ips or [])} {marker}"
+            )
+        print(f"          reason={reason}  blocked_index={d.blocked_index}")
+        results.append(
+            {
+                "label": label,
+                "verdict": verdict,
+                "reason": reason,
+                "blocked_index": d.blocked_index,
+                "hops": len(chain),
+            }
+        )
+
+    allow = results[0]
+    blocks = results[1:]
+    checks = {
+        "safe_chain_allowed": allow["verdict"] == "ALLOW" and allow["reason"] == "-",
+        "every_other_chain_blocked": all(r["verdict"] == "DENY" for r in blocks),
+        "redirect_to_loopback_blocked_at_hop1": results[1]["reason"] == "loopback_address"
+        and results[1]["blocked_index"] == 1,
+        "redirect_to_metadata_blocked": results[2]["reason"] == "cloud_metadata_address",
+        "rebind_to_private_blocked": results[3]["reason"] == "private_address",
+        "host_not_allowlisted_blocked": results[4]["reason"] == "host_not_allowlisted",
+        "scheme_downgrade_blocked": results[5]["reason"] == "scheme_downgrade",
+        "credentials_mid_chain_blocked": results[6]["reason"] == "credentials_in_url",
+        "too_many_redirects_blocked": results[7]["reason"] == "too_many_redirects",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no DNS lookup, no redirect-following, no socket, no fetch, "
+        "no AI/paid action. DCA-119 extends the DCA-118 destination guard across a REDIRECT CHAIN: it "
+        "re-runs the same pure guard on every hop - the initial URL and each redirect target, with that "
+        "hop's freshly-supplied resolved IP(s) - stopping at the first unsafe hop. A permitted first "
+        "URL therefore cannot redirect or DNS-rebind into anything internal: a 30x Location pointing at "
+        "loopback / RFC1918 / cloud-metadata, or a same-host re-resolution to a private address, is "
+        "refused at that hop with the guard's own reason. It also bounds the redirect count and refuses "
+        "an https->http downgrade and credentials appearing mid-chain. It follows no redirect, resolves "
+        "and connects to nothing, and fetches nothing - deciding ALLOW only permits a connection the "
+        "caller must still pin to each hop's verified IPs; actual fetching stays disabled.)"
+    )
+    return {"results": results, "checks": checks}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
