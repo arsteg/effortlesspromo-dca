@@ -77,6 +77,7 @@ DCA_TABLES = {
     "licensed_provider_fetches",
     "contact_imports",
     "source_result_cache",
+    "discovery_plans",
 }
 
 

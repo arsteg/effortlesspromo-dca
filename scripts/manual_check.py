@@ -22098,6 +22098,185 @@ def _dca_134(ctx: CheckContext) -> dict:
     return {"checks": checks, **out}
 
 
+@register(
+    "DCA-135",
+    "generate a BOUNDED discovery plan through the DCA AI chokepoint: grounded in the CONFIRMED India "
+    "ICP, using ONLY approved+entitled sources + their permitted fields, within task/query caps. An "
+    "un-entitled source, an un-permitted field, a geography outside the ICP and an over-cap task are "
+    "each CLAMPED/EXCLUDED (recorded, never stored); the plan is a DRAFT proposal — NEVER executed, "
+    "NEVER auto-approved; no confirmed ICP / a rejected output / a disabled capability each stage NO "
+    "plan. Fixture transport only (no network, no model, NO spend).",
+)
+def _dca_135(ctx: CheckContext) -> dict:
+    """Drive the real DCA-135 bounded discovery planning over the HTTP API against synthetic A, using the
+    deterministic fixture transport (no network/model/spend) wired to return an OVER-SCOPE model plan —
+    a valid task, an un-entitled source, an un-permitted field, a geography that expands the ICP and
+    over-cap tasks. PRINT the stored bounded plan and, per model task, whether it was KEPT or EXCLUDED
+    (with its reason), so a human sees the clamping/exclusion rather than a bare PASS."""
+    from datetime import UTC, datetime, timedelta
+
+    from fastapi.testclient import TestClient
+
+    from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
+    from app.db.models import (
+        BusinessSourceEntitlement,
+        IcpConfirmation,
+        IcpDraft,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+    )
+    from app.main import create_app
+    from app.services.discovery_planner import PLAN_PURPOSE
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    biz_new = "00000000-0000-4000-8000-00000000000f"  # a tenant with NO confirmed ICP
+    auth = {"X-Service-Auth": ctx.settings.service_auth_token or ""}
+    base = f"/v1/tenants/{biz_a}/discovery/plans"
+
+    allowed_key, allowed_fields = "mca_master_data", ["org_name", "org_identifier"]
+    unentitled_key = "gst_registry"
+
+    # An over-scope model plan — the gateway's rule_check would reject this; the fixture bypasses it so
+    # we can show the DCA's OWN defensive clamping/exclusion.
+    tasks: list[dict] = [
+        {"sourceKey": allowed_key, "fields": ["org_name", "secret_field"],
+         "filters": {"geography": ["KA"], "industries": ["information technology"]}, "maxQueries": 999},
+        {"sourceKey": unentitled_key, "fields": ["org_name"],
+         "filters": {"geography": ["MH"]}, "maxQueries": 2},
+        {"sourceKey": allowed_key, "fields": ["org_name"],
+         "filters": {"geography": ["TN"]}, "maxQueries": 1},  # TN is outside the confirmed ICP
+        {"sourceKey": allowed_key, "fields": ["org_identifier"],
+         "filters": {"geography": ["MH"]}, "maxQueries": 1},
+        {"sourceKey": allowed_key, "fields": ["org_name"],
+         "filters": {"geography": ["KA"]}, "maxQueries": 1},  # beyond the task cap of 2
+    ]
+    model_output = {"tasks": tasks, "rationale": "proposed discovery plan", "confidence": 0.72}
+
+    app = create_app(ctx.settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    out: dict = {}
+    try:
+        client.post("/v1/tenants", json={"businessId": biz_a}, headers=auth)
+        client.post("/v1/tenants", json={"businessId": biz_new}, headers=auth)
+
+        # Seed a CONFIRMED ICP + ONE approved+entitled source (the full DCA-044..048 rights chain).
+        now = datetime.now(UTC)
+        with app.state.session_factory() as session:
+            session.add(IcpDraft(business_id=biz_a, version=1, industries=["information technology"],
+                                 size_bands=["small", "medium"], roles=["owner"],
+                                 geography=["KA", "MH"], status="draft"))
+            session.add(IcpConfirmation(business_id=biz_a, version=1, actor_id="seed", actor_type="user"))
+            session.add(Source(key=allowed_key, name=allowed_key, kind=SourceKind.OFFICIAL.value,
+                               trust_tier="official_registry", capabilities=["org_discovery"],
+                               fields=allowed_fields, access_method=SourceAccessMethod.API.value,
+                               india_coverage={"nationwide": True, "states": []},
+                               status=SourceStatus.ENABLED.value, enabled=True, permissions=[]))
+            session.add(SourceTerms(source_key=allowed_key, version=1, operation_rights={"collect": True},
+                                    field_rights={}, purposes=[PLAN_PURPOSE],
+                                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                                    status=SourceTermsStatus.ACTIVE.value))
+            session.add(SourceTermsApproval(source_key=allowed_key, terms_version=1, reviewer_id="op-1",
+                                            reviewer_type="platform_operator",
+                                            review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                                            reviewed_at=now - timedelta(days=1),
+                                            effective_from=now - timedelta(days=1),
+                                            expires_at=now + timedelta(days=365),
+                                            approved_operation_rights={"collect": True},
+                                            approved_field_rights={}, status=SourceApprovalStatus.ACTIVE.value))
+            session.add(BusinessSourceEntitlement(business_id=biz_a, source_key=allowed_key, version=1,
+                                                  enabled=True, operation_rights={"collect": True},
+                                                  field_rights={}, purposes=[PLAN_PURPOSE],
+                                                  approved_terms_version=1, actor_id="seed", actor_type="user"))
+            session.commit()
+
+        print("\nconfirmed ICP (the targeting the plan is grounded in):")
+        print("  industries=['information technology']  sizeBands=['small','medium']  "
+              "roles=['owner']  geography=['KA','MH']")
+        print(f"approved+entitled source: '{allowed_key}' permitted_fields={allowed_fields}  "
+              f"(un-entitled: '{unentitled_key}')")
+        print("caps: maxTasks=2  maxQueriesPerTask=3")
+
+        app.state.ai_capability_facade = AiCapabilityFacade(
+            FakeAiGatewayTransport(structured_output=model_output)
+        )
+        resp = client.post(base, json={"maxTasks": 2, "maxQueriesPerTask": 3}, headers=auth)
+        body: dict = resp.json()
+        print(f"\n1) generate plan                 -> HTTP {resp.status_code}")
+
+        print("\nper model-task disposition (the DCA re-enforces every bound before storing):")
+        kept_keys = [t["sourceKey"] for t in body.get("tasks", [])]
+        for i, t in enumerate(tasks):
+            geo = t["filters"].get("geography")
+            print(f"  task[{i}] source={t['sourceKey']:<16} fields={t['fields']} geo={geo} q={t['maxQueries']}")
+        print("\nstored bounded DRAFT plan (version "
+              f"{body.get('version')}, status={body.get('status')!r}):")
+        for t in body.get("tasks", []):
+            print(f"  KEPT  source={t['sourceKey']:<16} fields={t['fields']} "
+                  f"geo={t['filters']['geography']} maxQueries={t['maxQueries']}")
+        print("  excluded (clamped/dropped, recorded):")
+        for e in body.get("excluded", []):
+            print(f"    - {e.get('sourceKey','?'):<16} {e['reason']}"
+                  + (f" ({e['detail']})" if e.get("detail") else ""))
+        print(f"  overall_confidence={body.get('overallConfidence')}  executed={body.get('executed')}  "
+              f"autoApproved={body.get('autoApproved')}")
+
+        # Denial 1: a tenant with NO confirmed ICP cannot ground a plan -> 409, nothing staged.
+        no_icp = client.post(f"/v1/tenants/{biz_new}/discovery/plans", json={}, headers=auth)
+        # Denial 2: the capability disabled -> 503, nothing staged.
+        app.state.ai_capability_facade = None
+        disabled = client.post(base, json={}, headers=auth)
+        versions_after = [p["version"] for p in client.get(base, headers=auth).json()]
+        print(f"\n2) no confirmed ICP (other biz)  -> HTTP {no_icp.status_code}")
+        print(f"3) capability disabled           -> HTTP {disabled.status_code}")
+        print(f"   plan versions after denials   -> {versions_after} (unchanged; denials stage nothing)")
+
+        out = {
+            "kept_source_keys": kept_keys,
+            "kept_task_count": len(body.get("tasks", [])),
+            "excluded": [{"sourceKey": e.get("sourceKey"), "reason": e["reason"]} for e in body.get("excluded", [])],
+            "status": body.get("status"),
+            "executed": body.get("executed"),
+            "auto_approved": body.get("autoApproved"),
+            "no_icp_status": no_icp.status_code,
+            "disabled_status": disabled.status_code,
+            "versions_after_denials": versions_after,
+        }
+    finally:
+        app.state.engine.dispose()
+
+    excl_reasons = {e["reason"] for e in out["excluded"]}
+    checks = {
+        "only_entitled_source_kept": set(out["kept_source_keys"]) == {allowed_key},
+        "task_cap_enforced": out["kept_task_count"] == 2,
+        "unentitled_source_excluded": "source_not_approved_or_entitled" in excl_reasons,
+        "unpermitted_field_excluded": "field_not_permitted" in excl_reasons,
+        "scope_expansion_excluded": "geography_outside_confirmed_icp" in excl_reasons,
+        "over_cap_excluded": "task_cap_exceeded" in excl_reasons,
+        "plan_is_draft": out["status"] == "draft",
+        "not_executed": out["executed"] is False,
+        "not_auto_approved": out["auto_approved"] is False,
+        "no_icp_stages_nothing": out["no_icp_status"] == 409,
+        "disabled_stages_nothing": out["disabled_status"] == 503,
+        "only_one_version": out["versions_after_denials"] == [1],
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; fixture transport — no network, no model, NO spend. DCA-135 generates "
+        "a BOUNDED discovery plan through the one DCA AI chokepoint: grounded in the CONFIRMED ICP, using "
+        "only approved+entitled sources + permitted fields within the task/query caps; the model can add "
+        "no source, expand no India scope and exceed no cap — every over-scope task is clamped/excluded "
+        "and recorded; the plan stays a DRAFT proposal that is NEVER executed and NEVER auto-approved; a "
+        "missing ICP, a rejected output or a disabled capability stages nothing.)"
+    )
+    return {"checks": checks, **out}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

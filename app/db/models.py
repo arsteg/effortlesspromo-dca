@@ -1095,6 +1095,63 @@ class ProspectCandidate(TenantOwned, Base):
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
+class DiscoveryPlan(TenantOwned, Base):
+    """DCA-135 — a bounded, reviewable discovery PLAN proposal (tenant-owned, RLS-protected).
+
+    One row is one *version* of a proposed plan: the bounded set of source TASKS the agent could run to
+    discover prospects, generated through the one DCA AI chokepoint (the ``discovery_plan`` capability)
+    and grounded in the business's CONFIRMED India ICP (:class:`IcpConfirmation`). It is a PROPOSAL,
+    not an execution: no task here is ever run, and the plan is **never auto-approved** — promotion to an
+    executable/accepted plan is a DISABLED future capability (its own later story). The planner only ever
+    stages ``status='draft'`` rows and never mutates an existing one, so a generated plan can never
+    silently become an executing plan or grant any acquisition/sending authority.
+
+    The plan is bounded *by construction* (DCA-135 acceptance): every ``task`` references only a source
+    the business is ALREADY approved+entitled to, requests only that source's PERMITTED fields, carries
+    query filters derived from the confirmed ICP (geography never widened beyond the ICP — India-only, no
+    scope expansion), and the number of tasks and per-task query count stay within ``task_cap`` /
+    ``query_cap``. ``excluded`` records — honestly, by stable reason code — every task/field the model
+    proposed that was clamped or dropped to keep the plan inside those bounds; the model can never widen
+    its own mandate.
+
+    Insert-only + versioned exactly like :class:`IcpDraft` / :class:`BusinessProfileDraft`:
+    ``(business_id, version)`` is unique, a new plan is always ``max(version)+1``, and prior versions are
+    preserved. Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy, so
+    one business can never read another's plans. It holds only the business's own targeting/plan metadata
+    — no prospect contact data and no secrets.
+    """
+
+    __tablename__ = "discovery_plans"
+    # A version number is unique PER business (the same ordinal recurs across tenants but never within one).
+    __table_args__ = (tenant_unique("version", name="uq_discovery_plan_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # 1-based version ordinal within the business; a new plan is always max(version)+1.
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    # The confirmed ICP version the plan was grounded against (traceability; the plan's targeting source).
+    icp_version: Mapped[int] = mapped_column(Integer)
+    # draft (reviewable proposal) vs a future accepted/executable plan. Promotion is disabled, so every
+    # row written here is 'draft'; nothing promotes a draft to an executing plan yet.
+    status: Mapped[str] = mapped_column(
+        String(16), default="draft", server_default="draft", index=True
+    )
+    # The bounded task list actually kept: [{sourceKey, fields:[...], filters:{...}, maxQueries:int}].
+    tasks: Mapped[list] = mapped_column(JSON, default=list)
+    # What the planner clamped/dropped to keep the plan in bounds: [{sourceKey?, field?, reason, detail?}].
+    excluded: Mapped[list] = mapped_column(JSON, default=list)
+    # The hard caps applied when the plan was generated (recorded for review/reproducibility).
+    task_cap: Mapped[int] = mapped_column(Integer)
+    query_cap: Mapped[int] = mapped_column(Integer)
+    # The model's plan rationale + self-reported overall confidence (an uncertainty signal).
+    rationale: Mapped[str] = mapped_column(Text, default="", server_default="")
+    overall_confidence: Mapped[float | None] = mapped_column(Float, default=None)
+    # DCA-037-style provenance of the generation (model/provider/prompt version, synthetic flag, counts).
+    source: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    source_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

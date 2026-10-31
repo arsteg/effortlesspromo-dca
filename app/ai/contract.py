@@ -59,10 +59,14 @@ DCA_JOB_ID_PREFIX = "dca:"
 # through-DCA-134 accepted story already references — the licensed-provider organization fetch
 # (``contact_research``, app/sources/licensed_provider.py, whose live paid call is itself disabled) and
 # the DCA-134 business-profile drafting capability (``business_profile_draft``,
-# app/services/profile_drafter.py — a draft-only, evidence-grounded capability). A later AI-capability
+# app/services/profile_drafter.py — a draft-only, evidence-grounded capability) and the DCA-135 bounded
+# discovery-plan capability (``discovery_plan``, app/services/discovery_planner.py — a proposal-only
+# planning capability over the business's own confirmed ICP + approved sources). A later AI-capability
 # story adds its reviewed key here; listing a key only permits REQUESTING it and never enables a
 # live/paid call (that stays gated on the transport being configured — off by default).
-KNOWN_CAPABILITIES: frozenset[str] = frozenset({"contact_research", "business_profile_draft"})
+KNOWN_CAPABILITIES: frozenset[str] = frozenset(
+    {"contact_research", "business_profile_draft", "discovery_plan"}
+)
 
 # Terminal envelope statuses the DCA understands. Anything else is an incompatible contract extension.
 _COMPLETED = "completed"

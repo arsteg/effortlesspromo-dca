@@ -122,6 +122,23 @@ CAPABILITY_CONTEXT_ALLOWLIST: dict[str, frozenset[str]] = {
             "draftFields",
         }
     ),
+    # DCA-135 — the trusted context for bounded discovery planning is ONLY the business's own confirmed
+    # India ICP targeting, the sources it is ALREADY approved+entitled to (each with the exact permitted
+    # fields) and the hard task/query caps. No prospect contact data and no external content ever rides
+    # here; the model proposes a plan within these declared bounds (and the gateway's own rule_check +
+    # the DCA re-enforce them).
+    "discovery_plan": frozenset(
+        {
+            "icpVersion",
+            "industries",
+            "sizeBands",
+            "roles",
+            "geography",
+            "allowedSources",
+            "maxTasks",
+            "maxQueriesPerTask",
+        }
+    ),
 }
 
 # The serialized-size bound for a minimized context (characters of its canonical JSON). Matches the AI
