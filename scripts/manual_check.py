@@ -21777,6 +21777,166 @@ def _dca_132(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-133",
+    "validate AI-extracted fact CITATIONS against the DCA-retrieved evidence: a fact that cites real "
+    "source text for a permitted field under live rights is ACCEPTED (may become an observation); an "
+    "invented citation (evidence the DCA never retrieved), a hallucinated quote (text absent from the "
+    "source), a missing citation, an unrelated/non-permitted field, and expired source rights are each "
+    "REJECTED (dropped, reason recorded, nothing written). The gateway's own 'valid' verdict cannot "
+    "authorize the write — this is the independent grounding gate. No AI, no network, no spend.",
+)
+def _dca_133(ctx: CheckContext) -> dict:
+    """Run the DCA-133 citation validator over a batch of synthetic AI-extracted facts against one
+    DCA-retrieved page and PRINT, per fact, the actual disposition (ACCEPTED / dropped + reason) so a
+    human sees grounded-vs-ungrounded facts, never a bare PASS. Pure/deterministic: no DB, no network,
+    no model, no spend."""
+    from app.ai import (
+        CitedFact,
+        CitedSource,
+        validate_citations,
+    )
+    from app.ai.citation_validator import LABEL_INFERRED, LABEL_OBSERVED
+
+    # One piece of evidence the DCA actually retrieved — the ONLY material a citation may rest on.
+    page = (
+        "About Acme Textiles Pvt Ltd.\n"
+        "Legal name: Acme Textiles Private Limited.\n"
+        "Industry: Textiles manufacturing.\n"
+        "We operate three mills across Maharashtra."
+    )
+    live_source = CitedSource(
+        ref="evidence-live",
+        content=page,
+        permitted_fields=frozenset({"legal_name", "industry", "description"}),
+        rights_valid=True,
+    )
+    # A second retrieved page whose source RIGHTS have since expired — it can ground nothing.
+    expired_source = CitedSource(
+        ref="evidence-expired",
+        content="Legal name: Globex Trading LLP.",
+        permitted_fields=frozenset({"legal_name"}),
+        rights_valid=False,
+    )
+
+    facts = [
+        # grounded observed fact — the value is quoted by a span that appears in the source
+        CitedFact(
+            field_key="legal_name",
+            field_value="Acme Textiles Private Limited",
+            citation_ref="evidence-live",
+            cited_text="Legal name: Acme Textiles Private Limited.",
+            inference_label=LABEL_OBSERVED,
+        ),
+        # grounded inferred fact — value derived, but basis quote is in the source and it stays labelled
+        CitedFact(
+            field_key="description",
+            field_value="textile manufacturer",
+            citation_ref="evidence-live",
+            cited_text="Industry: Textiles manufacturing.",
+            inference_label=LABEL_INFERRED,
+        ),
+        # invented citation — cites evidence the DCA never retrieved
+        CitedFact(
+            field_key="legal_name",
+            field_value="Globex Corporation",
+            citation_ref="evidence-ghost",
+            cited_text="Legal name: Globex Corporation.",
+        ),
+        # hallucinated quote — the cited span does not appear in the retrieved page
+        CitedFact(
+            field_key="industry",
+            field_value="pharmaceuticals",
+            citation_ref="evidence-live",
+            cited_text="Industry: Pharmaceuticals.",
+        ),
+        # unrelated field — the source is not permitted to supply `cin`
+        CitedFact(
+            field_key="cin",
+            field_value="U17110MH1990PTC055555",
+            citation_ref="evidence-live",
+            cited_text="We operate three mills across Maharashtra.",
+        ),
+        # expired source rights — even a faithful quote cannot ground an accepted observation
+        CitedFact(
+            field_key="legal_name",
+            field_value="Globex Trading LLP",
+            citation_ref="evidence-expired",
+            cited_text="Legal name: Globex Trading LLP.",
+        ),
+        # missing citation — an unprovenanced value is never promoted
+        CitedFact(field_key="legal_name", field_value="Acme", citation_ref="", cited_text=""),
+        # unknown fact — the model could not find a value; it stays null and is dropped (not an error)
+        CitedFact(
+            field_key="gstin", field_value=None, citation_ref="evidence-live", cited_text="n/a"
+        ),
+    ]
+
+    result = validate_citations(facts, [live_source, expired_source])
+
+    print("\nDCA-retrieved evidence (the only material a citation may rest on):")
+    for src in (live_source, expired_source):
+        print(
+            f"  - ref={src.ref!r}  rights_valid={src.rights_valid}  "
+            f"permitted_fields={sorted(src.permitted_fields)}"
+        )
+
+    print("\nper-fact citation verdicts (in input order):")
+    rows: list[dict] = []
+    for verdict in result.verdicts:
+        fact = verdict.fact
+        disposition = "ACCEPTED" if verdict.accepted else "DROPPED"
+        print(
+            f"  - {fact.field_key:<11} value={str(fact.field_value)!r:<34} "
+            f"cites={fact.citation_ref or '<none>':<16} -> {disposition:<8} "
+            f"reason={verdict.reason or '-'}"
+        )
+        rows.append(
+            {
+                "field": fact.field_key,
+                "value": fact.field_value,
+                "citation_ref": fact.citation_ref,
+                "accepted": verdict.accepted,
+                "reason": verdict.reason,
+                "grounded_ref": verdict.grounded_ref,
+            }
+        )
+
+    accepted_fields = [f.field_key for f in result.accepted]
+    print(
+        f"\naccepted (may become observations): {accepted_fields}   "
+        f"(accepted={result.accepted_count} dropped={result.rejected_count})"
+    )
+
+    checks = {
+        "only_grounded_facts_accepted": accepted_fields == ["legal_name", "description"],
+        "invented_citation_dropped": any(
+            r["citation_ref"] == "evidence-ghost" and not r["accepted"] for r in rows
+        ),
+        "hallucinated_quote_dropped": any(
+            r["field"] == "industry" and not r["accepted"] for r in rows
+        ),
+        "unrelated_field_dropped": any(r["field"] == "cin" and not r["accepted"] for r in rows),
+        "expired_rights_dropped": any(
+            r["citation_ref"] == "evidence-expired" and not r["accepted"] for r in rows
+        ),
+        "unknown_null_fact_dropped": any(
+            r["field"] == "gstin" and r["value"] is None and not r["accepted"] for r in rows
+        ),
+        "not_all_grounded": result.all_grounded is False,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no model, no DB, NO spend. DCA-133 is the independent "
+        "GROUNDING gate between AI extraction and the observation write: each extracted fact must CITE "
+        "source text the DCA itself retrieved, for a permitted field, under live source rights — an "
+        "invented, hallucinated, unrelated or expired-rights citation is REJECTED (dropped, reason "
+        "recorded, nothing written). The gateway's own output-validation verdict does NOT authorize the "
+        "write; only a fact confirmed grounded here may become an observation.)"
+    )
+    return {"accepted_fields": accepted_fields, "verdicts": rows, "checks": checks}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
