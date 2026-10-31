@@ -216,6 +216,28 @@ class Settings(BaseSettings):
         False  # local synthetic fixtures only; no live source exists yet
     )
 
+    # --- retrieval resource bounds (DCA-120) — safe, BOUNDED caps (never unbounded) ---
+    # The caps the centralized fetch client (a still-disabled future capability) MUST apply to every
+    # retrieval so an oversized / slow / decompression-bomb / non-approved response is stopped and
+    # never stored as valid evidence. These are POLICY values (not a feature switch): the bounds exist
+    # and are enforced the moment any fetch is wired; they are intentionally conservative, never 0 /
+    # unbounded, and are validated positive at boot (a non-positive / <=1 ratio cap would disable the
+    # very protection). Enforcing them performs NO network I/O — see app/sources/retrieval_bounds.py.
+    retrieval_max_response_bytes: int = 5_242_880  # 5 MiB on-the-wire body cap per retrieval
+    retrieval_total_timeout_seconds: float = 30.0  # max total wall time for one retrieval
+    retrieval_max_decompressed_bytes: int = 52_428_800  # 50 MiB decoded-output cap (bomb guard)
+    retrieval_max_decompression_ratio: float = 100.0  # decoded/wire ceiling once past the body cap
+    # The ONLY content types a retrieval may keep (fail-closed: a missing/other type is refused).
+    retrieval_allowed_content_types: list[str] = [
+        "text/html",
+        "application/xhtml+xml",
+        "text/plain",
+        "text/xml",
+        "application/xml",
+        "application/json",
+        "application/ld+json",
+    ]
+
     # --- scope guards ---
     allowed_countries: list[str] = ["IN"]  # India-only build (DCA story boundary)
     candidate_ttl_days: int = 30
@@ -536,6 +558,20 @@ def validate_required(settings: Settings) -> None:
                 f"secret source '{settings.secret_source.value}' requires secret references: "
                 + ", ".join(missing_refs)
             )
+
+    # DCA-120: the retrieval resource bounds must be genuinely bounded. A non-positive byte/time cap
+    # would disable the very protection (an unbounded body/time), and a decompression ratio <= 1 would
+    # reject all legitimate compression. Fail fast, naming only the offending key.
+    if settings.retrieval_max_response_bytes <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_RETRIEVAL_MAX_RESPONSE_BYTES must be positive")
+    if settings.retrieval_total_timeout_seconds <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_RETRIEVAL_TOTAL_TIMEOUT_SECONDS must be positive")
+    if settings.retrieval_max_decompressed_bytes <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_RETRIEVAL_MAX_DECOMPRESSED_BYTES must be positive")
+    if settings.retrieval_max_decompression_ratio <= 1:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_RETRIEVAL_MAX_DECOMPRESSION_RATIO must be greater than 1"
+        )
 
     if settings.is_production:
         _validate_production(settings)

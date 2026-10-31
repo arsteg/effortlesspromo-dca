@@ -190,3 +190,31 @@ def test_platform_transport_non_env_secret_source_requires_reference():
     )
     with pytest.raises(RuntimeError, match="PLATFORM_SERVICE_CREDENTIAL_SECRET_REF"):
         validate_required(bad)
+
+
+# --- DCA-120: retrieval resource bounds must be genuinely bounded ---
+
+
+def test_retrieval_bounds_defaults_are_valid_and_bounded():
+    s = _base()
+    assert s.retrieval_max_response_bytes > 0
+    assert s.retrieval_total_timeout_seconds > 0
+    assert s.retrieval_max_decompressed_bytes > 0
+    assert s.retrieval_max_decompression_ratio > 1
+    assert "text/html" in s.retrieval_allowed_content_types
+    validate_required(s)  # no raise
+
+
+def test_retrieval_non_positive_byte_cap_rejected():
+    with pytest.raises(RuntimeError, match="RETRIEVAL_MAX_RESPONSE_BYTES"):
+        validate_required(_base(retrieval_max_response_bytes=0))
+
+
+def test_retrieval_non_positive_timeout_rejected():
+    with pytest.raises(RuntimeError, match="RETRIEVAL_TOTAL_TIMEOUT_SECONDS"):
+        validate_required(_base(retrieval_total_timeout_seconds=0))
+
+
+def test_retrieval_ratio_at_or_below_one_rejected():
+    with pytest.raises(RuntimeError, match="RETRIEVAL_MAX_DECOMPRESSION_RATIO"):
+        validate_required(_base(retrieval_max_decompression_ratio=1))

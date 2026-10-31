@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -18810,6 +18811,166 @@ def _dca_119(ctx: CheckContext) -> dict:
         "an https->http downgrade and credentials appearing mid-chain. It follows no redirect, resolves "
         "and connects to nothing, and fetches nothing - deciding ALLOW only permits a connection the "
         "caller must still pin to each hop's verified IPs; actual fetching stays disabled.)"
+    )
+    return {"results": results, "checks": checks}
+
+
+@register(
+    "DCA-120",
+    "bound retrieval resources: the fetch client's pure, network-free resource guard. Caps body size "
+    "(bytes), total time, decoded output and decompression ratio, and enforces a content-type "
+    "allowlist, so an oversized / slow / decompression-bomb / non-approved response is STOPPED mid-read "
+    "and never returned as evidence (an aborted retrieval yields no body). It only counts bytes - it "
+    "never parses, renders or executes content - and reads at most one chunk past a cap (no unbounded "
+    "memory). Opens no socket, resolves nothing, fetches nothing - it only VALIDATES + bounds.",
+)
+def _dca_120(ctx: CheckContext) -> dict:
+    """Exercise the DCA-120 retrieval guard against local synthetic fixtures and PRINT the REAL verdict
+    + reason for a within-limit retrieval and each breach - never a bare PASS. No network, no DNS, no
+    socket, no fetch, no content execution: the guard is a pure decider; the supplied byte chunks and
+    the fake clock stand in for a wire body / elapsed time the caller would have observed."""
+    from app.sources.retrieval_bounds import (
+        Chunk,
+        RetrievalLimits,
+        RetrievalStream,
+        bound_retrieval,
+    )
+
+    # Small, explicit caps so the fixtures stay tiny and the breach points are obvious.
+    limits = RetrievalLimits(
+        max_response_bytes=1000,
+        total_timeout_seconds=5.0,
+        max_decompressed_bytes=10_000,
+        max_decompression_ratio=10.0,
+        allowed_content_types=frozenset({"text/html", "application/json", "text/plain"}),
+    )
+
+    class _Clock:
+        """Deterministic monotonic clock: returns each scheduled value, holding the last once spent."""
+
+        def __init__(self, values: list[float]) -> None:
+            self._values, self._i = values, 0
+
+        def __call__(self) -> float:
+            v = self._values[min(self._i, len(self._values) - 1)]
+            self._i += 1
+            return v
+
+    # (label, stream-factory, clock, cancelled) for the OK path + each bounded breach.
+    cases: list[tuple] = [
+        (
+            "ok: approved type, within every bound",
+            lambda: RetrievalStream(
+                "text/html; charset=utf-8",
+                iter([Chunk.of(b"<html>"), Chunk.of(b"hello"), Chunk.of(b"</html>")]),
+                content_length=18,
+            ),
+            _Clock([0.0, 0.1, 0.2, 0.3, 0.4]),
+            None,
+        ),
+        (
+            "block: content type not on the allowlist",
+            lambda: RetrievalStream("application/octet-stream", iter([Chunk.of(b"x" * 10)])),
+            time.monotonic,
+            None,
+        ),
+        (
+            "block: declared Content-Length already over the byte cap",
+            lambda: RetrievalStream("text/html", iter([Chunk.of(b"x")]), content_length=5000),
+            time.monotonic,
+            None,
+        ),
+        (
+            "block: streamed body exceeds the byte cap",
+            lambda: RetrievalStream("text/plain", iter([Chunk.of(b"a" * 400) for _ in range(3)])),
+            time.monotonic,
+            None,
+        ),
+        (
+            "block: slow read exceeds the total timeout",
+            lambda: RetrievalStream("text/plain", iter([Chunk.of(b"a"), Chunk.of(b"b")])),
+            _Clock([0.0, 1.0, 9.0, 9.0]),
+            None,
+        ),
+        (
+            "block: decompression bomb (tiny on wire, huge decoded)",
+            lambda: RetrievalStream(
+                "text/html", iter([Chunk.of(b"x" * 2000, wire_size=50)]), content_encoding="gzip"
+            ),
+            time.monotonic,
+            None,
+        ),
+        (
+            "block: cancellation requested mid-read",
+            lambda: RetrievalStream("text/plain", iter([Chunk.of(b"a"), Chunk.of(b"b")])),
+            time.monotonic,
+            lambda: True,
+        ),
+    ]
+
+    print(
+        "\nDCA-120 retrieval resource guard (pure, network-free) - caps:",
+        f"max_response_bytes={limits.max_response_bytes}",
+        f"total_timeout_seconds={limits.total_timeout_seconds}",
+        f"max_decompressed_bytes={limits.max_decompressed_bytes}",
+        f"max_decompression_ratio={limits.max_decompression_ratio}",
+    )
+    print("  allowed_content_types:", sorted(limits.allowed_content_types))
+    results: list[dict] = []
+    for label, factory, clock, cancelled in cases:
+        out = bound_retrieval(factory(), limits, clock=clock, cancelled=cancelled)
+        verdict = out.verdict.value.upper()
+        reason = out.reason_code or "-"
+        print(f"  [{verdict:7}] {label}")
+        print(
+            f"          reason={reason}  content_type={out.content_type!r}  "
+            f"wire_bytes={out.wire_bytes}  decoded_bytes={out.decoded_bytes}  "
+            f"body_len={len(out.body)}"
+        )
+        results.append(
+            {
+                "label": label,
+                "verdict": verdict,
+                "reason": reason,
+                "wire_bytes": out.wire_bytes,
+                "decoded_bytes": out.decoded_bytes,
+                "body_len": len(out.body),
+            }
+        )
+
+    ok = results[0]
+    blocks = results[1:]
+    checks = {
+        "within_limits_ok_with_body": ok["verdict"] == "OK"
+        and ok["body_len"] == 18
+        and ok["reason"] == "-",
+        "every_breach_aborted_with_no_body": all(
+            r["verdict"] == "ABORTED" and r["body_len"] == 0 for r in blocks
+        ),
+        "reasons_in_order": [r["reason"] for r in blocks]
+        == [
+            "content_type_not_allowed",
+            "declared_length_exceeds_limit",
+            "body_too_large",
+            "timeout_exceeded",
+            "decompression_limit_exceeded",
+            "cancelled",
+        ],
+        "no_unbounded_memory_on_oversize": results[3]["wire_bytes"]
+        <= limits.max_response_bytes + 400,
+        "bomb_stayed_small_on_wire": results[5]["wire_bytes"] <= limits.max_response_bytes,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no DNS lookup, no socket, no fetch, no content execution, "
+        "no AI/paid action. DCA-120 BOUNDS what a retrieval may consume once DCA-118/119 have decided "
+        "WHERE it may connect: it caps body size, total time, decoded output and the decompression "
+        "ratio and enforces a content-type allowlist. An oversized / slow / decompression-bomb / "
+        "non-approved response is stopped at the first breached bound and returns an ABORTED outcome "
+        "with NO body - so a caller can only ever store the result of a retrieval that stayed inside "
+        "every bound. It reads at most one chunk past a cap before discarding the whole partial read "
+        "(no unbounded memory), treats every byte as opaque data it only COUNTS - never parsing, "
+        "rendering or executing it - and fetches nothing: actual fetching stays a disabled capability.)"
     )
     return {"results": results, "checks": checks}
 
