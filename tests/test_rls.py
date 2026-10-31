@@ -78,6 +78,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "business_emergency_stops",
         "budget_reservations",
         "provider_call_records",
+        "host_crawl_state",
     }
 
 
@@ -594,6 +595,55 @@ def test_provider_call_record_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_PROVIDER_CALL, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_CRAWL_STATE = (
+    "INSERT INTO host_crawl_state "
+    "(id, business_id, schema_version, source_key, host, window_started_at, window_seconds, "
+    "request_count, in_flight, last_request_at, created_at, updated_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'mca_master_data', 'data.gov.in', now(), 60, "
+    "1, 1, now(), now(), now())"
+)
+
+
+@requires_pg
+def test_host_crawl_state_is_tenant_isolated(rls_db):
+    """DCA-121 — the per-host crawl-rate state is tenant-owned: each tenant can read only its OWN
+    crawl counters (RLS on real Postgres), so one business can never see or perturb another's per-host
+    rate / crawl-delay / concurrency state (the limits a host enforces are each business's own)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_CRAWL_STATE, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_CRAWL_STATE, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM host_crawl_state").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM host_crawl_state").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_host_crawl_state_write_check_rejects_foreign_owner(rls_db):
+    """A crawl-state row can never be stamped for another tenant: writing a B-owned row while scoped to
+    A violates the WITH CHECK clause (defence-in-depth beneath the limiter's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_CRAWL_STATE, (B,))
         conn.rollback()
     finally:
         conn.close()

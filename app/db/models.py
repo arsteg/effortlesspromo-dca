@@ -1644,6 +1644,69 @@ class BusinessSourceEntitlement(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class HostCrawlState(TenantOwned, Base):
+    """DCA-121 — the durable per-host crawl-rate state that makes crawl limits hold ACROSS jobs.
+
+    One row is one ``(business_id, source_key, host)`` the would-be fetch client has made (or
+    reserved) requests against. It is the shared, authoritative ledger the crawl-etiquette guard
+    (:class:`~app.sources.crawl_limits.HostCrawlLimiter`) consults and updates under a ``FOR UPDATE``
+    lock, so a per-host rate / crawl-delay / concurrency limit is enforced the SAME way whether one
+    job or several concurrent jobs are reserving requests against that host — a limit that lived only
+    in a single job's memory could be collectively overshot by two concurrent jobs; this row cannot
+    (the second reserve reads the first's committed count and is deferred). It holds only crawl
+    bookkeeping (counts, timestamps): NO prospect contact data and NO fetched content — actual
+    fetching stays a disabled future capability, so these counters only ever record RESERVED requests.
+
+    - ``source_key`` / ``host`` — the catalog source and the normalized (lower-cased) host the rate
+      state is kept for. A request's rate/delay/concurrency is bounded per host, not per source-wide.
+    - ``window_started_at`` / ``window_seconds`` — the current rolling rate window. ``request_count``
+      is the number of requests RESERVED since ``window_started_at``; the limiter rolls the window
+      (resets the count) once ``window_seconds`` have elapsed, so the rate cap is "N requests per
+      window" evaluated against a fresh window.
+    - ``request_count`` — reserved requests in the current window (the rate-cap counter). It is NOT
+      decremented on release — rate is about request FREQUENCY, not how many are in flight.
+    - ``in_flight`` — currently-reserved-but-not-released requests (the concurrency counter):
+      incremented on a reserve, decremented on a release, so two concurrent jobs holding slots against
+      the same host contend for the per-host concurrency cap.
+    - ``last_request_at`` — when the most recent request was reserved (the crawl-delay anchor): a new
+      reserve inside the per-host crawl-delay of this instant is deferred.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one business can never read or perturb another's crawl state; the rate
+    limits a business's own concurrent jobs share are its own. A reserve holds a crawl slot; it fetches
+    and sends nothing.
+    """
+
+    __tablename__ = "host_crawl_state"
+    # One crawl-state row per (source, host) WITHIN a business: two tenants may crawl the same host
+    # without sharing a counter, but a business's own concurrent jobs contend for the SAME row.
+    __table_args__ = (tenant_unique("source_key", "host", name="uq_host_crawl_state"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The version of the crawl-state contract this row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The catalog key of the Source these requests are bounded for (DCA-044).
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The normalized (lower-cased) host the rate/delay/concurrency is kept for.
+    host: Mapped[str] = mapped_column(String(255), index=True)
+    # The start of the current rolling rate window; the limiter rolls it once window_seconds elapse.
+    window_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # The length (seconds) of the rate window this state is counted under (pins the window).
+    window_seconds: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Requests RESERVED since window_started_at — the rate-cap counter (never decremented on release).
+    request_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Currently-reserved-but-not-released requests — the concurrency counter (reserve +1, release -1).
+    in_flight: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # When the most recent request was reserved — the crawl-delay anchor (NULL until the first reserve).
+    last_request_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None, nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
 class AuditEvent(TenantOwned, Base):
     """DCA-026 — a durable, transactional audit event for a tenant-scoped mutation.
 

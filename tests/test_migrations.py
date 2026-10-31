@@ -71,6 +71,7 @@ DCA_TABLES = {
     "platform_emergency_stops",
     "budget_reservations",
     "provider_call_records",
+    "host_crawl_state",
 }
 
 
@@ -1865,8 +1866,16 @@ def test_0045_adds_reconciliation_columns_on_a_preexisting_database(clean_schema
         "reconciled_by_actor_id",
         "reconciled_by_actor_type",
     }.issubset(cols)  # columns re-added
-    assert backfilled == (None, None, None, 0, None)  # pre-existing hold backfilled to "not reconciled"
-    assert policies == {"budget_reservations"}  # tenant-owned RLS unchanged by the add-column migration
+    assert backfilled == (
+        None,
+        None,
+        None,
+        0,
+        None,
+    )  # pre-existing hold backfilled to "not reconciled"
+    assert policies == {
+        "budget_reservations"
+    }  # tenant-owned RLS unchanged by the add-column migration
 
 
 @requires_pg
@@ -1989,7 +1998,52 @@ def test_0047_adds_resolution_columns_on_a_preexisting_database(clean_schema):
         "resolution_at",
     }.issubset(cols)  # columns re-added
     assert backfilled == ("", None, None, None)  # pre-existing record backfilled to "unresolved"
-    assert policies == {"provider_call_records"}  # tenant-owned RLS unchanged by the add-column migration
+    assert policies == {
+        "provider_call_records"
+    }  # tenant-owned RLS unchanged by the add-column migration
+
+
+@requires_pg
+def test_0048_creates_host_crawl_state_on_a_preexisting_database(clean_schema):
+    """DCA-121 — the 0048 create branch (for a DB migrated before ``host_crawl_state`` existed).
+
+    ``host_crawl_state`` is tenant-owned (RLS-protected), like ``budget_reservations`` (0044). A fresh
+    DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0048 is a
+    no-op there. To exercise 0048's real job, upgrade to head, drop the table + policy, stamp history
+    back to 0047, then upgrade to head again — 0048 must recreate the table (with its per-tenant
+    (source_key, host) constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "host_crawl_state" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0047_provider_call_resolution")  # pretend we predate the crawl-state table
+    command.upgrade(cfg, "head")  # 0048 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "host_crawl_state" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("host_crawl_state", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'host_crawl_state' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_host_crawl_state" in uniques  # one crawl-state row per (tenant, source, host)
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg

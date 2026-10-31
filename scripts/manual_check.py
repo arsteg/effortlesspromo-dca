@@ -18975,6 +18975,277 @@ def _dca_120(ctx: CheckContext) -> dict:
     return {"results": results, "checks": checks}
 
 
+@register(
+    "DCA-121",
+    "enforce approved access AND crawl limits before fetching a web source: the composed gate checks "
+    "source RIGHTS first (DCA-044..048), so a license denial is returned WITHOUT consulting the crawl "
+    "limiter (a permissive robots.txt / official origin can never override it), then — only once rights "
+    "permit — reserves a request slot through the DURABLE per-host limiter (robots allowed-paths, "
+    "crawl-delay, per-host rate and concurrency caps) that holds across concurrent jobs. A refused "
+    "reserve changes nothing; it fetches nothing.",
+)
+def _dca_121(ctx: CheckContext) -> dict:
+    """Drive the real DCA-121 composed fetch-policy gate against a disposable DB with isolated synthetic
+    Businesses A/B and PRINT the REAL allow + each denial (a rights denial AND each crawl-limit denial)
+    — never a bare PASS. No network, no DNS, no socket, no fetch: the gate returns a decision and (when
+    allowed) a durable crawl reservation; acting on an allow by fetching stays a disabled capability,
+    and because rights are checked first and no source is ever ENABLED in the running service, the gate
+    denies every fetch at the rights phase in production (here we synthetically enable one source so the
+    allow + crawl-limit branches are reachable)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import HostCrawlState, Source, SourceStatus
+    from app.identity.fake import BUSINESS_A
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_preflight import PreflightRequest
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+    from app.sources.crawl_limits import CrawlPolicy
+    from app.sources.fetch_policy import FetchPolicyGate, FetchPolicyRequest
+
+    source_key = "mca_master_data"
+    unapproved_key = "commercial_leads"
+    host = "data.gov.in"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0121", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+    official_robots = {"official_origin": True, "robots_allowed": True, "trust_tier": "official"}
+
+    def _rights(
+        req_source: str, operation: str, url: str, policy: CrawlPolicy
+    ) -> FetchPolicyRequest:
+        return FetchPolicyRequest(
+            preflight=PreflightRequest(
+                source_key=req_source,
+                operation=operation,
+                purpose="prospecting",
+                origin_signals=official_robots,
+            ),
+            url=url,
+            policy=policy,
+        )
+
+    generous = CrawlPolicy.of(
+        crawl_delay_seconds=0.0, max_requests=5, window_seconds=3600, max_concurrent=5
+    )
+    rate_one = CrawlPolicy.of(
+        crawl_delay_seconds=0.0, max_requests=1, window_seconds=3600, max_concurrent=5
+    )
+    robots_block = CrawlPolicy.of(
+        max_requests=5, window_seconds=3600, max_concurrent=5, disallow_rules=("/private",)
+    )
+
+    out: dict = {}
+
+    # 1) platform ceiling: an APPROVED + (test-only) ENABLED source entitled to collect/prospecting,
+    #    plus an official-origin UNAPPROVED source (enabled, but no platform approval) to prove robots
+    #    cannot override a license denial.
+    with ctx.session_factory() as session:
+        catalog = SourceCatalogStore(session)
+        catalog.create_draft(
+            SourceDraftInput(
+                key=source_key,
+                kind="official",
+                access_method="bulk_download",
+                name="MCA Company Master Data",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        catalog.create_draft(
+            SourceDraftInput(
+                key=unapproved_key,
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=source_key,
+                operations={"collect": True, "display": True, "export": True},
+                purposes=["prospecting"],
+                contract_evidence={"reference": "MCA-TOS-2026", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            source_key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        for key in (source_key, unapproved_key):
+            src = session.query(Source).filter(Source.key == key).one()
+            src.status = SourceStatus.ENABLED.value
+            src.enabled = True
+        # Business A entitles collect/display, purpose 'prospecting' (NOT export).
+        BusinessSourceEntitlementStore(session, BUSINESS_A).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=source_key,
+                enabled=True,
+                operations={"collect": True, "display": True},
+                purposes=["prospecting"],
+            ),
+            admin,
+            now=now,
+        )
+        session.commit()
+
+    # 2) ALLOW: approved + entitled + within crawl limits → reserves a durable slot.
+    with ctx.session_factory() as session:
+        allowed = FetchPolicyGate(session, BUSINESS_A).authorize_fetch(
+            _rights(source_key, "collect", f"https://{host}/mca/companies", generous), now=now
+        )
+        out["allowed"] = {
+            "allowed": allowed.allowed,
+            "phase": allowed.phase.value,
+            "reason": allowed.reason,
+            "reserved": allowed.reservation.reserved if allowed.reservation else None,
+            "request_count": allowed.reservation.request_count if allowed.reservation else None,
+        }
+        session.commit()
+
+    # 3) RIGHTS denials (crawl limiter NEVER consulted — reservation is None):
+    rights_denials: dict = {}
+    with ctx.session_factory() as session:
+        gate = FetchPolicyGate(session, BUSINESS_A)
+        cases = {
+            "op 'export' not entitled by A": _rights(
+                source_key, "export", f"https://{host}/mca/companies", generous
+            ),
+            "UNAPPROVED source (official origin + robots ok)": _rights(
+                unapproved_key, "collect", f"https://{host}/leads", generous
+            ),
+        }
+        for label, req in cases.items():
+            d = gate.authorize_fetch(req, now=now)
+            rights_denials[label] = {
+                "allowed": d.allowed,
+                "phase": d.phase.value,
+                "reason": d.reason,
+                "limiter_consulted": d.reservation is not None,
+            }
+        session.rollback()
+    out["rights_denials"] = rights_denials
+
+    # 4) CRAWL-LIMIT denials (rights pass, the crawl limiter refuses — and records nothing):
+    crawl_denials: dict = {}
+    # 4a) robots-disallowed path.
+    with ctx.session_factory() as session:
+        d = FetchPolicyGate(session, BUSINESS_A).authorize_fetch(
+            _rights(source_key, "collect", f"https://{host}/private/companies", robots_block),
+            now=now,
+        )
+        crawl_denials["robots-disallowed path /private"] = {
+            "allowed": d.allowed,
+            "phase": d.phase.value,
+            "reason": d.reason,
+            "reserved": d.reservation.reserved if d.reservation else None,
+        }
+        session.commit()
+    # 4b) rate cap across jobs: first reserve wins (committed), a second job is deferred.
+    with ctx.session_factory() as session:
+        FetchPolicyGate(session, BUSINESS_A).authorize_fetch(
+            _rights(source_key, "collect", f"https://{host}/mca/page1", rate_one), now=now
+        )
+        session.commit()
+    with ctx.session_factory() as session:
+        d = FetchPolicyGate(session, BUSINESS_A).authorize_fetch(
+            _rights(source_key, "collect", f"https://{host}/mca/page2", rate_one), now=now
+        )
+        crawl_denials["rate cap exceeded (2nd concurrent job)"] = {
+            "allowed": d.allowed,
+            "phase": d.phase.value,
+            "reason": d.reason,
+            "reserved": d.reservation.reserved if d.reservation else None,
+        }
+        session.commit()
+    out["crawl_denials"] = crawl_denials
+
+    # 5) the durable crawl state that makes rate limits hold across jobs.
+    with ctx.session_factory() as session:
+        rows = session.query(HostCrawlState).all()
+        out["crawl_state_rows"] = [
+            {
+                "source_key": r.source_key,
+                "host": r.host,
+                "request_count": r.request_count,
+                "in_flight": r.in_flight,
+            }
+            for r in rows
+        ]
+
+    print("\n1) platform ceiling: APPROVED + (test-only) ENABLED 'mca_master_data'")
+    print("   A entitles collect/display, purpose 'prospecting' (export NOT).")
+    a = out["allowed"]
+    print("\n2) ALLOW (collect / within crawl limits):")
+    print(
+        f"   allowed={a['allowed']} phase={a['phase']} reason={a['reason']} "
+        f"reserved={a['reserved']} request_count={a['request_count']}"
+    )
+    print("\n3) RIGHTS denials (crawl limiter NEVER consulted — robots cannot override license):")
+    for label, info in rights_denials.items():
+        print(
+            f"   {label:48} -> {info['reason']:32} phase={info['phase']} "
+            f"limiter_consulted={info['limiter_consulted']}"
+        )
+    print("\n4) CRAWL-LIMIT denials (rights pass; the crawl limiter refuses and records nothing):")
+    for label, info in crawl_denials.items():
+        print(
+            f"   {label:40} -> {str(info['reason']):28} phase={info['phase']} "
+            f"reserved={info['reserved']}"
+        )
+    print("\n5) durable per-host crawl state (what makes rate limits hold across concurrent jobs):")
+    for r in out["crawl_state_rows"]:
+        print(
+            f"   source={r['source_key']} host={r['host']} "
+            f"request_count={r['request_count']} in_flight={r['in_flight']}"
+        )
+    checks = {
+        "approved_entitled_within_limits_allowed": a["allowed"] is True and a["reserved"] is True,
+        "rights_denials_never_touched_limiter": all(
+            info["allowed"] is False and info["limiter_consulted"] is False
+            for info in rights_denials.values()
+        ),
+        "robots_did_not_override_license": rights_denials[
+            "UNAPPROVED source (official origin + robots ok)"
+        ]["reason"]
+        == "source_not_platform_approved",
+        "crawl_denials_reserved_nothing": all(
+            info["allowed"] is False and info["reserved"] is False
+            for info in crawl_denials.values()
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no network, no DNS, no socket, no fetch, no AI/paid action. DCA-121 "
+        "composes the source-RIGHTS chain with per-host crawl etiquette: rights are checked FIRST, so a "
+        "license denial is returned without ever consulting the crawl limiter — a permissive robots.txt "
+        "or an official origin can never override it. Only once rights permit is a request slot reserved "
+        "through the DURABLE per-host limiter (robots allowed-paths, crawl-delay, rate and concurrency "
+        "caps) that holds across concurrent jobs via a FOR UPDATE lock. A refused reserve changes "
+        "nothing; acting on an allow by performing the fetch stays a disabled future capability.)"
+    )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
