@@ -64,8 +64,18 @@ DCA_JOB_ID_PREFIX = "dca:"
 # planning capability over the business's own confirmed ICP + approved sources). A later AI-capability
 # story adds its reviewed key here; listing a key only permits REQUESTING it and never enables a
 # live/paid call (that stays gated on the transport being configured — off by default).
+# The DCA-136 permitted unstructured-observation extraction capability
+# (``unstructured_observation_extraction``, app/sources/unstructured_extract.py — the AI counterpart of
+# the deterministic DCA-124 website extractor: permitted organization fields extracted from
+# already-fetched approved content, each citation-grounded before it becomes a field observation) is
+# added here too. Listing a key only permits REQUESTING it and never enables a live/paid call.
 KNOWN_CAPABILITIES: frozenset[str] = frozenset(
-    {"contact_research", "business_profile_draft", "discovery_plan"}
+    {
+        "contact_research",
+        "business_profile_draft",
+        "discovery_plan",
+        "unstructured_observation_extraction",
+    }
 )
 
 # Terminal envelope statuses the DCA understands. Anything else is an incompatible contract extension.

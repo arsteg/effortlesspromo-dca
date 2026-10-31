@@ -2301,6 +2301,73 @@ class WebsiteFactExtraction(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class UnstructuredObservationExtraction(TenantOwned, Base):
+    """DCA-136 — the provenance linking one AI-extracted-from-content run to the org observations it
+    produced (tenant-owned, RLS-protected).
+
+    The AI counterpart of the deterministic DCA-124 website extractor
+    (:class:`~app.sources.unstructured_extract.UnstructuredObservationExtractor`) extracts a bounded set
+    of PERMITTED organization fields from ALREADY-FETCHED, APPROVED + entitled source content, through
+    the one DCA AI chokepoint (the ``unstructured_observation_extraction`` capability) — each extracted
+    field citation-grounded (DCA-133) before it becomes a provenanced :class:`FieldObservation`, and the
+    content captured as an :class:`EvidenceObject`. This table is the run-level SOURCE ATTRIBUTION: one
+    row records WHICH content was extracted for WHICH organization observation, under WHICH catalog
+    source / terms version, the ``evidence_id`` the observations cite, how many grounded permitted fields
+    were recorded and how many model observations were DROPPED (ungrounded / hallucinated / non-permitted
+    / unknown — the witness that nothing un-cited or off-allowlist leaked). It holds only organization
+    provenance (a catalog source key, a content locator, a content digest and counts); NO personal
+    contact data — the adapter is organization-only.
+
+    **Idempotent re-extraction.** ``(business_id, source_key, subject_id, content_ref)`` is unique, so one
+    piece of content maps to at most ONE extraction run for one organization within a business.
+    Re-extracting the same content finds the existing row and SKIPS it (reusing its evidence) rather than
+    re-invoking the model or writing duplicate observations — the run is replay-safe and spends nothing on
+    a retry. ``content_ref`` is the checkpointable locator a later refresh re-locates the content by.
+
+    Tenant-owned: it inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every
+    other tenant data table, so one business can never read another's extraction provenance.
+    """
+
+    __tablename__ = "unstructured_observation_extractions"
+    # One provenance row per extracted content piece WITHIN a business — the idempotency key that makes a
+    # re-extraction a no-op (no second model call, no duplicate observations) instead of a duplicate.
+    __table_args__ = (
+        tenant_unique(
+            "source_key",
+            "subject_id",
+            "content_ref",
+            name="uq_unstructured_observation_extraction",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The organization observation (OrgObservation.id within this business) the observations are about.
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The catalog Source (DCA-044) the content is approved+entitled under — the rights-gated source key.
+    source_key: Mapped[str] = mapped_column(String(64), index=True)
+    # The SourceTerms version the content was extracted under (source attribution).
+    source_version: Mapped[int] = mapped_column(Integer)
+    # The checkpointable content locator (the content's ref) — how a later refresh re-locates it.
+    content_ref: Mapped[str] = mapped_column(String(500), index=True)
+    # The evidence object (EvidenceObject.id within this business) the extracted observations cite/ground.
+    evidence_id: Mapped[str] = mapped_column(String(36), index=True)
+    # A non-reversible SHA-256 (hex) of the extracted content — ties the run to the exact bytes.
+    content_digest: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # How many grounded permitted ORGANIZATION fields were recorded as field observations from this run.
+    fields_recorded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # How many model observations were DROPPED by the independent DCA-133 grounding gate (ungrounded /
+    # hallucinated / non-permitted / unknown). A non-zero value is the witness that un-cited / off-allowlist
+    # output was refused, not written.
+    observations_dropped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The AI prompt version the extraction ran under (model-generation provenance), when reported.
+    prompt_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # Whether the run used the dev/test fixture transport (a synthetic, network-free, no-spend answer).
+    synthetic: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    # The version of the extraction contract this provenance row was written under (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class LicensedProviderFetch(TenantOwned, Base):
     """DCA-125 — the run-level provenance of one LICENSED-PROVIDER organization fetch (tenant-owned, RLS).
 

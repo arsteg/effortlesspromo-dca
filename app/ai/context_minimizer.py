@@ -139,6 +139,18 @@ CAPABILITY_CONTEXT_ALLOWLIST: dict[str, frozenset[str]] = {
             "maxQueriesPerTask",
         }
     ),
+    # DCA-136 — the trusted context for permitted unstructured-observation extraction is ONLY the
+    # subject kind, the organization-field allowlist this approved+entitled source may supply, and the
+    # evidence refs the model may cite. The fetched content BODIES never ride here: they go to the
+    # untrusted channel (DCA-132), so no raw source content is ever egressed as trusted instruction
+    # context. The model may produce no field outside permittedFields (gateway rule_check + DCA-133).
+    "unstructured_observation_extraction": frozenset(
+        {
+            "subjectType",
+            "permittedFields",
+            "evidenceRefs",
+        }
+    ),
 }
 
 # The serialized-size bound for a minimized context (characters of its canonical JSON). Matches the AI

@@ -21970,27 +21970,60 @@ def _dca_134(ctx: CheckContext) -> dict:
     )
     # A realistic model draft: two grounded claims + a hallucinated span + an unrelated field + a null.
     claims: list[dict] = [
-        {"field": "value_proposition", "value": "small-batch Indian teas", "citationRef": "ev-1",
-         "citedText": "We sell small-batch Indian teas sourced direct from growers.",
-         "inferenceLabel": "observed", "confidence": 0.86},
-        {"field": "business_type", "value": "retail", "citationRef": "ev-1",
-         "citedText": "Industry: retail.", "inferenceLabel": "observed", "confidence": 0.8},
-        {"field": "products", "value": "rockets", "citationRef": "ev-1",
-         "citedText": "We sell rockets to the moon.", "inferenceLabel": "observed", "confidence": 0.9},
-        {"field": "cin", "value": "U17110KA2010PTC000000", "citationRef": "ev-1",
-         "citedText": "Industry: retail.", "inferenceLabel": "observed", "confidence": 0.7},
-        {"field": "gstin", "value": None, "citationRef": "ev-1",
-         "citedText": "GST registered in Karnataka.", "inferenceLabel": "observed", "confidence": 0.3},
+        {
+            "field": "value_proposition",
+            "value": "small-batch Indian teas",
+            "citationRef": "ev-1",
+            "citedText": "We sell small-batch Indian teas sourced direct from growers.",
+            "inferenceLabel": "observed",
+            "confidence": 0.86,
+        },
+        {
+            "field": "business_type",
+            "value": "retail",
+            "citationRef": "ev-1",
+            "citedText": "Industry: retail.",
+            "inferenceLabel": "observed",
+            "confidence": 0.8,
+        },
+        {
+            "field": "products",
+            "value": "rockets",
+            "citationRef": "ev-1",
+            "citedText": "We sell rockets to the moon.",
+            "inferenceLabel": "observed",
+            "confidence": 0.9,
+        },
+        {
+            "field": "cin",
+            "value": "U17110KA2010PTC000000",
+            "citationRef": "ev-1",
+            "citedText": "Industry: retail.",
+            "inferenceLabel": "observed",
+            "confidence": 0.7,
+        },
+        {
+            "field": "gstin",
+            "value": None,
+            "citationRef": "ev-1",
+            "citedText": "GST registered in Karnataka.",
+            "inferenceLabel": "observed",
+            "confidence": 0.3,
+        },
     ]
     model_output = {"claims": claims, "unknowns": ["languages"], "confidence": 0.78}
     permitted = ["value_proposition", "business_type", "products"]
     evidence_body = {
         "businessName": "Acme Teas",
-        "evidence": [{
-            "ref": "ev-1", "content": page,
-            "permittedFields": permitted,
-            "rightsValid": True, "provenance": "website:acme-about",
-        }],
+        "evidence": [
+            {
+                "ref": "ev-1",
+                "content": page,
+                "permittedFields": permitted,
+                "rightsValid": True,
+                "provenance": "website:acme-about",
+            }
+        ],
         "draftFields": ["value_proposition", "business_type", "products", "languages"],
     }
 
@@ -22010,7 +22043,8 @@ def _dca_134(ctx: CheckContext) -> dict:
         # held for review). No network, no model, no spend.
         app.state.ai_capability_facade = AiCapabilityFacade(
             FakeAiGatewayTransport(
-                structured_output=model_output, validation={"humanReviewRequired": True, "taint": True}
+                structured_output=model_output,
+                validation={"humanReviewRequired": True, "taint": True},
             )
         )
 
@@ -22028,17 +22062,20 @@ def _dca_134(ctx: CheckContext) -> dict:
             reason = "-" if f in grounded_fields else dropped.get(f, "?")
             print(f"  - {f:<18} value={str(claim['value'])!r:<26} -> {disp}  reason={reason}")
 
-        print("\nstored DRAFT (version "
-              f"{body.get('version')}, status={body.get('status')!r}):")
+        print("\nstored DRAFT (version " f"{body.get('version')}, status={body.get('status')!r}):")
         print(f"  value_proposition = {body.get('valueProposition')!r}")
         print(f"  business_type     = {body.get('businessType')!r}")
         print(f"  products          = {body.get('products')}  (hallucinated 'rockets' dropped)")
         print(f"  unknowns          = {body.get('unknowns')}")
-        print(f"  overall_confidence= {grounding.get('overallConfidence')}   held_for_review={grounding.get('heldForReview')}")
+        print(
+            f"  overall_confidence= {grounding.get('overallConfidence')}   held_for_review={grounding.get('heldForReview')}"
+        )
         print(f"  references (kept) = {body.get('provenance', {}).get('references')}")
 
         confirmed = client.get(f"{base}/confirmed", headers=auth).json()
-        print(f"\n2) GET confirmed profile         -> confirmed={confirmed['confirmed']} (drafting never confirms)")
+        print(
+            f"\n2) GET confirmed profile         -> confirmed={confirmed['confirmed']} (drafting never confirms)"
+        )
 
         # Denial 1: a rejected gateway output stages NO draft.
         app.state.ai_capability_facade = AiCapabilityFacade(
@@ -22052,18 +22089,26 @@ def _dca_134(ctx: CheckContext) -> dict:
         app.state.ai_capability_facade = None
         disabled = client.post(f"{base}/draft-from-evidence", json=evidence_body, headers=auth)
         versions_after = [r["version"] for r in client.get(f"{base}/drafts", headers=auth).json()]
-        print(f"\n3) rejected gateway output       -> HTTP {rejected.status_code} ({rejected.json()['error']['message']})")
-        print(f"4) capability disabled           -> HTTP {disabled.status_code} ({disabled.json()['error']['message']})")
-        print(f"   draft versions after denials  -> {versions_after} (unchanged; denials stage nothing)")
+        print(
+            f"\n3) rejected gateway output       -> HTTP {rejected.status_code} ({rejected.json()['error']['message']})"
+        )
+        print(
+            f"4) capability disabled           -> HTTP {disabled.status_code} ({disabled.json()['error']['message']})"
+        )
+        print(
+            f"   draft versions after denials  -> {versions_after} (unchanged; denials stage nothing)"
+        )
 
         out = {
             "grounded_fields": sorted(grounded_fields),
             "dropped": dropped,
             "draft": {
-                "version": body.get("version"), "status": body.get("status"),
+                "version": body.get("version"),
+                "status": body.get("status"),
                 "value_proposition": body.get("valueProposition"),
                 "business_type": body.get("businessType"),
-                "products": body.get("products"), "unknowns": body.get("unknowns"),
+                "products": body.get("products"),
+                "unknowns": body.get("unknowns"),
             },
             "overall_confidence": grounding.get("overallConfidence"),
             "held_for_review": grounding.get("heldForReview"),
@@ -22145,16 +22190,36 @@ def _dca_135(ctx: CheckContext) -> dict:
     # An over-scope model plan — the gateway's rule_check would reject this; the fixture bypasses it so
     # we can show the DCA's OWN defensive clamping/exclusion.
     tasks: list[dict] = [
-        {"sourceKey": allowed_key, "fields": ["org_name", "secret_field"],
-         "filters": {"geography": ["KA"], "industries": ["information technology"]}, "maxQueries": 999},
-        {"sourceKey": unentitled_key, "fields": ["org_name"],
-         "filters": {"geography": ["MH"]}, "maxQueries": 2},
-        {"sourceKey": allowed_key, "fields": ["org_name"],
-         "filters": {"geography": ["TN"]}, "maxQueries": 1},  # TN is outside the confirmed ICP
-        {"sourceKey": allowed_key, "fields": ["org_identifier"],
-         "filters": {"geography": ["MH"]}, "maxQueries": 1},
-        {"sourceKey": allowed_key, "fields": ["org_name"],
-         "filters": {"geography": ["KA"]}, "maxQueries": 1},  # beyond the task cap of 2
+        {
+            "sourceKey": allowed_key,
+            "fields": ["org_name", "secret_field"],
+            "filters": {"geography": ["KA"], "industries": ["information technology"]},
+            "maxQueries": 999,
+        },
+        {
+            "sourceKey": unentitled_key,
+            "fields": ["org_name"],
+            "filters": {"geography": ["MH"]},
+            "maxQueries": 2,
+        },
+        {
+            "sourceKey": allowed_key,
+            "fields": ["org_name"],
+            "filters": {"geography": ["TN"]},
+            "maxQueries": 1,
+        },  # TN is outside the confirmed ICP
+        {
+            "sourceKey": allowed_key,
+            "fields": ["org_identifier"],
+            "filters": {"geography": ["MH"]},
+            "maxQueries": 1,
+        },
+        {
+            "sourceKey": allowed_key,
+            "fields": ["org_name"],
+            "filters": {"geography": ["KA"]},
+            "maxQueries": 1,
+        },  # beyond the task cap of 2
     ]
     model_output = {"tasks": tasks, "rationale": "proposed discovery plan", "confidence": 0.72}
 
@@ -22168,38 +22233,86 @@ def _dca_135(ctx: CheckContext) -> dict:
         # Seed a CONFIRMED ICP + ONE approved+entitled source (the full DCA-044..048 rights chain).
         now = datetime.now(UTC)
         with app.state.session_factory() as session:
-            session.add(IcpDraft(business_id=biz_a, version=1, industries=["information technology"],
-                                 size_bands=["small", "medium"], roles=["owner"],
-                                 geography=["KA", "MH"], status="draft"))
-            session.add(IcpConfirmation(business_id=biz_a, version=1, actor_id="seed", actor_type="user"))
-            session.add(Source(key=allowed_key, name=allowed_key, kind=SourceKind.OFFICIAL.value,
-                               trust_tier="official_registry", capabilities=["org_discovery"],
-                               fields=allowed_fields, access_method=SourceAccessMethod.API.value,
-                               india_coverage={"nationwide": True, "states": []},
-                               status=SourceStatus.ENABLED.value, enabled=True, permissions=[]))
-            session.add(SourceTerms(source_key=allowed_key, version=1, operation_rights={"collect": True},
-                                    field_rights={}, purposes=[PLAN_PURPOSE],
-                                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
-                                    status=SourceTermsStatus.ACTIVE.value))
-            session.add(SourceTermsApproval(source_key=allowed_key, terms_version=1, reviewer_id="op-1",
-                                            reviewer_type="platform_operator",
-                                            review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
-                                            reviewed_at=now - timedelta(days=1),
-                                            effective_from=now - timedelta(days=1),
-                                            expires_at=now + timedelta(days=365),
-                                            approved_operation_rights={"collect": True},
-                                            approved_field_rights={}, status=SourceApprovalStatus.ACTIVE.value))
-            session.add(BusinessSourceEntitlement(business_id=biz_a, source_key=allowed_key, version=1,
-                                                  enabled=True, operation_rights={"collect": True},
-                                                  field_rights={}, purposes=[PLAN_PURPOSE],
-                                                  approved_terms_version=1, actor_id="seed", actor_type="user"))
+            session.add(
+                IcpDraft(
+                    business_id=biz_a,
+                    version=1,
+                    industries=["information technology"],
+                    size_bands=["small", "medium"],
+                    roles=["owner"],
+                    geography=["KA", "MH"],
+                    status="draft",
+                )
+            )
+            session.add(
+                IcpConfirmation(business_id=biz_a, version=1, actor_id="seed", actor_type="user")
+            )
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=allowed_fields,
+                    access_method=SourceAccessMethod.API.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                BusinessSourceEntitlement(
+                    business_id=biz_a,
+                    source_key=allowed_key,
+                    version=1,
+                    enabled=True,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    approved_terms_version=1,
+                    actor_id="seed",
+                    actor_type="user",
+                )
+            )
             session.commit()
 
         print("\nconfirmed ICP (the targeting the plan is grounded in):")
-        print("  industries=['information technology']  sizeBands=['small','medium']  "
-              "roles=['owner']  geography=['KA','MH']")
-        print(f"approved+entitled source: '{allowed_key}' permitted_fields={allowed_fields}  "
-              f"(un-entitled: '{unentitled_key}')")
+        print(
+            "  industries=['information technology']  sizeBands=['small','medium']  "
+            "roles=['owner']  geography=['KA','MH']"
+        )
+        print(
+            f"approved+entitled source: '{allowed_key}' permitted_fields={allowed_fields}  "
+            f"(un-entitled: '{unentitled_key}')"
+        )
         print("caps: maxTasks=2  maxQueriesPerTask=3")
 
         app.state.ai_capability_facade = AiCapabilityFacade(
@@ -22213,18 +22326,28 @@ def _dca_135(ctx: CheckContext) -> dict:
         kept_keys = [t["sourceKey"] for t in body.get("tasks", [])]
         for i, t in enumerate(tasks):
             geo = t["filters"].get("geography")
-            print(f"  task[{i}] source={t['sourceKey']:<16} fields={t['fields']} geo={geo} q={t['maxQueries']}")
-        print("\nstored bounded DRAFT plan (version "
-              f"{body.get('version')}, status={body.get('status')!r}):")
+            print(
+                f"  task[{i}] source={t['sourceKey']:<16} fields={t['fields']} geo={geo} q={t['maxQueries']}"
+            )
+        print(
+            "\nstored bounded DRAFT plan (version "
+            f"{body.get('version')}, status={body.get('status')!r}):"
+        )
         for t in body.get("tasks", []):
-            print(f"  KEPT  source={t['sourceKey']:<16} fields={t['fields']} "
-                  f"geo={t['filters']['geography']} maxQueries={t['maxQueries']}")
+            print(
+                f"  KEPT  source={t['sourceKey']:<16} fields={t['fields']} "
+                f"geo={t['filters']['geography']} maxQueries={t['maxQueries']}"
+            )
         print("  excluded (clamped/dropped, recorded):")
         for e in body.get("excluded", []):
-            print(f"    - {e.get('sourceKey','?'):<16} {e['reason']}"
-                  + (f" ({e['detail']})" if e.get("detail") else ""))
-        print(f"  overall_confidence={body.get('overallConfidence')}  executed={body.get('executed')}  "
-              f"autoApproved={body.get('autoApproved')}")
+            print(
+                f"    - {e.get('sourceKey','?'):<16} {e['reason']}"
+                + (f" ({e['detail']})" if e.get("detail") else "")
+            )
+        print(
+            f"  overall_confidence={body.get('overallConfidence')}  executed={body.get('executed')}  "
+            f"autoApproved={body.get('autoApproved')}"
+        )
 
         # Denial 1: a tenant with NO confirmed ICP cannot ground a plan -> 409, nothing staged.
         no_icp = client.post(f"/v1/tenants/{biz_new}/discovery/plans", json={}, headers=auth)
@@ -22234,12 +22357,17 @@ def _dca_135(ctx: CheckContext) -> dict:
         versions_after = [p["version"] for p in client.get(base, headers=auth).json()]
         print(f"\n2) no confirmed ICP (other biz)  -> HTTP {no_icp.status_code}")
         print(f"3) capability disabled           -> HTTP {disabled.status_code}")
-        print(f"   plan versions after denials   -> {versions_after} (unchanged; denials stage nothing)")
+        print(
+            f"   plan versions after denials   -> {versions_after} (unchanged; denials stage nothing)"
+        )
 
         out = {
             "kept_source_keys": kept_keys,
             "kept_task_count": len(body.get("tasks", [])),
-            "excluded": [{"sourceKey": e.get("sourceKey"), "reason": e["reason"]} for e in body.get("excluded", [])],
+            "excluded": [
+                {"sourceKey": e.get("sourceKey"), "reason": e["reason"]}
+                for e in body.get("excluded", [])
+            ],
             "status": body.get("status"),
             "executed": body.get("executed"),
             "auto_approved": body.get("autoApproved"),
@@ -22273,6 +22401,365 @@ def _dca_135(ctx: CheckContext) -> dict:
         "no source, expand no India scope and exceed no cap — every over-scope task is clamped/excluded "
         "and recorded; the plan stays a DRAFT proposal that is NEVER executed and NEVER auto-approved; a "
         "missing ICP, a rejected output or a disabled capability stages nothing.)"
+    )
+    return {"checks": checks, **out}
+
+
+@register(
+    "DCA-136",
+    "extract permitted UNSTRUCTURED observations through the DCA AI chokepoint (the AI counterpart of "
+    "the deterministic DCA-124 website extractor): already-fetched APPROVED + entitled content in, "
+    "permitted ORGANIZATION field observations out — each citation-grounded (DCA-133) before it is "
+    "stored. The content body rides ONLY the untrusted channel (DCA-132); a hallucinated span, a "
+    "NON-permitted personal field (email) and an unknown null are DROPPED (recorded, never written); an "
+    "unentitled source extracts nothing and never calls the model; the observations are never "
+    "auto-applied beyond being observations. Fixture transport only (no network, no model, NO spend).",
+)
+def _dca_136(ctx: CheckContext) -> dict:
+    """Drive the real DCA-136 AI extractor against a disposable DB with isolated synthetic Business A,
+    using the deterministic fixture transport (no network/model/spend) wired to return a realistic model
+    output — three grounded permitted observations plus a hallucinated span, a non-permitted personal
+    field and an unknown null. PRINT, per model observation, whether it was RECORDED (grounded) or
+    DROPPED (with its reason), the stored field observations + cited evidence, and the unentitled-source
+    denial — so a human sees recorded-vs-dropped rather than a bare PASS."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.ai import AiCapabilityFacade, FakeAiGatewayTransport
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import (
+        BusinessSourceEntitlement,
+        EvidenceObject,
+        FieldObservation,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        UnstructuredObservationExtraction,
+    )
+    from app.services.org_observation import ObservationInput, OrgObservationStore
+    from app.sources.unstructured_extract import (
+        REASON_SOURCE_NOT_ENTITLED,
+        FetchedContent,
+        UnstructuredExtractRequest,
+        UnstructuredObservationExtractor,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000000a"
+    now = datetime(2026, 10, 31, 12, 0, tzinfo=UTC)
+    actor = AuditActor(id="00000000-0000-4000-9000-0000000a0136", type=ActorType.USER)
+    source_key = "acme_profile_doc"
+    unentitled_key = "gst_registry"
+    purpose = "prospect_enrichment"
+    content_ref = "doc://acme/profile-2026"
+    permitted = ["legal_name", "industry", "description", "cin", "gstin"]
+
+    content_body = (
+        "About Synthetic Textiles Pvt Ltd.\n"
+        "Legal name: Synthetic Textiles Pvt Ltd.\n"
+        "Industry: Textile Manufacturing.\n"
+        "Description: A synthetic textiles manufacturer based in Maharashtra.\n"
+        "Contact our founder at founder@synthetic.example or +919876543210.\n"
+    )
+    content = FetchedContent(
+        content_ref=content_ref,
+        body=content_body,
+        content_media_type="text/plain",
+        content_kind="business_profile_doc",
+        provenance="source:acme-profile",
+    )
+    observations: list[dict] = [
+        {
+            "field": "legal_name",
+            "value": "Synthetic Textiles Pvt Ltd",
+            "citationRef": content_ref,
+            "citedText": "Legal name: Synthetic Textiles Pvt Ltd.",
+            "inferenceLabel": "observed",
+            "confidence": 0.88,
+        },
+        {
+            "field": "industry",
+            "value": "Textile Manufacturing",
+            "citationRef": content_ref,
+            "citedText": "Industry: Textile Manufacturing.",
+            "inferenceLabel": "observed",
+            "confidence": 0.84,
+        },
+        {
+            "field": "description",
+            "value": "A synthetic textiles manufacturer based in Maharashtra",
+            "citationRef": content_ref,
+            "citedText": "Description: A synthetic textiles manufacturer based in Maharashtra.",
+            "inferenceLabel": "observed",
+            "confidence": 0.8,
+        },
+        {
+            "field": "cin",
+            "value": "U17120MH2026PTC900099",
+            "citationRef": content_ref,
+            "citedText": "CIN: U17120MH2026PTC900099.",  # hallucinated: span NOT in the content
+            "inferenceLabel": "observed",
+            "confidence": 0.7,
+        },
+        {
+            "field": "email",
+            "value": "founder@synthetic.example",
+            "citationRef": content_ref,
+            "citedText": "Contact our founder at founder@synthetic.example or +919876543210.",
+            "inferenceLabel": "observed",
+            "confidence": 0.9,
+        },  # NON-permitted personal field
+        {
+            "field": "gstin",
+            "value": None,
+            "citationRef": content_ref,
+            "citedText": "GST registered in Maharashtra.",
+            "inferenceLabel": "observed",
+            "confidence": 0.3,
+        },  # unknown null
+    ]
+    model_output = {"observations": observations, "unknowns": [], "confidence": 0.82}
+
+    def _seed_catalog(session, key: str) -> None:
+        session.add(
+            Source(
+                key=key,
+                name=key,
+                kind=SourceKind.COMMERCIAL.value,
+                trust_tier="business_document",
+                capabilities=["org_discovery"],
+                fields=list(permitted),
+                access_method=SourceAccessMethod.PORTAL_LOOKUP.value,
+                india_coverage={"nationwide": True, "states": []},
+                status=SourceStatus.ENABLED.value,
+                enabled=True,
+                permissions=[],
+            )
+        )
+        session.add(
+            SourceTerms(
+                source_key=key,
+                version=1,
+                operation_rights={"collect": True, "store": True},
+                field_rights={},
+                purposes=[purpose],
+                contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                status=SourceTermsStatus.ACTIVE.value,
+            )
+        )
+        session.add(
+            SourceTermsApproval(
+                source_key=key,
+                terms_version=1,
+                reviewer_id="op-1",
+                reviewer_type="platform_operator",
+                review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                reviewed_at=now - timedelta(days=1),
+                effective_from=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+                approved_operation_rights={"collect": True, "store": True},
+                approved_field_rights={},
+                status=SourceApprovalStatus.ACTIVE.value,
+            )
+        )
+
+    # 1) Seed the approved+entitled source + subject (Business A) and an UN-entitled source.
+    with ctx.session_factory() as session:
+        _seed_catalog(session, source_key)
+        _seed_catalog(
+            session, unentitled_key
+        )  # approved at platform level, but NO entitlement for A
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz_a,
+                source_key=source_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True, "store": True},
+                field_rights={},
+                purposes=[purpose],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        subject_id = (
+            OrgObservationStore(session, biz_a)
+            .create(
+                ObservationInput(
+                    entity_type="legal_entity", display_name="Synthetic Textiles Pvt Ltd"
+                ),
+                actor=actor,
+                now=now,
+            )
+            .id
+        )
+        session.commit()
+
+    facade = AiCapabilityFacade(
+        FakeAiGatewayTransport(
+            structured_output=model_output, validation={"humanReviewRequired": True, "taint": True}
+        )
+    )
+
+    print(
+        "\nalready-fetched APPROVED + entitled content the DCA retrieved (the ONLY material an "
+        "observation may cite):"
+    )
+    print(f"  - content_ref='{content_ref}'  permitted_fields={permitted}")
+    print("    content:")
+    for line in content_body.splitlines():
+        print(f"      | {line}")
+
+    out: dict = {}
+    # 2) Extract through the one DCA AI chokepoint.
+    with ctx.session_factory() as session:
+        result = UnstructuredObservationExtractor(session, biz_a).extract(
+            facade,
+            UnstructuredExtractRequest(
+                subject_observation_id=subject_id,
+                source_key=source_key,
+                source_version=1,
+                purpose=purpose,
+                invocation_key=f"extract:{subject_id}:1",
+                scope="MH",
+            ),
+            content,
+            actor,
+            now=now,
+        )
+        recorded_fields = {o.field_key for o in result.recorded}
+        dropped = {v.fact.field_key: v.reason for v in result.dropped}
+        print(
+            "\nper model-observation disposition (the independent DCA-133 grounding gate decides):"
+        )
+        for obs in observations:
+            f = obs["field"]
+            disp = "RECORDED" if f in recorded_fields else "DROPPED "
+            reason = "-" if f in recorded_fields else dropped.get(f, "?")
+            print(f"  - {f:<12} value={str(obs['value'])!r:<48} -> {disp}  reason={reason}")
+        print(
+            f"\nheld_for_review={result.outcome.held_for_review if result.outcome else None}  "
+            f"overall_confidence={result.overall_confidence}  synthetic={result.synthetic}"
+        )
+        session.commit()
+
+    # 3) Inspect the stored field observations + cited evidence + provenance row.
+    with ctx.session_factory() as session:
+        fields = session.query(FieldObservation).all()
+        evidence = session.query(EvidenceObject).one()
+        prov = session.query(UnstructuredObservationExtraction).one()
+        print("\nstored field observations (each citing the captured content evidence):")
+        for f in sorted(fields, key=lambda r: r.field_key):
+            print(
+                f"  {f.field_key:<12} = {f.field_value!r:<48} label={f.inference_label} "
+                f"scope={f.scope} source={f.source_key}@{f.source_version}"
+            )
+            print(f"               provenance_ref={f.provenance_ref}")
+        print(
+            f"\ncaptured evidence: id={evidence.id} content_ref={evidence.content_ref!r} "
+            f"retention_mode={evidence.retention_mode}"
+        )
+        print(
+            f"extraction provenance row: fields_recorded={prov.fields_recorded}  "
+            f"observations_dropped={prov.observations_dropped}  content_ref={prov.content_ref!r}"
+        )
+        stored_values = {f.field_value for f in fields}
+
+    # 4) Idempotent replay — a no-op (no second model call, no duplicate observations).
+    replay_transport = FakeAiGatewayTransport(
+        structured_output=model_output, validation={"humanReviewRequired": True, "taint": True}
+    )
+    with ctx.session_factory() as session:
+        again = UnstructuredObservationExtractor(session, biz_a).extract(
+            AiCapabilityFacade(replay_transport),
+            UnstructuredExtractRequest(
+                subject_observation_id=subject_id,
+                source_key=source_key,
+                source_version=1,
+                purpose=purpose,
+                invocation_key=f"extract:{subject_id}:1",
+                scope="MH",
+            ),
+            content,
+            actor,
+            now=now,
+        )
+        session.commit()
+    print(
+        f"\nidempotent replay -> skipped={again.skipped}  model_called={len(replay_transport.calls) > 0}"
+    )
+
+    # 5) An un-entitled source extracts nothing and never calls the model.
+    denial_transport = FakeAiGatewayTransport(structured_output=model_output)
+    with ctx.session_factory() as session:
+        denied = UnstructuredObservationExtractor(session, biz_a).extract(
+            AiCapabilityFacade(denial_transport),
+            UnstructuredExtractRequest(
+                subject_observation_id=subject_id,
+                source_key=unentitled_key,
+                source_version=1,
+                purpose=purpose,
+                invocation_key=f"extract:{subject_id}:unentitled",
+                scope="MH",
+            ),
+            FetchedContent(content_ref="doc://other", body=content_body),
+            actor,
+            now=now,
+        )
+        session.rollback()
+    print(
+        f"\nun-entitled source -> refused={denied.refused_reason!r}  "
+        f"model_called={len(denial_transport.calls) > 0}  (extracts nothing, no spend)"
+    )
+
+    with ctx.session_factory() as session:
+        final_fields = session.query(FieldObservation).count()
+        final_evidence = session.query(EvidenceObject).count()
+        final_prov = session.query(UnstructuredObservationExtraction).count()
+
+    out = {
+        "recorded_fields": sorted(recorded_fields),
+        "dropped": dropped,
+        "email_not_stored": "founder@synthetic.example" not in stored_values,
+        "held_for_review": result.outcome.held_for_review if result.outcome else None,
+        "replay_skipped": again.skipped,
+        "replay_model_called": len(replay_transport.calls) > 0,
+        "unentitled_refused": denied.refused_reason,
+        "unentitled_model_called": len(denial_transport.calls) > 0,
+        "final_fields": final_fields,
+        "final_evidence": final_evidence,
+        "final_prov": final_prov,
+    }
+    checks = {
+        "only_grounded_recorded": out["recorded_fields"]
+        == ["description", "industry", "legal_name"],
+        "hallucinated_dropped": out["dropped"].get("cin") == "citation_not_in_source",
+        "personal_field_excluded": out["dropped"].get("email") == "field_not_permitted",
+        "unknown_null_dropped": out["dropped"].get("gstin") == "unknown_fact_null",
+        "email_not_stored": out["email_not_stored"],
+        "held_for_review": out["held_for_review"] is True,
+        "replay_is_no_op": out["replay_skipped"] and not out["replay_model_called"],
+        "unentitled_extracts_nothing": (
+            out["unentitled_refused"] == REASON_SOURCE_NOT_ENTITLED
+            and not out["unentitled_model_called"]
+        ),
+        "steady_state": out["final_fields"] == 3
+        and out["final_evidence"] == 1
+        and out["final_prov"] == 1,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; fixture transport — no network, no model, NO spend. DCA-136 extracts "
+        "permitted ORGANIZATION observations from already-fetched approved+entitled content through the "
+        "one DCA AI chokepoint: the content body rides only the untrusted channel (DCA-132); each model "
+        "observation must CITE a span the DCA re-grounds (DCA-133) AND name a permitted field before it "
+        "is recorded; hallucinated / personal-non-permitted / unknown observations are DROPPED and never "
+        "written; an unentitled source extracts nothing and never calls the model; the observations are "
+        "never auto-applied beyond being observations.)"
     )
     return {"checks": checks, **out}
 

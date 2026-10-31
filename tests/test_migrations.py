@@ -78,6 +78,7 @@ DCA_TABLES = {
     "contact_imports",
     "source_result_cache",
     "discovery_plans",
+    "unstructured_observation_extractions",
 }
 
 
@@ -2275,6 +2276,60 @@ def test_0053_creates_source_result_cache_on_a_preexisting_database(clean_schema
     assert (
         "uq_source_result_cache_entry" in uniques
     )  # one entry per (tenant, source, version, cache_key)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0055_creates_unstructured_observation_extractions_on_a_preexisting_database(clean_schema):
+    """DCA-136 — the 0055 create branch (for a DB migrated before ``unstructured_observation_extractions``).
+
+    ``unstructured_observation_extractions`` is tenant-owned (RLS-protected), like
+    ``website_fact_extractions`` (0050). A fresh DB gets the table from the metadata baseline (0001) and
+    its RLS policy from 0002, so 0055 is a no-op there. To exercise 0055's real job, upgrade to head, drop
+    the table + policy, stamp history back to 0054, then upgrade to head again — 0055 must recreate the
+    table (with its per-tenant (source_key, subject_id, content_ref) constraint) AND its tenant-isolation
+    RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text('DROP TABLE IF EXISTS "unstructured_observation_extractions" CASCADE')
+        )  # policy drops too
+    eng.dispose()
+
+    command.stamp(cfg, "0054_discovery_plans")  # pretend we predate the AI-extract provenance table
+    command.upgrade(cfg, "head")  # 0055 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "unstructured_observation_extractions" in set(
+        insp.get_table_names(schema=clean_schema)
+    )
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints(
+            "unstructured_observation_extractions", schema=clean_schema
+        )
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'unstructured_observation_extractions' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert (
+        "uq_unstructured_observation_extraction" in uniques
+    )  # one run per (tenant, source, subject, content)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

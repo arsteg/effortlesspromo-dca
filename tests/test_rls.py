@@ -85,6 +85,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "contact_imports",
         "source_result_cache",
         "discovery_plans",
+        "unstructured_observation_extractions",
     }
 
 
