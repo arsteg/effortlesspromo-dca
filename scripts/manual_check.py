@@ -17848,6 +17848,174 @@ def _dca_113(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-114",
+    "reconcile reserved vs actual cost: once a run's actual cost is known, SETTLE the DCA-113 hold at the "
+    "clamped actual (releasing the unused difference back to the budget), RELEASE the whole hold, or mark "
+    "it UNCERTAIN (preserving the full hold - no blind refund/retry). Idempotent on the provider-call "
+    "identity (a duplicate settlement never double-spends); a reservation is reconciled ONCE; authority "
+    "(budget.manage) is checked FIRST. Reconciliation adjusts only the ledger - it spends/sends nothing.",
+)
+def _dca_114(ctx: CheckContext) -> dict:
+    """Drive the DCA-114 reconciliation store directly against the ephemeral synthetic DB and PRINT the
+    REAL before/after reservation + budget-remaining rows - never a bare PASS. Shows: an under-spend
+    SETTLE releases the unused hold back to the budget; an over-run is CLAMPED and FLAGGED (never charged
+    past the cap); a RELEASE frees the whole hold; MARK-UNCERTAIN preserves it; a duplicate settlement
+    under the same provider-call identity is an idempotent replay; a second reconciliation under a
+    different identity is REFUSED (reconciled once). Nothing is spent or sent (the DCA has no such path)."""
+    from datetime import UTC, datetime
+    from typing import cast
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.cost.reconcile import (
+        REASON_ALREADY_RECONCILED,
+        BudgetReconciliationStore,
+        ReconcileOutcome,
+        ReconciliationActor,
+        ReconciliationError,
+        ReconciliationRequest,
+    )
+    from app.cost.reserve import BudgetReservationStore, ReservationActor, ReservationRequest
+    from app.services.budget_store import BudgetLimitInput, BudgetLimitStore
+
+    factory = cast("sessionmaker[Session]", ctx.session_factory)
+    biz = "11111111-1111-1111-1111-11111111b114"
+    res_admin = ReservationActor(subject="00000000-0000-4000-9000-0000000a0114", roles=("admin",))
+    rec_admin = ReconciliationActor(
+        subject="00000000-0000-4000-9000-0000000a0114", roles=("admin",)
+    )
+    budget_actor = AuditActor(id="00000000-0000-4000-9000-0000000b0114", type=ActorType.USER)
+    now = datetime(2026, 10, 31, 9, 0, 0, tzinfo=UTC)  # 2026-10-31 14:30 IST
+
+    # Seed the in-force caps: Rs 500 daily, Rs 10,000 monthly, Rs 500 per-run (in paise) — generous
+    # headroom so the four sequential holds below all fit (a settled hold keeps consuming its actual).
+    with factory() as session:
+        BudgetLimitStore(session, biz).save(
+            BudgetLimitInput(
+                daily_cap_minor=50_000, monthly_cap_minor=1_000_000, per_run_cap_minor=50_000
+            ),
+            budget_actor,
+        )
+        session.commit()
+
+    def _remaining() -> int:
+        with factory() as session:
+            return BudgetReservationStore(session, biz).window(now=now).daily_remaining_minor or 0
+
+    def _row(resv_id: str) -> dict:
+        with factory() as session:
+            r = BudgetReconciliationStore(session, biz)._get(resv_id)
+            assert r is not None  # seeded in this scenario; present
+            return {
+                "id": r.id[:8],
+                "status": r.status,
+                "reserved": r.amount_minor,
+                "actual": r.actual_minor,
+                "settled": r.settled_amount_minor,
+                "overspend": r.overspend_minor,
+            }
+
+    def _reserve(key: str, amount: int) -> str:
+        with factory() as session:
+            r = BudgetReservationStore(session, biz).reserve(
+                ReservationRequest(idempotency_key=key, amount_minor=amount), res_admin, now=now
+            )
+            session.commit()
+            return r.id
+
+    def _reconcile(resv_id, outcome, key, actual=None) -> str:
+        with factory() as session:
+            try:
+                res = BudgetReconciliationStore(session, biz).reconcile(
+                    ReconciliationRequest(resv_id, key, outcome, actual_minor=actual),
+                    rec_admin,
+                    now=now,
+                )
+                session.commit()
+                tag = "replay" if res.replayed else "applied"
+                return (
+                    f"{tag} status={res.status} settled={res.settled_minor} "
+                    f"released={res.released_minor} overspend={res.overspend_minor}"
+                )
+            except ReconciliationError as exc:
+                session.rollback()
+                return f"refused({exc.code})"
+
+    print(f"\nbusiness: ...{biz[-4:]}   in-force caps (paise): daily=50000 per_run=50000")
+    print(f"initial daily remaining: {_remaining()}")
+
+    # 1) Under-spend SETTLE releases the unused hold back to the budget.
+    r1 = _reserve("run-1", 4_000)
+    print("\n1) under-spend settle (reserved 4000, actual 2500 -> release 1500):")
+    print(f"   after reserve:  remaining={_remaining()}  row={_row(r1)}")
+    s1 = _reconcile(r1, ReconcileOutcome.SETTLE, "call-1a", actual=2_500)
+    print(f"   settle actual 2500 -> {s1}")
+    print(f"   after settle:   remaining={_remaining()}  row={_row(r1)}  (freed 1500)")
+
+    # 1b) Duplicate settlement under the SAME provider-call identity is an idempotent replay.
+    dup = _reconcile(r1, ReconcileOutcome.SETTLE, "call-1a", actual=2_500)
+    print(
+        f"   duplicate same identity call-1a -> {dup}  remaining={_remaining()}  (not double-freed)"
+    )
+    # 1c) A different identity against the already-settled hold is refused (reconciled once).
+    diff = _reconcile(r1, ReconcileOutcome.RELEASE, "call-1b")
+    print(f"   different identity call-1b -> {diff}  (REASON={REASON_ALREADY_RECONCILED})")
+
+    # 2) Over-run is CLAMPED and FLAGGED (never charged past the cap).
+    r2 = _reserve("run-2", 2_000)
+    s2 = _reconcile(r2, ReconcileOutcome.SETTLE, "call-2", actual=3_000)
+    print("\n2) over-run settle (reserved 2000, actual 3000 -> clamp to 2000, flag 1000):")
+    print(f"   settle actual 3000 -> {s2}  row={_row(r2)}")
+
+    # 3) RELEASE frees the whole hold; MARK_UNCERTAIN preserves it.
+    r3 = _reserve("run-3", 1_000)
+    before_rel = _remaining()
+    s3 = _reconcile(r3, ReconcileOutcome.RELEASE, "call-3")
+    print("\n3) release vs uncertain:")
+    print(f"   release reserved 1000 -> {s3}  remaining {before_rel} -> {_remaining()}  (freed)")
+    r4 = _reserve("run-4", 1_000)
+    before_unc = _remaining()
+    s4 = _reconcile(r4, ReconcileOutcome.MARK_UNCERTAIN, "call-4")
+    print(
+        f"   mark uncertain reserved 1000 -> {s4}  remaining {before_unc} -> {_remaining()}  (preserved)"
+    )
+
+    checks = {
+        "under_spend_releases_difference": "released=1500" in s1 and _row(r1)["settled"] == 2_500,
+        "duplicate_is_idempotent_replay": dup.startswith("replay"),
+        "reconciled_once": diff == f"refused({REASON_ALREADY_RECONCILED})",
+        "over_run_clamped_and_flagged": _row(r2)["settled"] == 2_000
+        and _row(r2)["overspend"] == 1_000,
+        "release_frees_full_hold": _row(r3)["status"] == "released",
+        "uncertain_preserves_hold": _row(r4)["status"] == "uncertain"
+        and before_unc == _remaining(),
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no spend, no send. DCA-114 RECONCILES a "
+        "DCA-113 hold against the ACTUAL cost once known: SETTLE at min(actual, reserved) with the unused "
+        "difference RELEASED back to the budget, RELEASE the whole hold, or mark UNCERTAIN to PRESERVE the "
+        "full hold (an unknown external result is never blindly refunded or retried). An over-run is "
+        "CLAMPED to the reserved amount and the excess FLAGGED - never retroactively charged past the cap "
+        "the reserve path already enforced. Each reconciliation carries the provider-call identity and is "
+        "idempotent on it (a duplicate settlement never double-spends); a reservation is reconciled ONCE "
+        "under a FOR UPDATE lock (proven on real Postgres in tests/test_budget_reconcile.py); authority "
+        "(budget.manage) is checked FIRST. Reconciling adjusts only the ledger - it spends/sends nothing.)"
+    )
+    return {
+        "under_spend_settle": s1,
+        "duplicate_replay": dup,
+        "different_identity": diff,
+        "over_run_settle": s2,
+        "release": s3,
+        "uncertain": s4,
+        "final_remaining": _remaining(),
+        "checks": checks,
+    }
+
+
 def _row_status(ctx: CheckContext, job_id: str) -> str:
     """The current status of one durable job row (manual-check helper)."""
     from app.db.models import DurableJobRequest

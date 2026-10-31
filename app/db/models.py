@@ -675,18 +675,38 @@ class BudgetLimit(TenantOwned, Base):
 
 
 class ReservationStatus(str, Enum):
-    """DCA-113 — the lifecycle state of one budget reservation.
+    """DCA-113/114 — the lifecycle state of one budget reservation.
 
-    A reservation is a HOLD against a business's spend caps, not a charge: while it is ``ACTIVE`` its
-    amount counts toward the daily / monthly / provider / platform totals, so a later reservation sees
-    less remaining budget and a reservation that would overshoot any cap is refused. ``RELEASED`` is a
-    DISABLED future capability (releasing / settling a hold when a run finishes or is abandoned is a
-    later story, DCA-114+); nothing here ever writes it, and the cap sums count ONLY ``ACTIVE`` rows so
-    a future release path drops out of the totals automatically (expand→migrate→contract, BR-201).
+    A reservation is a HOLD against a business's spend caps, not a charge. While it is ``ACTIVE`` its
+    FULL reserved amount counts toward the daily / monthly / provider / platform totals, so a later
+    reservation sees less remaining budget and a reservation that would overshoot any cap is refused.
+
+    DCA-114 reconciles a hold against the ACTUAL cost once it is known, driving it to a terminal state
+    (the writer :class:`~app.cost.reconcile.BudgetReconciliationStore`):
+
+    - ``SETTLED`` — the actual cost is known and the hold is settled at it (clamped to the reserved
+      amount, never above the cap enforced at reserve time). A settled hold counts its
+      ``settled_amount_minor`` toward the caps, so the unused difference is RELEASED back to the budget.
+    - ``RELEASED`` — the run was abandoned / cost nothing; the whole hold is freed (counts 0).
+    - ``UNCERTAIN`` — the external result is UNKNOWN; the full reserved hold is PRESERVED (counts the
+      reserved amount) and is neither refunded nor retried, awaiting a later, disabled reconciliation.
+
+    The cap sums count the EFFECTIVE amount per status (active/uncertain → the reserved amount, settled →
+    its settled amount, released → 0), so reconciling a hold frees exactly the unused headroom
+    (expand→migrate→contract, BR-201). A reconciliation only adjusts this ledger — it charges and sends
+    nothing (the DCA has no spend or send path); resolving an UNCERTAIN charge is a later, disabled story.
     """
 
     ACTIVE = "active"
+    SETTLED = "settled"
     RELEASED = "released"
+    UNCERTAIN = "uncertain"
+
+    @classmethod
+    def reconciled_values(cls) -> frozenset[str]:
+        """The terminal (already-reconciled) status values — a reservation in any of these has had its
+        one reconciliation applied and can never be reconciled again (DCA-114 "reconciled once")."""
+        return frozenset({cls.SETTLED.value, cls.RELEASED.value, cls.UNCERTAIN.value})
 
 
 class BudgetReservation(TenantOwned, Base):
@@ -722,8 +742,9 @@ class BudgetReservation(TenantOwned, Base):
     name/email), on the atomic DCA-026 audit entry in the SAME unit of work as the row. Tenant-owned: it
     inherits the DCA-017 ``business_id`` column and the DCA-018 RLS policy like every other tenant table,
     so a reservation can never be read or summed across tenants. Reserving holds budget; it spends and
-    sends nothing (releasing/settling a hold and recording actual provider spend are later, disabled
-    stories).
+    sends nothing. DCA-114 reconciles a hold against the actual cost (the ``reconciliation_*`` /
+    ``actual_minor`` / ``settled_amount_minor`` / ``overspend_minor`` columns below) — adjusting only this
+    ledger, charging and sending nothing. Resolving an UNCERTAIN charge stays a later, disabled story.
     """
 
     __tablename__ = "budget_reservations"
@@ -755,8 +776,9 @@ class BudgetReservation(TenantOwned, Base):
     timezone: Mapped[str] = mapped_column(
         String(64), default="Asia/Kolkata", server_default="Asia/Kolkata"
     )
-    # active (held, counts toward the caps) | released (a disabled future capability). Only ACTIVE is ever
-    # written here; the cap sums count only ACTIVE rows.
+    # active (held in full) | settled (reconciled at the actual cost) | released (hold fully freed) |
+    # uncertain (external result unknown; full hold preserved). DCA-113 only ever writes ACTIVE; DCA-114
+    # drives a hold to one terminal state. The cap sums count the EFFECTIVE amount per status.
     status: Mapped[str] = mapped_column(
         String(16),
         default=ReservationStatus.ACTIVE.value,
@@ -768,6 +790,28 @@ class BudgetReservation(TenantOwned, Base):
     actor_id: Mapped[str] = mapped_column(String(128))
     actor_type: Mapped[str] = mapped_column(String(32), default="user", server_default="user")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    # --- DCA-114 reconciliation (all nullable / defaulted: NULL/0 while the hold is still ACTIVE) ---
+    # The provider-call identity that reconciled this hold — the idempotency token for the ONE
+    # reconciliation (a duplicate settlement carrying the SAME identity is a replay, never a second
+    # adjustment). Opaque; NULL until reconciled. Not globally unique (one provider call → one hold).
+    reconciliation_key: Mapped[str | None] = mapped_column(String(128), default=None, index=True)
+    # The REPORTED actual cost in INR minor units (paise), as learned from the provider call — recorded
+    # verbatim even when it exceeds the reserved amount (the overage is flagged, not silently dropped).
+    # NULL while ACTIVE and when the result is UNCERTAIN (an unknown result is never coerced to a number).
+    actual_minor: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # The amount the hold was SETTLED at (what it now counts toward the caps): min(actual, reserved) for a
+    # settle, 0 for a release. NULL while ACTIVE and when UNCERTAIN (the full reserved hold is preserved).
+    settled_amount_minor: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # The flagged overage: max(0, actual - reserved). Non-zero means the actual cost exceeded the hold and
+    # the excess was CLAMPED (never retroactively charged past the cap) but preserved here for review.
+    overspend_minor: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    # WHEN the reconciliation was applied (NULL while ACTIVE).
+    reconciled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # WHO reconciled this — an opaque subject id (never a name/email) plus its kind, screened by the audit
+    # sink in the SAME unit of work. NULL while ACTIVE.
+    reconciled_by_actor_id: Mapped[str | None] = mapped_column(String(128), default=None)
+    reconciled_by_actor_type: Mapped[str | None] = mapped_column(String(32), default=None)
 
 
 class DiscoveryRun(TenantOwned, Base):

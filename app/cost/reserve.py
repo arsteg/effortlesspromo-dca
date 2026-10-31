@@ -39,8 +39,10 @@ audit entry commit together. The load-bearing guarantees (the DCA-113 acceptance
   under a system actor and is a separate, still-disabled capability.
 
 Keeping future/paid capabilities disabled: a reservation HOLDS budget, it never spends, charges, bills or
-sends, and it never invokes a model/provider. Releasing / settling a hold (and recording actual provider
-spend) are later, disabled stories; this writer only ever inserts an ``ACTIVE`` hold.
+sends, and it never invokes a model/provider. This writer only ever inserts an ``ACTIVE`` hold;
+reconciling a hold against the actual cost (release / settle / mark-uncertain) is the sibling DCA-114
+writer :class:`~app.cost.reconcile.BudgetReconciliationStore`, which only adjusts this ledger and still
+spends and sends nothing.
 """
 
 from __future__ import annotations
@@ -49,7 +51,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.audit.sink import ActorType, AuditActor, AuditSink
@@ -291,8 +293,9 @@ class BudgetReservationStore:
            No configured budget → :data:`REASON_NO_BUDGET` (fail-closed; a reservation needs caps).
         5. **Caps.** The amount must fit within the per-run cap, the platform per-reservation ceiling,
            the day's remaining daily cap, the month's remaining monthly cap, an optional provider cap,
-           and the platform daily ceiling — each a stable refusal code. Sums count only ACTIVE holds in
-           the caps' own civil day/month (India-local).
+           and the platform daily ceiling — each a stable refusal code. Sums count the EFFECTIVE held
+           amount per status (DCA-114: active/uncertain → full, settled → its settled amount, released →
+           0) in the caps' own civil day/month (India-local).
 
         On success an ``ACTIVE`` hold is staged with the pinned ``budget_version`` and window keys, plus
         an atomic DCA-026 audit entry (opaque references only) in the SAME unit of work. The caller owns
@@ -464,11 +467,26 @@ class BudgetReservationStore:
         month_key: str | None = None,
         provider: str | None = None,
     ) -> int:
-        """Sum of ACTIVE reservation amounts for this business in the given window (exact minor units)."""
-        stmt = (
-            select(func.coalesce(func.sum(BudgetReservation.amount_minor), 0))
-            .where(BudgetReservation.business_id == self._business_id)
-            .where(BudgetReservation.status == ReservationStatus.ACTIVE.value)
+        """Sum of the EFFECTIVE reserved amount for this business in the given window (exact minor units).
+
+        The effective amount per status (DCA-114): an ``ACTIVE`` or ``UNCERTAIN`` hold counts its full
+        reserved ``amount_minor`` (an unknown result is NOT refunded), a ``SETTLED`` hold counts its
+        ``settled_amount_minor`` (the actual, clamped cost — so the unused difference is freed), and a
+        ``RELEASED`` hold counts 0. Reconciling a hold therefore frees exactly the unused headroom, which
+        a later :meth:`reserve` / :meth:`window` observes as restored remaining budget.
+        """
+        effective = case(
+            (BudgetReservation.status == ReservationStatus.RELEASED.value, 0),
+            (
+                BudgetReservation.status == ReservationStatus.SETTLED.value,
+                func.coalesce(
+                    BudgetReservation.settled_amount_minor, BudgetReservation.amount_minor
+                ),
+            ),
+            else_=BudgetReservation.amount_minor,
+        )
+        stmt = select(func.coalesce(func.sum(effective), 0)).where(
+            BudgetReservation.business_id == self._business_id
         )
         if day_key is not None:
             stmt = stmt.where(BudgetReservation.day_key == day_key)

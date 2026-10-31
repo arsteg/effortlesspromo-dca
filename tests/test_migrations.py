@@ -1791,6 +1791,84 @@ def test_0044_creates_budget_reservations_on_a_preexisting_database(clean_schema
 
 
 @requires_pg
+def test_0045_adds_reconciliation_columns_on_a_preexisting_database(clean_schema):
+    """DCA-114 — the 0045 add-column branch (for a DB migrated before the reconciliation columns existed).
+
+    A fresh DB gets ``budget_reservations`` WITH the DCA-114 reconciliation columns from the metadata
+    baseline (0001), so 0045 is a no-op there. To exercise 0045's real job, upgrade to head, DROP the
+    columns, seed one pre-existing ACTIVE hold, stamp history back to 0044, then upgrade to head again —
+    0045 must re-add exactly those columns and backfill the existing row to "not reconciled" (NULLs with
+    ``overspend_minor`` 0), with no new table and no RLS change (the 0044 policy still covers the table).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "budget_reservations" '
+                'DROP COLUMN "reconciliation_key", DROP COLUMN "actual_minor", '
+                'DROP COLUMN "settled_amount_minor", DROP COLUMN "overspend_minor", '
+                'DROP COLUMN "reconciled_at", DROP COLUMN "reconciled_by_actor_id", '
+                'DROP COLUMN "reconciled_by_actor_type"'
+            )
+        )
+        # Seed one pre-existing (pre-reconciliation) ACTIVE hold to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO budget_reservations "
+                "(id, business_id, schema_version, idempotency_key, amount_minor, currency, provider, "
+                "budget_version, day_key, month_key, timezone, status, actor_id, actor_type, "
+                "created_at) VALUES "
+                "('resv-legacy', 'biz-legacy', 1, 'legacy-key', 4000, 'INR', 'platform', 1, "
+                "'2026-10-31', '2026-10', 'Asia/Kolkata', 'active', 'admin-legacy', 'user', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0044_budget_reservations")  # pretend we predate the reconciliation columns
+    command.upgrade(cfg, "head")  # 0045 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("budget_reservations", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT reconciliation_key, actual_minor, settled_amount_minor, overspend_minor, "
+                "reconciled_at FROM budget_reservations WHERE id = 'resv-legacy'"
+            )
+        ).first()
+        policies = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT tablename FROM pg_policies WHERE schemaname = :s "
+                    "AND tablename = 'budget_reservations' AND policyname = 'tenant_isolation'"
+                ),
+                {"s": clean_schema},
+            ).all()
+        }
+    eng.dispose()
+    assert {
+        "reconciliation_key",
+        "actual_minor",
+        "settled_amount_minor",
+        "overspend_minor",
+        "reconciled_at",
+        "reconciled_by_actor_id",
+        "reconciled_by_actor_type",
+    }.issubset(cols)  # columns re-added
+    assert backfilled == (None, None, None, 0, None)  # pre-existing hold backfilled to "not reconciled"
+    assert policies == {"budget_reservations"}  # tenant-owned RLS unchanged by the add-column migration
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 
