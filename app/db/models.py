@@ -1475,6 +1475,69 @@ class DiscoveryTaskConversion(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class ObservationBatchResolution(TenantOwned, Base):
+    """DCA-144 — the record of RESOLVING one discovery run's converted observation batch (RLS).
+
+    DCA-143 converts each DONE task's staged checkpoint into provenanced :class:`FieldObservation`s
+    about :class:`OrgObservation` subjects. This row is the next step: it RESOLVES that run's batch of
+    subjects by connecting the deterministic DCA-067 identity matcher and the DCA-069/070 canonical
+    selection (with the user-correction overlay) to the batch, and ROUTING an ambiguous match to an
+    existing DCA-137 :class:`IdentityMatchSuggestion` review proposal. It is a read-and-conclude step:
+    it stages review proposals and this summary record, but it **merges nothing, promotes no canonical
+    value into a host/shared record, and performs no fetch, model call, spend or send.**
+
+    **The two load-bearing invariants (the DCA-144 acceptance criteria):**
+
+    - **A batch cannot merge consent.** Resolution NEVER writes a :class:`ConsentReceipt` /
+      :class:`ProcessingRestriction` and never collapses two identities — an ambiguous pair becomes a
+      review-only suggestion (the human-authorized DCA-071 merge is the only path that merges, and it
+      refuses an automation actor). One subject's consent/suppression can never reach another through
+      resolution.
+    - **A batch cannot overwrite a protected correction.** Canonical selection is computed through the
+      pure DCA-070 overlay, so a field with a PROTECTED user correction keeps the corrected value as
+      canonical regardless of any fresher provider observation — and because resolution writes no field
+      value anywhere, the stored correction history is untouched. ``corrections_preserved`` counts the
+      fields where a protected correction held.
+
+    Honest counts only — ``subject_count`` subjects in the batch, how many resolved to an existing
+    entity (``matched_count``), how many were ambiguous and routed to review (``ambiguous_count`` /
+    ``review_suggestion_count``), how many were distinct (``distinct_count``), and the canonical
+    selection summary (``fields_canonicalized`` / ``corrections_preserved``). It holds NO personal/field
+    values — only opaque counts + references to the rows it produced.
+
+    **Idempotent, tenant-owned.** ``(business_id, run_id)`` is unique: a run resolves ONCE — re-resolving
+    returns this existing record and stages no duplicate suggestion and no second audit. The row is owned
+    by exactly one ``business_id`` and read only within it (DCA-017/018); an unknown / cross-tenant run
+    reads as not-found and resolves nothing.
+    """
+
+    __tablename__ = "observation_batch_resolutions"
+    # At most ONE resolution per run in a business — the "a run resolves once" guarantee.
+    __table_args__ = (tenant_unique("run_id", name="uq_observation_batch_resolution_run"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-140 run whose converted observation batch this resolution covers.
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("discovery_run_requests.id"), index=True
+    )
+    # How many organization subjects were in the resolved batch (distinct subjects of the run's DCA-143
+    # field observations), and how each resolved against the business's existing identities.
+    subject_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    matched_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    ambiguous_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    distinct_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Review proposals routed for ambiguous pairs (new this resolution), and the canonical-selection
+    # summary over the batch (fields that resolved to a canonical value; fields held by a protected
+    # user correction over a provider refresh).
+    review_suggestion_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    fields_canonicalized: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    corrections_preserved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Resolution provenance + the load-bearing invariants (merged / sent / spent = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

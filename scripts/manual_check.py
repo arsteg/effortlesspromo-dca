@@ -24277,6 +24277,335 @@ def _dca_143(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-144",
+    "RESOLVE one discovery run's converted observation batch — connect the deterministic DCA-067 "
+    "identity matcher and the DCA-069/070 canonical selection to the batch. An AMBIGUOUS shared-name "
+    "candidate is ROUTED to a review-only suggestion and NEVER merged; a PROTECTED user correction keeps "
+    "its value as canonical (a refresh never overwrites it); consent/identities are never merged; "
+    "re-resolving is an idempotent no-op; a cross-tenant run reads as not-found. NO fetch/model/spend/"
+    "send. Local synthetic only.",
+)
+def _dca_144(ctx: CheckContext) -> dict:
+    """Drive the real DCA-144 resolver against a disposable DB. Business A executes + CONVERTS one task
+    (DCA-142/143) to produce the observation batch, seeds a same-NAME ambiguous identity, and PROTECTS a
+    corrected legal_name; then RESOLVES the run: PRINT the per-subject outcome counts, the routed
+    review-only suggestion, the preserved protected correction and that NOTHING was merged, then an
+    idempotent re-resolve. Business B shows A's run reads as not-found cross-tenant. Nothing fetched,
+    sent or spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        BudgetLimit,
+        BusinessSourceEntitlement,
+        DiscoveryPlan,
+        FieldCorrection,
+        IcpConfirmation,
+        IcpDraft,
+        IdentityMatchSuggestion,
+        IdentityMerge,
+        ObservationBatchResolution,
+        OrgObservation,
+        OrgObservationType,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_observation import DiscoveryObservationConverter, TaskConversionActor
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.discovery_task_execution import (
+        DiscoveryTaskExecutor,
+        OrgDatasetTaskInput,
+        TaskExecutionActor,
+    )
+    from app.services.field_correction import (
+        FieldCorrectionInput,
+        FieldCorrectionStore,
+        FieldCorrector,
+    )
+    from app.services.observation_resolution import (
+        BatchResolutionActor,
+        BatchResolutionError,
+        ObservationBatchResolver,
+    )
+    from app.services.org_observation import ExternalIdInput
+    from app.services.run_plan_approval import RunPlanApprover, approve_run_plan
+    from app.sources.org_dataset_import import DatasetManifest, DatasetRow
+
+    biz_a = "00000000-0000-4000-8000-00000000014a"
+    biz_b = "00000000-0000-4000-8000-00000000014b"
+    allowed_key = "mca_master_data"
+    fixture_name = "Synthetic Textiles Pvt Ltd"
+    exec_admin = TaskExecutionActor(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
+    approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
+    conv_admin = TaskConversionActor(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
+    corrector = FieldCorrector(subject="00000000-0000-4000-9000-0000000a0144c", roles=("owner",))
+    admin = BatchResolutionActor(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
+
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session, biz):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(IcpConfirmation(business_id=biz, version=1, actor_id="seed", actor_type="user"))
+        session.add(
+            BudgetLimit(
+                business_id=biz,
+                version=1,
+                currency="INR",
+                daily_cap_minor=10_000_000,
+                monthly_cap_minor=100_000_000,
+                per_run_cap_minor=1_000_000,
+                timezone="Asia/Kolkata",
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        if not session.query(Source).filter_by(key=allowed_key).count():
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=["org_name", "org_identifier"],
+                    access_method=SourceAccessMethod.BULK_DOWNLOAD.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _planned(session, biz):
+        run = create_discovery_run(session, settings, biz).run
+        assert run is not None
+        session.add(
+            DiscoveryPlan(
+                business_id=biz,
+                version=1,
+                icp_version=1,
+                status="draft",
+                tasks=[
+                    {
+                        "sourceKey": allowed_key,
+                        "fields": ["org_name"],
+                        "filters": {"geography": ["KA"]},
+                        "maxQueries": 2,
+                    }
+                ],
+                excluded=[],
+                task_cap=5,
+                query_cap=3,
+                rationale="reviewed discovery plan",
+                overall_confidence=0.8,
+                source="discovery_plan",
+                source_version="pv-1",
+                provenance={},
+            )
+        )
+        session.flush()
+        approve_run_plan(session, biz, run.id, 1, approver)
+        session.flush()
+        return run
+
+    def _adapter_input():
+        return OrgDatasetTaskInput(
+            manifest=DatasetManifest(
+                dataset_id="mca-2026-q3",
+                source_key=allowed_key,
+                source_version="2026-09-30",
+                license="data.gov.in-GODL-1.0",
+                purpose=PLAN_PURPOSE,
+            ),
+            rows=(
+                DatasetRow(
+                    row_ref="le-1",
+                    entity_type="legal_entity",
+                    display_name=fixture_name,
+                    external_ids=(ExternalIdInput("cin", "U17120MH2026PTC900099"),),
+                ),
+            ),
+        )
+
+    print("\nresolve one observation batch (local synthetic — nothing fetched/sent/spent):")
+
+    with ctx.session_factory() as session:
+        _seed(session, biz_a)
+        _seed(session, biz_b)
+        session.flush()
+        run_a = _planned(session, biz_a)
+        session.commit()
+        run_a_id = run_a.id
+
+        # A — execute (DCA-142) + convert (DCA-143) to produce the observation batch.
+        DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run_a_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        DiscoveryObservationConverter(session, biz_a).convert_task(run_a_id, 0, conv_admin)
+        session.commit()
+        subject = session.query(OrgObservation).filter_by(business_id=biz_a).one()
+
+        # A — a same-NAME identity with NO confirming identifier (an ambiguous REVIEW candidate).
+        other = OrgObservation(
+            business_id=biz_a,
+            entity_type=OrgObservationType.LEGAL_ENTITY.value,
+            display_name=fixture_name,
+        )
+        session.add(other)
+        session.flush()
+
+        # A — the user PROTECTS a corrected legal_name before resolution runs.
+        FieldCorrectionStore(session, biz_a).record(
+            FieldCorrectionInput(
+                subject_type="organization",
+                subject_id=subject.id,
+                field_key="legal_name",
+                corrected_value="Synthetic Textiles Private Limited (user)",
+                protected_from_refresh=True,
+            ),
+            corrector,
+        )
+        session.commit()
+
+        res = ObservationBatchResolver(session, biz_a).resolve_run(run_a_id, admin)
+        session.commit()
+        suggestions = session.query(IdentityMatchSuggestion).filter_by(business_id=biz_a).all()
+        merges = session.query(IdentityMerge).filter_by(business_id=biz_a).count()
+        correction = (
+            session.query(FieldCorrection)
+            .filter_by(business_id=biz_a, subject_id=subject.id, field_key="legal_name")
+            .one()
+        )
+        print("\n  Business A — AFTER resolving the run's batch:")
+        print(
+            f"      subjects={res.subject_count}  matched={res.matched_count}  "
+            f"ambiguous={res.ambiguous_count}  distinct={res.distinct_count}"
+        )
+        print(
+            f"      reviewSuggestionsRouted={res.review_suggestions}  identityMerges={merges}  "
+            f"(ambiguous pairs go to REVIEW, never merged)"
+        )
+        print(
+            f"      fieldsCanonicalized={res.fields_canonicalized}  "
+            f"correctionsPreserved={res.corrections_preserved}  "
+            f"protectedLegalName={correction.corrected_value!r} (untouched)"
+        )
+        for s in suggestions:
+            print(
+                f"        suggestion pair={{{s.subject_a_id[:8]}…, {s.subject_b_id[:8]}…}} "
+                f"outcome={s.match_outcome} confidence={s.match_confidence}"
+            )
+
+        # A — re-resolve: an idempotent no-op (a run resolves once).
+        res2 = ObservationBatchResolver(session, biz_a).resolve_run(run_a_id, admin)
+        session.commit()
+        resolutions = session.query(ObservationBatchResolution).filter_by(business_id=biz_a).count()
+        suggestions_after = session.query(IdentityMatchSuggestion).filter_by(business_id=biz_a).count()
+        print(
+            f"\n  Business A — re-resolve idempotent: already_resolved={res2.already_resolved}  "
+            f"resolutions still={resolutions}  suggestions still={suggestions_after}"
+        )
+
+        # B — A's run is not-found cross-tenant (a B-scoped resolver can never reach it).
+        refused_code = None
+        try:
+            ObservationBatchResolver(session, biz_b).resolve_run(run_a_id, admin)
+        except BatchResolutionError as exc:
+            refused_code = exc.code
+        print("\n  Business B — A's run is not reachable cross-tenant:")
+        print(f"      resolveRefusedWith={refused_code}")
+        b_resolutions = session.query(ObservationBatchResolution).filter_by(business_id=biz_b).count()
+
+    checks = {
+        "a_single_subject_batch": res.subject_count == 1,
+        "a_ambiguous_routed_to_review": res.ambiguous_count == 1 and res.review_suggestions == 1,
+        "a_nothing_merged": merges == 0 and len(suggestions) == 1,
+        "a_protected_correction_preserved": res.corrections_preserved >= 1
+        and correction.corrected_value == "Synthetic Textiles Private Limited (user)",
+        "a_reresolve_idempotent": res2.already_resolved is True
+        and resolutions == 1
+        and suggestions_after == 1,
+        "b_cross_tenant_not_found": refused_code == "discovery_run_not_found"
+        and b_resolutions == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-144 RESOLVES one run's "
+        "converted observation batch: an ambiguous shared-name candidate is ROUTED to a review-only "
+        "suggestion and never merged, a protected user correction stays canonical and untouched, no "
+        "consent/identities are merged, re-resolving is a no-op, and a cross-tenant run reads as "
+        "not-found.)"
+    )
+    return {
+        "checks": checks,
+        "run": run_a_id,
+        "ambiguous": res.ambiguous_count,
+        "reviewSuggestions": res.review_suggestions,
+        "correctionsPreserved": res.corrections_preserved,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

@@ -85,6 +85,7 @@ DCA_TABLES = {
     "discovery_run_requests",
     "discovery_task_executions",
     "discovery_task_conversions",
+    "observation_batch_resolutions",
 }
 
 
@@ -2628,6 +2629,51 @@ def test_0062_creates_discovery_task_conversions_on_a_preexisting_database(clean
         ).first()
     eng.dispose()
     assert "uq_discovery_task_conversion_task" in uniques  # one conversion per (tenant, run, task)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0063_creates_observation_batch_resolutions_on_a_preexisting_database(clean_schema):
+    """DCA-144 — the 0063 create branch (for a DB migrated before ``observation_batch_resolutions``).
+
+    ``observation_batch_resolutions`` is tenant-owned (RLS-protected), like ``discovery_task_conversions``
+    (0062). A fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so
+    0063 is a no-op there. To exercise 0063's real job, upgrade to head, drop the table + policy, stamp
+    history back to 0062, then upgrade to head again — 0063 must recreate the table (with its per-tenant
+    per-run unique constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "observation_batch_resolutions" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0062_discovery_task_conversions")  # pretend we predate the resolution table
+    command.upgrade(cfg, "head")  # 0063 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "observation_batch_resolutions" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("observation_batch_resolutions", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'observation_batch_resolutions' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_observation_batch_resolution_run" in uniques  # one resolution per (tenant, run)
     assert policy is not None  # RLS re-established, not just the bare table
 
 
