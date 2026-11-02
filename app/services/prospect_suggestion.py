@@ -41,7 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.audit.sink import ActorType, AuditActor, AuditSink
@@ -508,6 +508,199 @@ class ProspectSuggestionCreator:
         return suggestion
 
 
+# --------------------------------------------------------------------------------------------------
+# DCA-150 — list the business's VISIBLE prospect suggestions (a tenant-scoped, read-only candidate list)
+# --------------------------------------------------------------------------------------------------
+
+# The one status a suggestion holds while it is reviewable: DCA-145 writes only ``suggested`` and
+# acceptance / dismissal stay disabled future capabilities, so a listable suggestion must be in exactly
+# this status — a dismissed / accepted / any-other-status row is NOT visible and is never listed.
+VISIBLE_STATUS = "suggested"
+
+# The visibility constraints a LISTABLE suggestion may carry. Only a research-only organization is a
+# reviewable candidate here; a SENDABLE suggestion is a disabled future capability (making a prospect
+# sendable requires recipient consent, which accepting a suggestion is NOT) — no path produces one and
+# the list never surfaces one, so a prospect can never silently become a sendable recipient through a
+# read. Keeping it a set makes the visible vocabulary explicit and extend-by-data, not by code.
+VISIBLE_VISIBILITIES: frozenset[str] = frozenset({SuggestionVisibility.RESEARCH_ONLY.value})
+
+# Pagination bounds for the candidate list. A page is capped so one read can never pull an unbounded
+# result set; the default keeps a review page small.
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 200
+
+
+@dataclass(frozen=True)
+class SuggestionListFilters:
+    """The safe, optional filters a caller may narrow the candidate list by.
+
+    ``run_id`` confines the page to one discovery run's suggestions; ``min_score`` keeps only
+    suggestions whose deterministic ICP fit is at least the floor. Both only ever NARROW the visible
+    set — they can never widen it past the tenant scope or surface a non-visible (expired / dismissed /
+    sendable) row.
+    """
+
+    run_id: str | None = None
+    min_score: float | None = None
+
+
+@dataclass(frozen=True)
+class SuggestionListItem:
+    """One rights-aware row in a visible-suggestion page.
+
+    Carries only the suggestion's opaque scoring metadata — the subject id + scoring/targeting/expiry
+    attributes — and NEVER a contact value (none is stored on a research-only organization suggestion).
+    ``sendable`` is surfaced so a consumer can see the research-only vs sendable distinction, and is
+    always ``False`` here (a sendable suggestion is a disabled future capability the list never returns).
+    """
+
+    id: str
+    run_id: str
+    subject_type: str
+    subject_id: str
+    visibility: str
+    status: str
+    match_score: float
+    rationale: str
+    scored_icp_version: int | None
+    schema_version: int
+    matched_dimensions: list[str]
+    created_at: datetime | None
+    expires_at: datetime | None
+
+    @property
+    def sendable(self) -> bool:
+        return self.visibility == SuggestionVisibility.SENDABLE.value
+
+    @classmethod
+    def of(cls, row: ProspectSuggestion) -> SuggestionListItem:
+        provenance = row.provenance or {}
+        return cls(
+            id=row.id,
+            run_id=row.run_id,
+            subject_type=row.subject_type,
+            subject_id=row.subject_id,
+            visibility=row.visibility,
+            status=row.status,
+            match_score=row.match_score,
+            rationale=row.rationale,
+            scored_icp_version=row.scored_icp_version,
+            schema_version=row.schema_version,
+            matched_dimensions=list(provenance.get("matchedDimensions", [])),
+            created_at=row.created_at,
+            expires_at=row.expires_at,
+        )
+
+
+@dataclass(frozen=True)
+class SuggestionPage:
+    """One page of this business's visible suggestions plus the pagination cursor.
+
+    ``total`` is the full count of VISIBLE suggestions matching the filters (not just this page), so a
+    consumer can page deterministically; ``has_more`` is derived from where this page sits in that total.
+    """
+
+    business_id: str
+    generated_at: datetime
+    items: list[SuggestionListItem]
+    total: int
+    limit: int
+    offset: int
+
+    @property
+    def has_more(self) -> bool:
+        return self.offset + len(self.items) < self.total
+
+
+class ProspectSuggestionReader:
+    """List ONE business's VISIBLE prospect suggestions (DCA-150) — a read-only candidate list.
+
+    Construct with the active session and the verified business scope (a route resolves it from the
+    membership-verified tenant context). Every query is confined to this business, so a page can never
+    leak another tenant's rows. A suggestion is VISIBLE — and so listable — only when it is in the
+    reviewable ``suggested`` status, carries a visible visibility constraint (research-only; the
+    disabled sendable future capability is never surfaced) and has not expired (``expires_at`` in the
+    future or unset). An expired suggestion drops out of the list, so source/policy invalidation that
+    drives the DCA-145 expiry affects reads. Reading writes nothing, spends nothing and sends nothing,
+    so the list reproduces with no state change.
+    """
+
+    def __init__(self, session: Session, business_id: str) -> None:
+        self._session = session
+        self._business_id = business_id
+
+    def _visible_predicate(self, now: datetime) -> list:
+        """The fail-closed VISIBLE predicate: tenant-scoped + reviewable status + visible visibility +
+        not expired. Tenant scope is enforced in SQL, so a non-member's business id simply matches no
+        row (and the HTTP boundary denies a non-member before this runs)."""
+        return [
+            ProspectSuggestion.business_id == self._business_id,
+            ProspectSuggestion.status == VISIBLE_STATUS,
+            ProspectSuggestion.visibility.in_(VISIBLE_VISIBILITIES),
+            or_(
+                ProspectSuggestion.expires_at.is_(None),
+                ProspectSuggestion.expires_at > now,
+            ),
+        ]
+
+    def _filter_predicate(self, filters: SuggestionListFilters | None) -> list:
+        """The optional, NARROWING-only safe filters (run + minimum score)."""
+        clauses: list = []
+        if filters is None:
+            return clauses
+        if filters.run_id:
+            clauses.append(ProspectSuggestion.run_id == filters.run_id)
+        if filters.min_score is not None:
+            clauses.append(ProspectSuggestion.match_score >= filters.min_score)
+        return clauses
+
+    def list_visible(
+        self,
+        *,
+        filters: SuggestionListFilters | None = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        offset: int = 0,
+        now: datetime | None = None,
+    ) -> SuggestionPage:
+        """One page of this business's VISIBLE suggestions, newest-and-best first.
+
+        ``limit`` is clamped to :data:`MAX_PAGE_SIZE` (and to at least 1) and ``offset`` floored at 0, so
+        a caller can never request an unbounded or negative page. Ordering is deterministic
+        (``match_score`` desc, then ``created_at`` desc, then ``id``) so paging is stable. ``total`` is
+        the full count of matching visible suggestions. Nothing is written.
+        """
+        moment = now or datetime.now(UTC)
+        bounded_limit = max(1, min(limit, MAX_PAGE_SIZE))
+        bounded_offset = max(0, offset)
+        predicate = self._visible_predicate(moment) + self._filter_predicate(filters)
+
+        total = (
+            self._session.scalar(
+                select(func.count()).select_from(ProspectSuggestion).where(*predicate)
+            )
+            or 0
+        )
+        rows = self._session.scalars(
+            select(ProspectSuggestion)
+            .where(*predicate)
+            .order_by(
+                ProspectSuggestion.match_score.desc(),
+                ProspectSuggestion.created_at.desc(),
+                ProspectSuggestion.id,
+            )
+            .limit(bounded_limit)
+            .offset(bounded_offset)
+        ).all()
+        return SuggestionPage(
+            business_id=self._business_id,
+            generated_at=moment,
+            items=[SuggestionListItem.of(row) for row in rows],
+            total=int(total),
+            limit=bounded_limit,
+            offset=bounded_offset,
+        )
+
+
 __all__ = [
     "SUBJECT_TYPE",
     "DIMENSION_INDUSTRY",
@@ -527,4 +720,12 @@ __all__ = [
     "ProspectSuggestionResult",
     "ProspectSuggestionCreator",
     "score_against_icp",
+    "VISIBLE_STATUS",
+    "VISIBLE_VISIBILITIES",
+    "DEFAULT_PAGE_SIZE",
+    "MAX_PAGE_SIZE",
+    "SuggestionListFilters",
+    "SuggestionListItem",
+    "SuggestionPage",
+    "ProspectSuggestionReader",
 ]

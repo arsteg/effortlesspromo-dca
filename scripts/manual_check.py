@@ -26094,6 +26094,151 @@ def _dca_149(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-150",
+    "LIST a business's VISIBLE prospect suggestions — a tenant-scoped, read-only candidate list with "
+    "safe filters (one run, a minimum ICP fit) and bounded pagination. Only VISIBLE suggestions are "
+    "returned: the reader honours every DCA-145 visibility constraint — the reviewable 'suggested' "
+    "status, research_only vs the disabled 'sendable' future capability, and expiry — so a dismissed / "
+    "expired / sendable row is omitted, and each row carries only rights-aware fields (opaque scoring "
+    "metadata, never a contact value). Tenant-scoped: Business B never sees A's candidates. NOTHING "
+    "fetched/sent/spent/written. Local synthetic.",
+)
+def _dca_150(ctx: CheckContext) -> dict:
+    """Drive the real DCA-150 reader against a disposable DB with isolated synthetic Businesses A/B.
+    PRINT the actual visible page: a mix of visible / expired / dismissed / sendable suggestions is
+    seeded for A, and the reader returns ONLY the visible research-only unexpired ones (ordered by ICP
+    fit); the safe filters narrow the page; pagination is bounded and deterministic; and Business B
+    never sees A's candidates. Listing reads inert rows and writes nothing — no fetch, model, spend or
+    send."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import AuditEvent, ProspectSuggestion, SuggestionVisibility
+    from app.services.prospect_suggestion import (
+        MAX_PAGE_SIZE,
+        ProspectSuggestionReader,
+        SuggestionListFilters,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000150a"
+    biz_b = "00000000-0000-4000-8000-00000000150b"
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    def _row(
+        business_id,
+        subject_id,
+        *,
+        run_id="run-150",
+        status="suggested",
+        visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+        score=0.5,
+        expires_in_days=30,
+    ):
+        expires = None if expires_in_days is None else now + timedelta(days=expires_in_days)
+        return ProspectSuggestion(
+            business_id=business_id,
+            run_id=run_id,
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=visibility,
+            match_score=score,
+            rationale=f"ICP fit {score:.2f}",
+            scored_icp_version=1,
+            schema_version=1,
+            status=status,
+            provenance={
+                "source": "prospect_suggestion",
+                "matchedDimensions": ["industry"],
+                "sendable": False,
+                "addedToAudience": False,
+            },
+            created_at=now,
+            expires_at=expires,
+        )
+
+    print("\nlist VISIBLE prospect suggestions (local synthetic — nothing fetched/written):")
+
+    with ctx.session_factory() as session:
+        session.add_all(
+            [
+                _row(biz_a, "visible-high", run_id="run-x", score=0.9),
+                _row(biz_a, "visible-low", run_id="run-y", score=0.3),
+                _row(biz_a, "expired", score=0.8, expires_in_days=-1),
+                _row(biz_a, "dismissed", status="dismissed", score=0.95),
+                _row(biz_a, "sendable", visibility=SuggestionVisibility.SENDABLE.value, score=0.99),
+                _row(biz_b, "b-only", score=0.7),
+            ]
+        )
+        session.commit()
+
+        audits_before = session.query(AuditEvent).count()
+        rows_before = session.query(ProspectSuggestion).count()
+
+        reader_a = ProspectSuggestionReader(session, biz_a)
+        visible = reader_a.list_visible(now=now)
+        print("\n  [1] A's visible page (expired / dismissed / sendable omitted):")
+        for item in visible.items:
+            print(
+                f"      - {item.subject_id}  score={item.match_score}  "
+                f"visibility={item.visibility}  sendable={item.sendable}"
+            )
+        print(f"      total={visible.total}  hasMore={visible.has_more}")
+
+        filtered = reader_a.list_visible(
+            filters=SuggestionListFilters(run_id="run-x", min_score=0.5), now=now
+        )
+        print("\n  [2] safe filters narrow the page (runId=run-x, minScore=0.5):")
+        print(f"      subjects={[i.subject_id for i in filtered.items]}")
+
+        page1 = reader_a.list_visible(limit=1, offset=0, now=now)
+        page2 = reader_a.list_visible(limit=1, offset=1, now=now)
+        clamped = reader_a.list_visible(limit=10_000, now=now)
+        print("\n  [3] bounded, deterministic pagination:")
+        print(
+            f"      page1={[i.subject_id for i in page1.items]} hasMore={page1.has_more}  "
+            f"page2={[i.subject_id for i in page2.items]}  clampedLimit={clamped.limit}"
+        )
+
+        b_page = ProspectSuggestionReader(session, biz_b).list_visible(now=now)
+        print("\n  [4] tenant isolation — Business B sees only its own candidates:")
+        print(f"      B.subjects={[i.subject_id for i in b_page.items]}")
+
+        audits_after = session.query(AuditEvent).count()
+        rows_after = session.query(ProspectSuggestion).count()
+
+    no_state_change = audits_after == audits_before and rows_after == rows_before
+    visible_subjects = [i.subject_id for i in visible.items]
+    b_subjects = [i.subject_id for i in b_page.items]
+
+    checks = {
+        "only_visible_listed": visible_subjects == ["visible-high", "visible-low"]
+        and visible.total == 2,
+        "sendable_never_surfaced": all(i.sendable is False for i in visible.items)
+        and "sendable" not in visible_subjects,
+        "filters_only_narrow": [i.subject_id for i in filtered.items] == ["visible-high"],
+        "pagination_bounded_deterministic": [i.subject_id for i in page1.items] == ["visible-high"]
+        and page1.has_more is True
+        and [i.subject_id for i in page2.items] == ["visible-low"]
+        and clamped.limit == MAX_PAGE_SIZE,
+        "tenant_isolated": b_subjects == ["b-only"] and "b-only" not in visible_subjects,
+        "read_only_no_state_change": no_state_change,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-150 LISTS a business's "
+        "VISIBLE prospect suggestions: it honours every DCA-145 visibility constraint — reviewable "
+        "status, research_only vs the disabled sendable future capability, and expiry — returns only "
+        "rights-aware fields (never a contact value), is tenant-scoped so one business never pages into "
+        "another's candidates, and writes nothing, so the list and its denials reproduce with no state "
+        "change. Acceptance stays a human action and is NOT recipient consent.)"
+    )
+    return {
+        "checks": checks,
+        "visibleSubjects": visible_subjects,
+        "bSubjects": b_subjects,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
