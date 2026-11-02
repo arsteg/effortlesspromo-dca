@@ -24606,6 +24606,334 @@ def _dca_144(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-145",
+    "CREATE one scoped prospect suggestion from a resolved discovery observation — convert an eligible "
+    "resolved organization subject into a business-scoped candidate with a deterministic ICP "
+    "score/rationale, the targeting version, an expiry and a visibility constraint. The suggestion is "
+    "RESEARCH-ONLY (never a sendable contact) and creating it adds NO audience membership (acceptance is "
+    "not consent); re-suggesting is an idempotent no-op; an unauthorized caller and a cross-tenant run "
+    "are both refused with no state change. NO fetch/model/spend/send/auto-accept. Local synthetic only.",
+)
+def _dca_145(ctx: CheckContext) -> dict:
+    """Drive the real DCA-145 creator against a disposable DB. Business A executes + converts (DCA-142/143)
+    + resolves (DCA-144) one run to produce a resolved organization subject, records an industry field so
+    the deterministic ICP fit is a crisp 0.5, then SUGGESTS: PRINT the created suggestion's
+    score/rationale/version/expiry/visibility, that it is research-only + non-sendable, that the host
+    audience (consent-receipt) count is UNCHANGED, an idempotent re-suggest, and the refusals (an
+    unauthorized viewer, and Business B reading A's run as not-found). Nothing fetched, sent or spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import (
+        BudgetLimit,
+        BusinessSourceEntitlement,
+        ConsentReceipt,
+        DiscoveryPlan,
+        FieldInferenceLabel,
+        IcpConfirmation,
+        IcpDraft,
+        OrgObservation,
+        ProspectSuggestion,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_observation import DiscoveryObservationConverter, TaskConversionActor
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.discovery_task_execution import (
+        DiscoveryTaskExecutor,
+        OrgDatasetTaskInput,
+        TaskExecutionActor,
+    )
+    from app.services.field_observation import FieldObservationInput, FieldObservationStore
+    from app.services.observation_resolution import BatchResolutionActor, ObservationBatchResolver
+    from app.services.org_observation import ExternalIdInput
+    from app.services.prospect_suggestion import (
+        ProspectSuggestionActor,
+        ProspectSuggestionAuthorizationError,
+        ProspectSuggestionCreator,
+        ProspectSuggestionError,
+        SuggestionVisibility,
+    )
+    from app.services.run_plan_approval import RunPlanApprover, approve_run_plan
+    from app.sources.org_dataset_import import DatasetManifest, DatasetRow
+
+    biz_a = "00000000-0000-4000-8000-00000000015a"
+    biz_b = "00000000-0000-4000-8000-00000000015b"
+    allowed_key = "mca_master_data"
+    fixture_name = "Synthetic Textiles Pvt Ltd"
+    exec_admin = TaskExecutionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    conv_admin = TaskConversionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    resolve_admin = BatchResolutionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    field_actor = AuditActor(id="00000000-0000-4000-9000-0000000a0145c", type=ActorType.USER)
+    admin = ProspectSuggestionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    viewer = ProspectSuggestionActor(subject="00000000-0000-4000-9000-0000000a0145b", roles=("viewer",))
+
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session, biz):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(IcpConfirmation(business_id=biz, version=1, actor_id="seed", actor_type="user"))
+        session.add(
+            BudgetLimit(
+                business_id=biz,
+                version=1,
+                currency="INR",
+                daily_cap_minor=10_000_000,
+                monthly_cap_minor=100_000_000,
+                per_run_cap_minor=1_000_000,
+                timezone="Asia/Kolkata",
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        if not session.query(Source).filter_by(key=allowed_key).count():
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=["org_name", "org_identifier"],
+                    access_method=SourceAccessMethod.BULK_DOWNLOAD.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _planned(session, biz):
+        run = create_discovery_run(session, settings, biz).run
+        assert run is not None
+        session.add(
+            DiscoveryPlan(
+                business_id=biz,
+                version=1,
+                icp_version=1,
+                status="draft",
+                tasks=[
+                    {
+                        "sourceKey": allowed_key,
+                        "fields": ["org_name"],
+                        "filters": {"geography": ["KA"]},
+                        "maxQueries": 2,
+                    }
+                ],
+                excluded=[],
+                task_cap=5,
+                query_cap=3,
+                rationale="reviewed discovery plan",
+                overall_confidence=0.8,
+                source="discovery_plan",
+                source_version="pv-1",
+                provenance={},
+            )
+        )
+        session.flush()
+        approve_run_plan(session, biz, run.id, 1, approver)
+        session.flush()
+        return run
+
+    def _adapter_input():
+        return OrgDatasetTaskInput(
+            manifest=DatasetManifest(
+                dataset_id="mca-2026-q3",
+                source_key=allowed_key,
+                source_version="2026-09-30",
+                license="data.gov.in-GODL-1.0",
+                purpose=PLAN_PURPOSE,
+            ),
+            rows=(
+                DatasetRow(
+                    row_ref="le-1",
+                    entity_type="legal_entity",
+                    display_name=fixture_name,
+                    external_ids=(ExternalIdInput("cin", "U17120MH2026PTC900099"),),
+                ),
+            ),
+        )
+
+    print("\ncreate one scoped prospect suggestion (local synthetic — nothing fetched/sent/spent):")
+
+    with ctx.session_factory() as session:
+        _seed(session, biz_a)
+        _seed(session, biz_b)
+        session.flush()
+        run_a = _planned(session, biz_a)
+        session.commit()
+        run_a_id = run_a.id
+
+        # A — execute (DCA-142) + convert (DCA-143) + resolve (DCA-144) to produce a resolved subject.
+        DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run_a_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        DiscoveryObservationConverter(session, biz_a).convert_task(run_a_id, 0, conv_admin)
+        session.commit()
+        subject = session.query(OrgObservation).filter_by(business_id=biz_a).one()
+        # Record an industry field matching the ICP so the deterministic fit is a crisp 0.5.
+        FieldObservationStore(session, biz_a).record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=subject.id,
+                field_key="industry",
+                field_value="information technology",
+                inference_label=FieldInferenceLabel.OBSERVED.value,
+                provenance_ref=f"discovery_run:{run_a_id}/task:0#evidence=seed",
+                observed_at=datetime.now(UTC),
+                scope="nationwide",
+                rights_basis="synthetic_fixture",
+                source_key=allowed_key,
+                source_version=1,
+            ),
+            field_actor,
+        )
+        session.commit()
+        ObservationBatchResolver(session, biz_a).resolve_run(run_a_id, resolve_admin)
+        session.commit()
+
+        consent_before = session.query(ConsentReceipt).filter_by(business_id=biz_a).count()
+
+        # A — CREATE the scoped prospect suggestion.
+        res = ProspectSuggestionCreator(session, biz_a).suggest(run_a_id, subject.id, admin)
+        session.commit()
+        consent_after = session.query(ConsentReceipt).filter_by(business_id=biz_a).count()
+        row = session.query(ProspectSuggestion).filter_by(business_id=biz_a).one()
+        print("\n  Business A — the created prospect suggestion:")
+        print(f"      subject            = {subject.id[:8]}… ({subject.display_name!r})")
+        print(f"      matchScore         = {res.match_score}  matchedDimensions={res.matched_dimensions}")
+        print(f"      rationale          = {res.rationale!r}")
+        print(f"      scoredIcpVersion   = {res.scored_icp_version}  schemaVersion={row.schema_version}")
+        print(f"      visibility         = {res.visibility}  sendable={res.sendable}")
+        print(f"      status             = {row.status}  expiresAt={res.expires_at}")
+        print(
+            f"      research-only org, NOT a sendable contact — consent/audience receipts "
+            f"before={consent_before} after={consent_after} (UNCHANGED: no audience membership)"
+        )
+        print(f"      provenance invariants = {row.provenance}")
+
+        # A — re-suggest: an idempotent no-op (a subject is suggested once per run).
+        res2 = ProspectSuggestionCreator(session, biz_a).suggest(run_a_id, subject.id, admin)
+        session.commit()
+        suggestions_total = session.query(ProspectSuggestion).filter_by(business_id=biz_a).count()
+        print(
+            f"\n  Business A — re-suggest idempotent: already_suggested={res2.already_suggested}  "
+            f"suggestions still={suggestions_total}"
+        )
+
+        # A — an unauthorized (viewer) caller is refused before any read.
+        viewer_refused = None
+        try:
+            ProspectSuggestionCreator(session, biz_a).suggest(run_a_id, subject.id, viewer)
+        except ProspectSuggestionAuthorizationError as exc:
+            viewer_refused = exc.code
+        print(f"\n  Business A — unauthorized viewer refused: {viewer_refused}")
+
+        # B — A's run is not-found cross-tenant (a B-scoped creator can never reach it).
+        refused_code = None
+        try:
+            ProspectSuggestionCreator(session, biz_b).suggest(run_a_id, subject.id, admin)
+        except ProspectSuggestionError as exc:
+            refused_code = exc.code
+        b_total = session.query(ProspectSuggestion).filter_by(business_id=biz_b).count()
+        print("\n  Business B — A's run is not reachable cross-tenant:")
+        print(f"      suggestRefusedWith={refused_code}  B_suggestions={b_total}")
+
+    checks = {
+        "a_suggestion_created": res.already_suggested is False and suggestions_total == 1,
+        "a_scored_with_rationale_version": res.match_score == 0.5
+        and "industry" in res.matched_dimensions
+        and bool(res.rationale)
+        and res.scored_icp_version == 1,
+        "a_has_expiry": res.expires_at is not None,
+        "a_research_only_not_sendable": res.visibility == SuggestionVisibility.RESEARCH_ONLY.value
+        and res.sendable is False
+        and row.provenance["sendable"] is False,
+        "a_no_audience_membership": consent_after == consent_before
+        and row.provenance["addedToAudience"] is False,
+        "a_resuggest_idempotent": res2.already_suggested is True and suggestions_total == 1,
+        "a_unauthorized_refused": viewer_refused == "prospect_suggestion_not_authorized",
+        "b_cross_tenant_not_found": refused_code == "discovery_run_not_found" and b_total == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send, NO auto-accept. DCA-145 creates "
+        "ONE research-only prospect suggestion from a resolved observation: it is distinguishable from a "
+        "sendable contact and confers NO audience membership — accepting it is not recipient consent. The "
+        "denial reproduces with no state change.)"
+    )
+    return {
+        "checks": checks,
+        "run": run_a_id,
+        "matchScore": res.match_score,
+        "visibility": res.visibility,
+        "scoredIcpVersion": res.scored_icp_version,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

@@ -111,6 +111,27 @@ class ScoreStatus(str, Enum):
     STALE = "stale"
 
 
+class SuggestionVisibility(str, Enum):
+    """DCA-145 — the visibility constraint of a scoped prospect suggestion (controlled vocabulary).
+
+    The load-bearing distinction the acceptance criterion requires — a *research-only organization* is
+    never a *sendable contact*:
+
+    - ``RESEARCH_ONLY`` — the suggestion is about an ORGANIZATION the business may research. It carries
+      no sendable contact and confers NO audience membership: it can be reviewed, enriched and
+      qualified, but nothing about it is a recipient the business may message. Every suggestion the
+      DCA-143 discovery pipeline produces is research-only by construction (that pipeline records
+      organization-level facts only — no contact point), so an organization suggestion is always this.
+    - ``SENDABLE`` — reserved for a future, currently-DISABLED capability: a suggestion backed by a
+      contact the business has a lawful basis to message. No path in this service produces one — making
+      a prospect sendable requires recipient consent, and *accepting a suggestion is not consent* — so a
+      suggestion can never silently become a sendable recipient.
+    """
+
+    RESEARCH_ONLY = "research_only"
+    SENDABLE = "sendable"
+
+
 class InboxStatus(str, Enum):
     """Processing state of an inbound-event receipt (DCA-028).
 
@@ -1536,6 +1557,87 @@ class ObservationBatchResolution(TenantOwned, Base):
     # Resolution provenance + the load-bearing invariants (merged / sent / spent = False).
     provenance: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class ProspectSuggestion(TenantOwned, Base):
+    """DCA-145 — ONE scoped prospect SUGGESTION created from a resolved discovery observation (RLS).
+
+    The next step of the still-disabled discovery pipeline after DCA-144 resolves a run's converted
+    observation batch: it CONVERTS one eligible resolved subject (an :class:`OrgObservation` in this
+    business's batch) into a business-scoped CANDIDATE the business can review — carrying a deterministic
+    ICP ``match_score`` + ``rationale``, the targeting ``scored_icp_version`` it was scored against, a
+    ``schema_version``, an ``expires_at`` expiry and a ``visibility`` constraint. It is **suggested-only**
+    and inert: nothing is fetched, no message is sent, nothing is spent, and it is **never auto-accepted**
+    (acceptance stays a human action; promotion to anything executable is a disabled future capability).
+
+    **The two load-bearing invariants (the DCA-145 acceptance criteria):**
+
+    - **Research-only organizations are distinguishable from sendable contacts; no automatic audience
+      membership.** A suggestion built from an organization observation is ``visibility='research_only'``
+      (see :class:`SuggestionVisibility`): it is NOT a sendable recipient and creating it adds the
+      subject to NO audience / list / send surface. Accepting a suggestion is a DCA-local review status,
+      never recipient consent — so a research-only organization can never become a message target here.
+      A ``sendable`` suggestion is a disabled future capability this story never produces.
+
+    - **Reproduce the result and the relevant denial without unintended state changes.** The one creator
+      checks authority FIRST, then that the run exists in THIS business (an unknown / cross-tenant run is
+      not-found), then that the run has been RESOLVED (DCA-144) and the subject is an eligible member of
+      that resolved batch (an unknown / cross-tenant / off-batch subject is not-found). Each refusal is
+      raised BEFORE the session is mutated, so it changes nothing.
+
+    **Idempotent, tenant-owned.** ``(business_id, run_id, subject_id)`` is unique: a subject is suggested
+    ONCE per run — re-suggesting returns the existing row and stages no duplicate and no second audit.
+    The row is owned by exactly one ``business_id`` (DCA-017/018) and read only within it; it holds the
+    subject id + opaque scoring metadata — never a contact value.
+    """
+
+    __tablename__ = "prospect_suggestions"
+    # At most ONE suggestion per (run, subject) in a business — the "suggested once" idempotency guard.
+    __table_args__ = (
+        tenant_unique("run_id", "subject_id", name="uq_prospect_suggestion_subject"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-140 run whose resolved batch this suggestion was drawn from.
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("discovery_run_requests.id"), index=True
+    )
+    # The eligible resolved subject this suggestion is ABOUT — an OrgObservation in this business
+    # (organization). Stored as (subject_type, subject_id), scoped within the business (never a
+    # cross-tenant id).
+    # Always "organization" here (see FieldSubjectType.ORGANIZATION, defined later in this module); a
+    # literal is used because that enum is declared below this model.
+    subject_type: Mapped[str] = mapped_column(
+        String(16), default="organization", server_default="organization"
+    )
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The visibility constraint — research_only vs the disabled sendable (SuggestionVisibility). An
+    # organization suggestion is always research_only (no sendable contact, no audience membership).
+    visibility: Mapped[str] = mapped_column(
+        String(16),
+        default=SuggestionVisibility.RESEARCH_ONLY.value,
+        server_default=SuggestionVisibility.RESEARCH_ONLY.value,
+        index=True,
+    )
+    # The deterministic ICP fit score in [0, 1] and its human-readable rationale (NOT an AI output —
+    # scored deterministically against the confirmed ICP). ``scored_icp_version`` is the confirmed ICP
+    # version the score was computed against (the targeting version); ``schema_version`` the suggestion
+    # contract version (expand→migrate→contract).
+    match_score: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    rationale: Mapped[str] = mapped_column(Text, default="", server_default="")
+    scored_icp_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Suggested-only lifecycle. 'suggested' is the only status this story writes; acceptance/dismissal
+    # and any promotion stay disabled future capabilities, so a suggestion never self-advances.
+    status: Mapped[str] = mapped_column(
+        String(16), default="suggested", server_default="suggested", index=True
+    )
+    # Suggestion provenance + the load-bearing invariants (suggested = True; sent / spent / autoAccepted
+    # / addedToAudience = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # The expiry after which the suggestion should no longer be acted on without a refresh.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
 
 
 class AcquisitionDecision(TenantOwned, Base):

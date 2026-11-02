@@ -86,6 +86,7 @@ DCA_TABLES = {
     "discovery_task_executions",
     "discovery_task_conversions",
     "observation_batch_resolutions",
+    "prospect_suggestions",
 }
 
 
@@ -2674,6 +2675,50 @@ def test_0063_creates_observation_batch_resolutions_on_a_preexisting_database(cl
         ).first()
     eng.dispose()
     assert "uq_observation_batch_resolution_run" in uniques  # one resolution per (tenant, run)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0064_creates_prospect_suggestions_on_a_preexisting_database(clean_schema):
+    """DCA-145 — the 0064 create branch (for a DB migrated before ``prospect_suggestions``).
+
+    ``prospect_suggestions`` is tenant-owned (RLS-protected), like ``observation_batch_resolutions``
+    (0063). A fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so
+    0064 is a no-op there. To exercise 0064's real job, upgrade to head, drop the table + policy, stamp
+    history back to 0063, then upgrade to head again — 0064 must recreate the table (with its per-tenant
+    per-(run, subject) unique constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "prospect_suggestions" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0063_observation_batch_resolutions")  # pretend we predate the suggestion table
+    command.upgrade(cfg, "head")  # 0064 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "prospect_suggestions" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("prospect_suggestions", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'prospect_suggestions' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_prospect_suggestion_subject" in uniques  # one suggestion per (tenant, run, subject)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

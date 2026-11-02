@@ -93,6 +93,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "discovery_task_executions",
         "discovery_task_conversions",
         "observation_batch_resolutions",
+        "prospect_suggestions",
     }
 
 
@@ -811,6 +812,60 @@ def test_discovery_task_execution_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_TASK_EXEC, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_SUGGESTION = (
+    "WITH r AS ("
+    "INSERT INTO discovery_run_requests "
+    "(id, business_id, icp_version, status, source_scope, target_cap, task_cap, query_cap, "
+    "requested, clamped, clamp_notes, provenance, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'completed', '[]', 50, 5, 3, '{}', false, '[]', '{}', now()) "
+    "RETURNING id, business_id) "
+    "INSERT INTO prospect_suggestions "
+    "(id, business_id, run_id, subject_type, subject_id, visibility, match_score, rationale, "
+    "scored_icp_version, schema_version, status, provenance, created_at, expires_at) "
+    "SELECT gen_random_uuid()::text, r.business_id, r.id, 'organization', 'subj-1', 'research_only', "
+    "0.5, '', 1, 1, 'suggested', '{}', now(), now() + interval '30 days' FROM r"
+)
+
+
+@requires_pg
+def test_prospect_suggestion_is_tenant_isolated(rls_db):
+    """DCA-145 — a scoped prospect suggestion is tenant-owned: each tenant can read only its OWN
+    suggestions (RLS on real Postgres), so one business can never see or enumerate another's candidates."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_SUGGESTION, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_SUGGESTION, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM prospect_suggestions").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM prospect_suggestions").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_prospect_suggestion_write_check_rejects_foreign_owner(rls_db):
+    """A suggestion can never be stamped for another tenant: writing a B-owned row while scoped to A
+    violates the WITH CHECK clause (defence-in-depth beneath the creator's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_SUGGESTION, (B,))
         conn.rollback()
     finally:
         conn.close()
