@@ -26555,6 +26555,252 @@ def _dca_152(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-153",
+    "RECORD ONE audience-acceptance INTENT over a prospect suggestion — an authorized business user "
+    "persists a 'pending_sync' intent, its atomic audit entry AND a durable outbox sync REQUEST in one "
+    "unit of work, capturing the suggestion's selection versions. It performs NO EffortlessPromo CRM "
+    "sync / send, confers NO recipient consent (acceptance is NOT consent) and creates NO audience "
+    "membership — a research-only organization stays research-only. Repeated submit creates ONE intent; "
+    "a transaction failure commits NEITHER the intent NOR its audit/outbox; a read-only viewer is "
+    "refused with no state change; a dismissed suggestion is not acceptable; a cross-tenant id is "
+    "not-found; and another tenant's independent suggestion is untouched. NOTHING fetched/sent/spent. "
+    "Local synthetic.",
+)
+def _dca_153(ctx: CheckContext) -> dict:
+    """Drive the real DCA-153 recorder against a disposable DB with isolated synthetic Businesses A/B.
+
+    A and B each hold an INDEPENDENT suggestion for the SAME subject. PRINT the actual state: an
+    authorized A admin accepts A's suggestion (ONE pending_sync intent + ONE atomic audit + ONE PENDING
+    outbox sync request, with the CAPTURED selection versions and the invariants pinned); a re-accept is
+    an idempotent no-op (no second intent/audit/outbox); a genuine transaction failure (a conflicting
+    duplicate) commits NEITHER the intent NOR its audit/outbox; a read-only viewer is refused with no
+    state change; a dismissed suggestion is not acceptable; a cross-tenant id reads as not-found; and
+    B's identical suggestion gets no intent. Nothing is fetched, synced, sent or spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db.models import (
+        AcceptanceIntent,
+        AcceptanceIntentStatus,
+        AuditEvent,
+        OutboxMessage,
+        OutboxStatus,
+        ProspectSuggestion,
+        SuggestionVisibility,
+    )
+    from app.services.acceptance_intent import (
+        AUDIT_ACTION_ACCEPT,
+        OUTBOX_EVENT_ACCEPTANCE,
+        AcceptanceIntentActor,
+        AcceptanceIntentAuthorizationError,
+        AcceptanceIntentError,
+        AcceptanceIntentRecorder,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000153a"
+    biz_b = "00000000-0000-4000-8000-00000000153b"
+    admin = AcceptanceIntentActor(subject="00000000-0000-4000-9000-0000000a0153a", roles=("owner",))
+    viewer = AcceptanceIntentActor(
+        subject="00000000-0000-4000-9000-0000000a0153b", roles=("viewer",)
+    )
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    def _row(business_id, subject_id, *, status="suggested", scored_icp_version=7):
+        return ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-153",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+            match_score=0.7,
+            rationale="ICP fit 0.70",
+            scored_icp_version=scored_icp_version,
+            schema_version=1,
+            status=status,
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+
+    def _counts(session, business_id):
+        intents = session.query(AcceptanceIntent).filter_by(business_id=business_id).count()
+        audits = session.query(AuditEvent).filter_by(action=AUDIT_ACTION_ACCEPT).count()
+        outbox = session.query(OutboxMessage).filter_by(event_type=OUTBOX_EVENT_ACCEPTANCE).count()
+        return intents, audits, outbox
+
+    print(
+        "\nrecord an audience-acceptance intent (local synthetic — nothing fetched/synced/sent/spent):"
+    )
+
+    with ctx.session_factory() as session:
+        a = _row(biz_a, "shared-subject")
+        b = _row(biz_b, "shared-subject")
+        session.add_all([a, b])
+        session.commit()
+        a_id, b_id = a.id, b.id
+        recorder_a = AcceptanceIntentRecorder(session, biz_a)
+
+        # 1) An authorized admin records the acceptance intent — intent + audit + outbox, atomically.
+        result = recorder_a.accept(a_id, admin, now=now)
+        session.commit()
+        intent = session.get(AcceptanceIntent, result.intent.id)
+        outbox = session.query(OutboxMessage).filter_by(event_id=intent.outbox_event_id).one()
+        a_counts_1 = _counts(session, biz_a)
+        print("\n  [1] A admin records the intent (pending_sync):")
+        print(
+            f"      status={intent.status}  visibility={intent.visibility}  "
+            f"sendable={result.sendable}  capturedScoredIcpVersion={intent.scored_icp_version}  "
+            f"capturedSuggestionSchemaVersion={intent.suggestion_schema_version}"
+        )
+        print(
+            f"      outbox: event_type={outbox.event_type} status={outbox.status} "
+            f"delivered_at={outbox.delivered_at}"
+        )
+        print(
+            f"      invariants: synced={intent.provenance['synced']} "
+            f"sent={intent.provenance['sent']} spent={intent.provenance['spent']} "
+            f"consentConferred={intent.provenance['consentConferred']} "
+            f"membershipCreated={intent.provenance['membershipCreated']}"
+        )
+        print(f"      A counts (intents, audits, outbox) = {a_counts_1}")
+
+        # 2) Idempotent replay — a re-accept stages no second intent/audit/outbox.
+        replay = recorder_a.accept(a_id, admin, now=now + timedelta(days=1))
+        session.commit()
+        a_counts_2 = _counts(session, biz_a)
+        print("\n  [2] re-accept is an idempotent no-op:")
+        print(
+            f"      alreadyAccepted={replay.already_accepted}  "
+            f"sameIntentId={replay.intent.id == intent.id}  "
+            f"A counts unchanged {a_counts_1}->{a_counts_2}"
+        )
+
+        # 3) Transaction failure — a conflicting duplicate makes the WHOLE unit of work fail; a fresh
+        #    suggestion gains NEITHER an intent NOR its audit/outbox.
+        fresh = _row(biz_a, "txn-subject")
+        session.add(fresh)
+        session.commit()
+        fresh_id = fresh.id
+        before_txn = _counts(session, biz_a)
+        recorder_a.accept(fresh_id, admin, now=now)  # stages intent + audit + outbox
+        session.add(
+            AcceptanceIntent(
+                business_id=biz_a,
+                suggestion_id=fresh_id,  # duplicate (business_id, suggestion_id) → uq violation
+                run_id="run-153",
+                subject_type="organization",
+                subject_id="txn-subject",
+                visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+                status=AcceptanceIntentStatus.PENDING_SYNC.value,
+            )
+        )
+        try:
+            session.commit()
+            txn_failed = False
+        except IntegrityError:
+            session.rollback()
+            txn_failed = True
+        after_txn = _counts(session, biz_a)
+        print("\n  [3] a transaction failure commits NEITHER the intent NOR its audit/outbox:")
+        print(f"      commit_raised={txn_failed}  A counts unchanged {before_txn}->{after_txn}")
+
+        # 4) Denial — a read-only viewer is refused with NO state change.
+        denial_subject = _row(biz_a, "denial-subject")
+        session.add(denial_subject)
+        session.commit()
+        before_denial = _counts(session, biz_a)
+        try:
+            recorder_a.accept(denial_subject.id, viewer, now=now)
+            viewer_refused = False
+        except AcceptanceIntentAuthorizationError:
+            viewer_refused = True
+        session.rollback()
+        after_denial = _counts(session, biz_a)
+        print("\n  [4] read-only viewer refused (a denial changes nothing):")
+        print(f"      refused={viewer_refused}  A counts unchanged {before_denial}->{after_denial}")
+
+        # 5) A dismissed suggestion is not acceptable (acting on a non-reviewable candidate is denied).
+        dismissed = _row(biz_a, "dismissed-subject", status="dismissed")
+        session.add(dismissed)
+        session.commit()
+        try:
+            recorder_a.accept(dismissed.id, admin, now=now)
+            dismissed_refused = False
+        except AcceptanceIntentError as exc:
+            dismissed_refused = exc.code == "prospect_suggestion_not_acceptable"
+        session.rollback()
+
+        # 6) A cross-tenant id reads as not-found (A cannot accept B's row by id).
+        try:
+            recorder_a.accept(b_id, admin, now=now)
+            cross_not_found = False
+        except AcceptanceIntentError as exc:
+            cross_not_found = exc.code == "prospect_suggestion_not_found"
+        session.rollback()
+
+        # 7) B's identical suggestion gets no intent — the acceptance is tenant-private.
+        b_counts = _counts(session, biz_b)
+        row_b = session.get(ProspectSuggestion, b_id)
+        print("\n  [5] B's identical suggestion is untouched (acceptance is private):")
+        print(f"      B intents={b_counts[0]}  B.suggestion.status={row_b.status}")
+
+        # Snapshot every ORM value into plain variables while still attached — the rollbacks above
+        # expired the instances, so re-read them here before the session closes (detaches them).
+        intent = session.get(AcceptanceIntent, intent.id)
+        intent_status = intent.status
+        intent_scored = intent.scored_icp_version
+        intent_schema = intent.suggestion_schema_version
+        intent_prov = dict(intent.provenance)
+        outbox_event_id = intent.outbox_event_id
+        outbox = session.get(OutboxMessage, outbox.id)
+        outbox_status = outbox.status
+        outbox_delivered = outbox.delivered_at
+        result_sendable = result.sendable
+        b_intents = b_counts[0]
+        b_status = row_b.status
+
+    checks = {
+        "intent_audit_outbox_created_once": a_counts_1 == (1, 1, 1)
+        and intent_status == "pending_sync"
+        and intent_scored == 7
+        and intent_schema == 1
+        and outbox_status == OutboxStatus.PENDING.value
+        and outbox_delivered is None,
+        "no_sync_consent_or_membership": intent_prov["synced"] is False
+        and intent_prov["sent"] is False
+        and intent_prov["spent"] is False
+        and intent_prov["consentConferred"] is False
+        and intent_prov["membershipCreated"] is False
+        and result_sendable is False,
+        "idempotent_no_second_intent": replay.already_accepted is True and a_counts_2 == a_counts_1,
+        "txn_failure_commits_nothing": txn_failed and after_txn == before_txn,
+        "viewer_refused_no_state_change": viewer_refused and after_denial == before_denial,
+        "dismissed_not_acceptable": dismissed_refused,
+        "cross_tenant_not_found": cross_not_found,
+        "other_business_unaffected": b_intents == 0 and b_status == "suggested",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-153 records a business's "
+        "INTENT to accept a prospect suggestion into its audience: it persists a 'pending_sync' intent, "
+        "its atomic audit entry and a durable outbox SYNC REQUEST in one unit of work, capturing the "
+        "suggestion's selection versions. It performs NO EffortlessPromo CRM sync / send, confers NO "
+        "recipient consent (acceptance is NOT consent) and creates NO audience membership — a "
+        "research-only organization stays research-only. Repeated submit creates ONE intent; a "
+        "transaction failure commits neither the intent nor its audit/outbox; and every denial "
+        "reproduces with no unintended state change. The actual sync and any billing stay disabled "
+        "future capabilities.)"
+    )
+    return {
+        "checks": checks,
+        "aCounts": a_counts_1,
+        "bIntents": b_intents,
+        "outboxEventId": outbox_event_id,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

@@ -132,6 +132,25 @@ class SuggestionVisibility(str, Enum):
     SENDABLE = "sendable"
 
 
+class AcceptanceIntentStatus(str, Enum):
+    """DCA-153 — lifecycle state of ONE recorded audience-acceptance intent (controlled vocabulary).
+
+    ``PENDING_SYNC`` — the business user has recorded an INTENT to accept a DCA-145 prospect suggestion
+    into their audience. It is the ONLY status this story writes: it records the tenant's decision and
+    stages a durable sync *request* (an outbox intent), but it performs NO CRM sync / send and confers
+    NO recipient consent (acceptance is NOT consent). The row is inert — nothing is synced, sent,
+    charged or added to any audience by creating it.
+
+    ``SYNCED`` — reserved for a future, currently-DISABLED capability: a later story (the actual
+    EffortlessPromo sync) marks the intent delivered once it has performed the sync inside its own unit
+    of work. No path here EVER sets it; the state models the lifecycle so the sync story can reconcile a
+    hand-off, exactly like :class:`OutboxStatus` models ``DELIVERED`` without any send path existing yet.
+    """
+
+    PENDING_SYNC = "pending_sync"
+    SYNCED = "synced"
+
+
 class InboxStatus(str, Enum):
     """Processing state of an inbound-event receipt (DCA-028).
 
@@ -1646,6 +1665,87 @@ class ProspectSuggestion(TenantOwned, Base):
     dismissal_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
     dismissed_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
     dismissed_by_type: Mapped[str] = mapped_column(String(16), default="", server_default="")
+
+
+class AcceptanceIntent(TenantOwned, Base):
+    """DCA-153 — ONE recorded audience-acceptance INTENT over a DCA-145 prospect suggestion (RLS).
+
+    The audience stage's commit-of-intent step after the DCA-152 preview: a business user has reviewed a
+    :class:`ProspectSuggestion` and records their INTENT to accept it into their audience. Creating the
+    intent is INERT — it persists the decision and a durable sync *request* (a DCA-027 outbox intent),
+    but it performs NO EffortlessPromo CRM sync / send, confers NO recipient consent (**acceptance is
+    NOT consent**), and creates NO audience membership. The actual sync is a later, still-DISABLED story;
+    billable acceptance / usage emission is a later story too (DCA-157/158) and is NOT done here.
+
+    **The load-bearing invariants (the DCA-153 acceptance criteria):**
+
+    - **Repeated submit creates ONE intent; a transaction failure commits neither the intent NOR its
+      audit/outbox.** ``(business_id, suggestion_id)`` is unique — a subject is accepted ONCE, so
+      re-accepting returns the existing row and stages no duplicate, no second audit and no second
+      outbox intent. The recorder stages the intent, its atomic DCA-026 audit entry AND its DCA-027
+      outbox request into the *caller's* session and never commits, so a rolled-back unit of work leaves
+      none of the three (the atomic-audit/outbox rule, SEC-001/BR-122).
+
+    - **A research-only suggestion never becomes sendable; no audience membership / send is created.**
+      The accepted suggestion's ``visibility`` is CAPTURED on the intent unchanged; a research-only
+      organization stays research-only. The recorded ``provenance`` pins the invariants
+      (``sendable`` / ``synced`` / ``sent`` / ``spent`` / ``consentConferred`` / ``membershipCreated`` =
+      ``False``). The ``scored_icp_version`` and ``suggestion_schema_version`` are the CAPTURED selection
+      versions, so the intent records exactly what was accepted even if the suggestion is later rescored.
+
+    **Idempotent, tenant-owned.** The row is owned by exactly one ``business_id`` (DCA-017/018) and read
+    only within it; it holds the suggestion / subject ids + opaque metadata — never a contact value.
+    """
+
+    __tablename__ = "acceptance_intents"
+    # At most ONE acceptance intent per suggestion in a business — the "accepted once" idempotency guard.
+    __table_args__ = (tenant_unique("suggestion_id", name="uq_acceptance_intent_suggestion"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-145 suggestion this intent accepts, and the run/subject it is about (captured so the intent
+    # is self-describing even if the suggestion is later dismissed/expired). Scoped within the business.
+    suggestion_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("prospect_suggestions.id"), index=True
+    )
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    subject_type: Mapped[str] = mapped_column(
+        String(16), default="organization", server_default="organization"
+    )
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The accepted suggestion's visibility, CAPTURED unchanged — a research_only organization stays
+    # research_only (accepting it confers no sendable contact and no recipient consent).
+    visibility: Mapped[str] = mapped_column(
+        String(16),
+        default=SuggestionVisibility.RESEARCH_ONLY.value,
+        server_default=SuggestionVisibility.RESEARCH_ONLY.value,
+        index=True,
+    )
+    # Suggested-only lifecycle. 'pending_sync' is the only status this story writes; the actual sync
+    # ('synced') stays a disabled future capability, so an intent never self-advances.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=AcceptanceIntentStatus.PENDING_SYNC.value,
+        server_default=AcceptanceIntentStatus.PENDING_SYNC.value,
+        index=True,
+    )
+    # The CAPTURED selection versions: the ICP targeting version the suggestion was scored against and
+    # the suggestion contract version at acceptance time, plus the suggestion's match score — frozen so
+    # the intent records exactly what was accepted even if the suggestion is later rescored.
+    scored_icp_version: Mapped[int | None] = mapped_column(Integer, default=None)
+    suggestion_schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    match_score: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    # The acceptance-intent contract version (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # The stable DCA-027 outbox event id staged with this intent (an opaque reference to the pending sync
+    # request) — so the intent and its outbox request can be joined without re-deriving the id.
+    outbox_event_id: Mapped[str] = mapped_column(String(36), default="", server_default="")
+    # WHO recorded the acceptance — an opaque business actor id + its kind (never a name/email).
+    accepted_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    accepted_by_type: Mapped[str] = mapped_column(String(16), default="user", server_default="user")
+    # Acceptance provenance + the load-bearing invariants (accepted = True; sendable / synced / sent /
+    # spent / consentConferred / membershipCreated = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class DiscoveryRunSummary(TenantOwned, Base):

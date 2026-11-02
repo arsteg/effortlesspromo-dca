@@ -89,6 +89,7 @@ DCA_TABLES = {
     "prospect_suggestions",
     "discovery_run_summaries",
     "search_partition_backoffs",
+    "acceptance_intents",
 }
 
 
@@ -2887,6 +2888,51 @@ def test_0067_adds_suggestion_dismissal_columns_on_a_preexisting_database(clean_
     assert (
         policy is not None
     )  # tenant-owned: RLS still in place (unchanged by an add-column branch)
+
+
+@requires_pg
+def test_0068_creates_acceptance_intents_on_a_preexisting_database(clean_schema):
+    """DCA-153 — the 0068 create branch (for a DB migrated before ``acceptance_intents`` existed).
+
+    ``acceptance_intents`` is tenant-owned (RLS-protected), like ``prospect_suggestions`` (0064). A fresh
+    DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0068 is a no-op
+    there. To exercise 0068's real job, upgrade to head, drop the table + policy, stamp history back to
+    0067, then upgrade to head again — 0068 must recreate the table (with its per-tenant per-suggestion
+    unique constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "acceptance_intents" CASCADE'))  # policy drops too
+    eng.dispose()
+
+    command.stamp(
+        cfg, "0067_suggestion_dismissal"
+    )  # pretend we predate the acceptance-intent table
+    command.upgrade(cfg, "head")  # 0068 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "acceptance_intents" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("acceptance_intents", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'acceptance_intents' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_acceptance_intent_suggestion" in uniques  # one intent per (tenant, suggestion)
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg

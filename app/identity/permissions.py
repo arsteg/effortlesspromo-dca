@@ -40,6 +40,16 @@ class Scope(str, Enum):
     # their global rights alone; a dismissal is business-private and never touches any shared/global
     # master or another tenant's independent suggestion for the same subject.
     CANDIDATE_DISMISS = "candidate.dismiss"
+    # record an INTENT to accept a prospect suggestion into THIS business's audience (DCA-153) — a
+    # pending_sync intent + a durable sync REQUEST, WITHOUT performing any EffortlessPromo CRM sync /
+    # send and WITHOUT conferring recipient consent (acceptance is NOT consent). A WRITE scope: an
+    # ordinary acting business user holds it (accepting a candidate you are reviewing is the positive
+    # counterpart of dismissing one — a normal acting-user review decision, never admin-only), a
+    # read-only viewer does NOT (viewing ≠ committing an intent). It is a business-plane scope, so a
+    # platform operator (holding no membership) can never accept a client's candidate with their global
+    # rights alone. Recording the intent runs no sync and sends nothing (both disabled future
+    # capabilities); a research-only suggestion stays research-only and joins no audience.
+    CANDIDATE_ACCEPT = "candidate.accept"
     # correct/override a field value the agent recorded about one of this business's subjects
     # (DCA-070). A WRITE scope: an ordinary acting business user holds it, a read-only viewer does
     # NOT — correcting a value is an edit, not a view. It is a business-plane scope, so a platform
@@ -168,6 +178,8 @@ _ADMIN_SCOPES = frozenset(
         Scope.CANDIDATE_READ,
         # dismissing a candidate privately is a normal review action an administrator also holds.
         Scope.CANDIDATE_DISMISS,
+        # recording an acceptance intent is a normal review action an administrator also holds.
+        Scope.CANDIDATE_ACCEPT,
         Scope.FIELD_CORRECT,
         Scope.IDENTITY_MERGE,
         Scope.CONSENT_WITHDRAW,
@@ -193,6 +205,9 @@ _ACTING_USER_SCOPES = frozenset(
         # an acting user may dismiss a suggestion privately (relevance feedback) — a read-only viewer
         # may only view it, never dismiss.
         Scope.CANDIDATE_DISMISS,
+        # an acting user may also record an acceptance intent (the positive review decision) — a
+        # read-only viewer may only view a candidate, never commit an intent over it.
+        Scope.CANDIDATE_ACCEPT,
         Scope.FIELD_CORRECT,
         Scope.IDENTITY_MERGE,
         Scope.CONSENT_WITHDRAW,
