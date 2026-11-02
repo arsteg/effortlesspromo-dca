@@ -25692,6 +25692,246 @@ def _dca_147(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-148",
+    "ROUTE missing fields through a provider waterfall — a pure, per-field ordered fallback over "
+    "rights (the DCA-048 preflight), coverage (the DCA-044 catalog fields), freshness (max age) and "
+    "marginal cost (cheapest first). It STOPS at the first provider that meets the requirement (every "
+    "pricier provider after it is 'not_reached', never called) and shared-upstream providers do NOT "
+    "count as independent corroboration. The relevant denial (a field whose only provider is "
+    "rights-denied) reproduces with NO state change, and routing is tenant-scoped (Business B is "
+    "denied the field Business A can route). NOTHING fetched/sent/spent. Local synthetic.",
+)
+def _dca_148(ctx: CheckContext) -> dict:
+    """Drive the real DCA-148 waterfall planner against a disposable DB with isolated synthetic
+    Businesses A/B. PRINT the actual routes: first-provider-success stops the waterfall (the pricier
+    provider is not reached); a 2-independent-source field skips a shared-upstream duplicate and is met
+    by two DISTINCT origins; a repeated-upstream-only field cannot meet corroboration; the rights-denied
+    field is unroutable with no state change; and Business B is denied the field A routes. Nothing is
+    fetched, sent or spent — it is a pure planning decision over synthetic provider descriptors."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import Source, SourceStatus
+    from app.services.provider_waterfall import (
+        OUTCOME_DENIED_RIGHTS,
+        OUTCOME_NOT_REACHED,
+        OUTCOME_SELECTED,
+        OUTCOME_SKIPPED_SHARED_UPSTREAM,
+        REASON_INSUFFICIENT,
+        REASON_NO_ENTITLED,
+        FieldRequirement,
+        ProviderCandidate,
+        ProviderWaterfallPlanner,
+    )
+    from app.services.source_approval import (
+        ReviewerPrincipal,
+        SourceApprovalReview,
+        SourceApprovalStore,
+    )
+    from app.services.source_catalog import SourceCatalogStore, SourceDraftInput
+    from app.services.source_entitlement import (
+        BusinessEntitler,
+        BusinessSourceEntitlementInput,
+        BusinessSourceEntitlementStore,
+    )
+    from app.services.source_terms import SourceTermsInput, SourceTermsStore
+
+    biz_a = "00000000-0000-4000-8000-00000000148a"
+    biz_b = "00000000-0000-4000-8000-00000000148b"
+    field = "org_identifier"
+    purpose = "prospect_discovery"
+    now = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
+    admin = BusinessEntitler(
+        subject="00000000-0000-4000-9000-0000000a0148", roles=("owner", "admin")
+    )
+    operator = ReviewerPrincipal(subject="op-001", roles=("platform_operator",))
+
+    def _catalogue_approve_enable(session, key):
+        SourceCatalogStore(session).create_draft(
+            SourceDraftInput(
+                key=key,
+                kind="official",
+                access_method="bulk_download",
+                trust_tier="official_registry",
+                fields=["org_name", field],
+                india_coverage={"nationwide": True},
+            )
+        )
+        SourceTermsStore(session).add_version(
+            SourceTermsInput(
+                source_key=key,
+                operations={"collect": True},
+                purposes=[purpose],
+                contract_evidence={"reference": f"{key}-TOS", "kind": "terms_of_use"},
+            )
+        )
+        SourceApprovalStore(session).approve(
+            key,
+            1,
+            SourceApprovalReview(
+                reviewer_id="op-001",
+                evidence={"reference": "RIGHTS-REVIEW-2026-11", "kind": "legal_review"},
+                reviewed_at=now - timedelta(days=1),
+                expires_at=now + timedelta(days=365),
+            ),
+            operator,
+        )
+        src = session.query(Source).filter(Source.key == key).one()
+        src.status = SourceStatus.ENABLED.value
+        src.enabled = True
+
+    def _entitle(session, business_id, key):
+        BusinessSourceEntitlementStore(session, business_id).set_entitlement(
+            BusinessSourceEntitlementInput(
+                source_key=key,
+                enabled=True,
+                operations={"collect": True},
+                purposes=[purpose],
+            ),
+            admin,
+            now=now,
+        )
+
+    print(
+        "\nroute missing fields through a provider waterfall (local synthetic — nothing fetched):"
+    )
+
+    with ctx.session_factory() as session:
+        # Catalogue + approve + enable four sources; a fifth stays unentitled to A for the denial case.
+        for key in ("cheap", "pricey", "reseller_a", "reseller_b", "independent"):
+            _catalogue_approve_enable(session, key)
+        for key in ("cheap", "pricey", "reseller_a", "reseller_b", "independent"):
+            _entitle(session, biz_a, key)
+        _catalogue_approve_enable(
+            session, "denied_only"
+        )  # approved at platform, NOT entitled to A/B
+        session.commit()
+
+        planner_a = ProviderWaterfallPlanner(session, biz_a)
+
+        # 1) First-provider success stops the waterfall — the pricier provider is never reached.
+        success = planner_a.route_fields(
+            [FieldRequirement(field=field)],
+            [
+                ProviderCandidate(source_key="pricey", marginal_cost_minor=900, age_days=1),
+                ProviderCandidate(source_key="cheap", marginal_cost_minor=100, age_days=10),
+            ],
+            now=now,
+        ).route_for(field)
+        success_outcomes = {c.source_key: c.outcome for c in success.considered}
+        print("\n  [1] first-provider success (single source):")
+        print(f"      selected={success.selected}  callsPlanned={success.calls_planned}")
+        print(f"      notReached={success.providers_not_reached}  outcomes={success_outcomes}")
+
+        # 2) Shared upstream is not independent corroboration — need 2 DISTINCT origins.
+        corroborated = planner_a.route_fields(
+            [FieldRequirement(field=field, min_independent_sources=2)],
+            [
+                ProviderCandidate(
+                    source_key="reseller_a", marginal_cost_minor=100, upstream_key="mca"
+                ),
+                ProviderCandidate(
+                    source_key="reseller_b", marginal_cost_minor=200, upstream_key="mca"
+                ),
+                ProviderCandidate(
+                    source_key="independent", marginal_cost_minor=300, upstream_key="gst"
+                ),
+            ],
+            now=now,
+        ).route_for(field)
+        corr_outcomes = {c.source_key: c.outcome for c in corroborated.considered}
+        print("\n  [2] 2 independent sources — shared upstream skipped:")
+        print(
+            f"      selected={corroborated.selected}  "
+            f"independentSources={corroborated.independent_sources}  outcomes={corr_outcomes}"
+        )
+
+        # 3) Two providers sharing ONE upstream cannot meet a 2-source corroboration requirement.
+        insufficient = planner_a.route_fields(
+            [FieldRequirement(field=field, min_independent_sources=2)],
+            [
+                ProviderCandidate(
+                    source_key="reseller_a", marginal_cost_minor=100, upstream_key="mca"
+                ),
+                ProviderCandidate(
+                    source_key="reseller_b", marginal_cost_minor=200, upstream_key="mca"
+                ),
+            ],
+            now=now,
+        ).route_for(field)
+        print("\n  [3] shared-upstream-only cannot corroborate:")
+        print(
+            f"      satisfied={insufficient.satisfied}  reason={insufficient.reason}  "
+            f"selected={insufficient.selected}  independentSources={insufficient.independent_sources}"
+        )
+
+        # 4) The denial: the only candidate is NOT entitled to A — unroutable, NO state change.
+        new_before = len(session.new)
+        dirty_before = len(session.dirty)
+        denied = planner_a.route_fields(
+            [FieldRequirement(field=field)],
+            [ProviderCandidate(source_key="denied_only", marginal_cost_minor=100)],
+            now=now,
+        ).route_for(field)
+        no_state_change = len(session.new) == new_before and len(session.dirty) == dirty_before
+        denied_rec = next(
+            (c for c in denied.considered if c.outcome == OUTCOME_DENIED_RIGHTS), None
+        )
+        print("\n  [4] rights-denied field is unroutable (a denial changes nothing):")
+        print(
+            f"      satisfied={denied.satisfied}  reason={denied.reason}  selected={denied.selected}  "
+            f"deniedReason={denied_rec.reason if denied_rec else None}  noStateChange={no_state_change}"
+        )
+
+        # 5) Tenant isolation — Business B is NOT entitled, so it is denied the field A routes.
+        route_b = (
+            ProviderWaterfallPlanner(session, biz_b)
+            .route_fields(
+                [FieldRequirement(field=field)],
+                [ProviderCandidate(source_key="cheap", marginal_cost_minor=100)],
+                now=now,
+            )
+            .route_for(field)
+        )
+        print("\n  [5] tenant isolation — Business B denied the same field:")
+        print(f"      B.satisfied={route_b.satisfied}  B.reason={route_b.reason}")
+
+    checks = {
+        "first_provider_success_stops": success.satisfied
+        and success.selected == ("cheap",)
+        and success.calls_planned == 1
+        and success_outcomes == {"cheap": OUTCOME_SELECTED, "pricey": OUTCOME_NOT_REACHED},
+        "shared_upstream_not_independent": corroborated.satisfied
+        and corroborated.independent_sources == 2
+        and corroborated.selected == ("reseller_a", "independent")
+        and corr_outcomes["reseller_b"] == OUTCOME_SKIPPED_SHARED_UPSTREAM,
+        "shared_only_cannot_corroborate": insufficient.satisfied is False
+        and insufficient.reason == REASON_INSUFFICIENT
+        and insufficient.independent_sources == 1,
+        "rights_denied_unroutable_no_state_change": denied.satisfied is False
+        and denied.reason == REASON_NO_ENTITLED
+        and denied.selected == ()
+        and bool(denied_rec)
+        and no_state_change,
+        "tenant_isolated": route_b.satisfied is False and route_b.reason == REASON_NO_ENTITLED,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-148 ROUTES a missing "
+        "field through an ordered provider waterfall on rights/coverage/freshness/marginal cost, STOPS "
+        "once the requirement is met — no redundant next-provider call — and never counts a shared "
+        "upstream as independent corroboration. It is a pure planning decision: it stages/commits "
+        "nothing, so a route and its denial reproduce with no state change, and acquisition stays a "
+        "disabled future capability.)"
+    )
+    return {
+        "checks": checks,
+        "successSelected": list(success.selected),
+        "corroboratedSelected": list(corroborated.selected),
+        "deniedReason": denied.reason,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
