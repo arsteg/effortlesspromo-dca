@@ -1739,6 +1739,24 @@ class AcceptanceIntent(TenantOwned, Base):
     # The stable DCA-027 outbox event id staged with this intent (an opaque reference to the pending sync
     # request) — so the intent and its outbox request can be joined without re-deriving the id.
     outbox_event_id: Mapped[str] = mapped_column(String(36), default="", server_default="")
+    # --- DCA-155 sync reconciliation (the audience-sync result applied back onto the intent) ---------
+    # The last AudienceSyncStatus observed when this intent was synced THROUGH EffortlessPromo (DCA-155):
+    # '' before any sync attempt, 'pending' for a queued hand-off still awaiting reconciliation, or
+    # 'acknowledged' once the platform wrote the record and returned its external ids. A timeout / lost
+    # acknowledgment leaves this 'pending' — the intent never advances to 'synced' before acknowledgment.
+    sync_status: Mapped[str] = mapped_column(String(16), default="", server_default="", index=True)
+    # The platform's OWN external record ids, PERSISTED only on an ACKNOWLEDGED sync (the external mapping
+    # the DCA keeps so it never re-syncs the same subject). Empty until acknowledged; opaque handles minted
+    # and owned by EffortlessPromo — never a contact value.
+    external_crm_record_id: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    external_audience_id: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    external_version: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # WHEN the sync was acknowledged (NULL until acknowledged) and WHEN it was last attempted (so a
+    # pending hand-off awaiting reconciliation is inspectable). Both nullable; neither implies a send.
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    last_sync_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     # WHO recorded the acceptance — an opaque business actor id + its kind (never a name/email).
     accepted_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
     accepted_by_type: Mapped[str] = mapped_column(String(16), default="user", server_default="user")

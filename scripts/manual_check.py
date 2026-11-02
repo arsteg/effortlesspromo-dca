@@ -26972,6 +26972,282 @@ def _dca_154(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-155",
+    "SYNCHRONIZE ONE accepted record THROUGH EffortlessPromo: in isolated synthetic Businesses A/B, an "
+    "authorized A user drives a DCA-153 pending_sync acceptance intent through the DCA-154 audience-sync "
+    "port (the synthetic fake; production refuses it). A host that does NOT acknowledge leaves the intent "
+    "PENDING reconciliation (no accepted status, no external ids — a lost acknowledgment); an "
+    "acknowledgment advances it pending_sync->synced and PERSISTS the platform's external record mapping "
+    "with ONE atomic audit; a replay is idempotent on the request key (no second sync). A restricted "
+    "CONTACT field and a sendable sync are REFUSED immediately before sync (no port call, no state "
+    "change, never promoted); production refuses the contract; a cross-tenant id is not-found. Syncing "
+    "confers NO consent and performs NO send. Local synthetic; no AI/paid action, no network, no send.",
+)
+def _dca_155(ctx: CheckContext) -> dict:
+    """Drive the real DCA-155 synchronizer against a disposable DB with isolated synthetic Businesses A/B.
+
+    PRINT the actual state: a host that does NOT acknowledge leaves the intent pending_sync (pending
+    reconciliation, no external ids); an acknowledgment advances it to synced and persists the external
+    mapping with one atomic sync audit; a replay is idempotent (no second port call / audit); a restricted
+    CONTACT field and a sendable sync are refused with no state change (never promoted); production refuses
+    the contract; and a cross-tenant id reads as not-found. Nothing is sent, spent or consented."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audience import (
+        AudienceField,
+        AudienceFieldClass,
+        AudienceSyncContractDisabled,
+        AudienceSyncDecision,
+        AudienceSyncStatus,
+        FakeEffortlessPromoAudienceSyncPort,
+    )
+    from app.db.models import (
+        AcceptanceIntent,
+        AcceptanceIntentStatus,
+        AuditEvent,
+        ProspectSuggestion,
+        SuggestionVisibility,
+    )
+    from app.services.acceptance_intent import AcceptanceIntentActor, AcceptanceIntentRecorder
+    from app.services.acceptance_sync import (
+        AUDIT_ACTION_SYNC,
+        AcceptanceRecordSynchronizer,
+        AcceptanceSyncActor,
+        AcceptanceSyncError,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000155a"
+    biz_b = "00000000-0000-4000-8000-00000000155b"
+    accept_actor = AcceptanceIntentActor(
+        subject="00000000-0000-4000-9000-0000000a0155a", roles=("owner",)
+    )
+    sync_admin = AcceptanceSyncActor(
+        subject="00000000-0000-4000-9000-0000000a0155a", roles=("owner",)
+    )
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    org_field = AudienceField(
+        key="business_type", field_class=AudienceFieldClass.ORGANIZATION, value_digest="retail"
+    )
+    contact_field = AudienceField(
+        key="email", field_class=AudienceFieldClass.CONTACT, value_digest="sha256-of-synthetic"
+    )
+
+    def _seed(
+        session, business_id, subject_id, *, visibility=SuggestionVisibility.RESEARCH_ONLY.value
+    ):
+        sug = ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-155",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=visibility,
+            match_score=0.7,
+            rationale="ICP fit 0.70",
+            scored_icp_version=7,
+            schema_version=1,
+            status="suggested",
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+        session.add(sug)
+        session.commit()
+        res = AcceptanceIntentRecorder(session, business_id).accept(sug.id, accept_actor, now=now)
+        session.commit()
+        return res.intent.id
+
+    def _sync_audits(session):
+        return session.query(AuditEvent).filter_by(action=AUDIT_ACTION_SYNC).count()
+
+    print(
+        "\nsynchronize one accepted record through EffortlessPromo (local synthetic — nothing sent):"
+    )
+
+    prod_settings = ctx.settings.model_copy(update={"environment": "production"})
+
+    with ctx.session_factory() as session:
+        intent_a = _seed(session, biz_a, "subject-a")
+        intent_restricted = _seed(session, biz_a, "subject-restricted")
+        intent_prod = _seed(session, biz_a, "subject-prod")
+        intent_b = _seed(
+            session, biz_b, "subject-b", visibility=SuggestionVisibility.SENDABLE.value
+        )
+
+        # 1) A host that does NOT acknowledge -> PENDING reconciliation (a lost acknowledgment).
+        pending = AcceptanceRecordSynchronizer(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=False),
+        ).sync(intent_a, sync_admin, fields=(org_field,), now=now)
+        session.commit()
+        row = session.get(AcceptanceIntent, intent_a)
+        audits_after_pending = _sync_audits(session)
+        print("\n  [1] host does NOT acknowledge -> PENDING reconciliation:")
+        print(
+            f"      status={row.status} syncStatus={row.sync_status} "
+            f"externalCrmRecordId={row.external_crm_record_id!r} syncedAt={row.synced_at} "
+            f"(a pending attempt is audited; sync audits={audits_after_pending})"
+        )
+
+        # 2) An acknowledgment advances the intent to synced + persists the external mapping.
+        ack_port = FakeEffortlessPromoAudienceSyncPort(acknowledges=True)
+        acknowledged = AcceptanceRecordSynchronizer(
+            session, biz_a, ctx.settings, port=ack_port
+        ).sync(intent_a, sync_admin, fields=(org_field,), now=now)
+        session.commit()
+        row = session.get(AcceptanceIntent, intent_a)
+        audits_after_ack = _sync_audits(session)
+        print("\n  [2] host acknowledges -> SYNCED, external mapping persisted:")
+        print(
+            f"      status={row.status} syncStatus={row.sync_status} "
+            f"crmRecordId={row.external_crm_record_id!r} audienceId={row.external_audience_id!r} "
+            f"syncedAt={row.synced_at is not None} provenance.synced={row.provenance['synced']}"
+        )
+        print(f"      sync audits={audits_after_ack}")
+
+        # 3) Idempotent replay — no second port call, no duplicate sync/audit, same external refs.
+        replay = AcceptanceRecordSynchronizer(session, biz_a, ctx.settings, port=ack_port).sync(
+            intent_a, sync_admin, fields=(org_field,), now=now + timedelta(hours=1)
+        )
+        session.commit()
+        audits_after_replay = _sync_audits(session)
+        print("\n  [3] replay is idempotent on the request key:")
+        print(
+            f"      alreadySynced={replay.already_synced} "
+            f"sameExternalRef={replay.external_ref == acknowledged.external_ref} "
+            f"sync audits unchanged {audits_after_ack}->{audits_after_replay}"
+        )
+
+        # 4) A restricted CONTACT field under a research-only acceptance -> refused, never promoted.
+        before_restricted = _sync_audits(session)
+        restricted = AcceptanceRecordSynchronizer(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).sync(intent_restricted, sync_admin, fields=(org_field, contact_field), now=now)
+        session.commit()
+        audits_after_restricted = _sync_audits(session)
+        row_restricted = session.get(AcceptanceIntent, intent_restricted)
+        print("\n  [4] restricted CONTACT field -> refused, nothing promoted:")
+        print(
+            f"      accepted={restricted.accepted} reason={restricted.reason} "
+            f"status={row_restricted.status} syncStatus={row_restricted.sync_status!r} "
+            f"externalCrmRecordId={row_restricted.external_crm_record_id!r}"
+        )
+
+        # 5) B's sendable acceptance -> refused (requires consent that does not exist).
+        sendable = AcceptanceRecordSynchronizer(
+            session,
+            biz_b,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).sync(intent_b, sync_admin, fields=(org_field,), now=now)
+        session.commit()
+        row_b = session.get(AcceptanceIntent, intent_b)
+        print("\n  [5] B sendable sync -> refused:")
+        print(f"      accepted={sendable.accepted} reason={sendable.reason} status={row_b.status}")
+
+        # 6) Production refuses the contract outright (the live adapter is unbuilt; the fake is dev-only).
+        try:
+            AcceptanceRecordSynchronizer(session, biz_a, prod_settings).sync(
+                intent_prod, sync_admin, fields=(org_field,), now=now
+            )
+            prod_refused = False
+        except AudienceSyncContractDisabled:
+            prod_refused = True
+        session.rollback()
+        row_prod = session.get(AcceptanceIntent, intent_prod)
+        print("\n  [6] production refuses the contract:")
+        print(
+            f"      refused={prod_refused} status={row_prod.status} syncStatus={row_prod.sync_status!r}"
+        )
+
+        # 7) A cross-tenant id reads as not-found (A cannot sync B's intent by id).
+        try:
+            AcceptanceRecordSynchronizer(
+                session,
+                biz_a,
+                ctx.settings,
+                port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+            ).sync(intent_b, sync_admin, fields=(org_field,), now=now)
+            cross_not_found = False
+        except AcceptanceSyncError as exc:
+            cross_not_found = exc.code == "acceptance_intent_not_found"
+        session.rollback()
+        print(f"\n  [7] cross-tenant id not-found: {cross_not_found}")
+
+        # Snapshot values while attached (the rollbacks above expire instances).
+        a = session.get(AcceptanceIntent, intent_a)
+        a_status, a_sync_status = a.status, a.sync_status
+        a_crm, a_aud = a.external_crm_record_id, a.external_audience_id
+        a_synced_at = a.synced_at is not None
+        a_prov_synced = a.provenance["synced"]
+        a_prov_sent = a.provenance["sent"]
+        a_prov_consent = a.provenance["consentConferred"]
+        a_prov_membership = a.provenance["membershipCreated"]
+        pending_status = pending.status
+        pending_sync_status = pending.sync_status
+        r_status = session.get(AcceptanceIntent, intent_restricted).status
+        r_sync_status = session.get(AcceptanceIntent, intent_restricted).sync_status
+        r_crm = session.get(AcceptanceIntent, intent_restricted).external_crm_record_id
+        b_status = session.get(AcceptanceIntent, intent_b).status
+        prod_status = session.get(AcceptanceIntent, intent_prod).status
+
+    checks = {
+        "pending_handoff_stays_pending_no_external_ids": pending_status
+        == AcceptanceIntentStatus.PENDING_SYNC.value
+        and pending_sync_status == AudienceSyncStatus.PENDING.value,
+        "acknowledged_advances_to_synced_with_external_mapping": a_status
+        == AcceptanceIntentStatus.SYNCED.value
+        and a_sync_status == AudienceSyncStatus.ACKNOWLEDGED.value
+        and bool(a_crm)
+        and bool(a_aud)
+        and a_synced_at
+        and a_prov_synced is True,
+        "no_send_or_consent_side_effect": a_prov_sent is False
+        and a_prov_consent is False
+        and a_prov_membership is False
+        and acknowledged.confers_consent is False,
+        "acknowledgment_wrote_exactly_one_more_audit": audits_after_ack == audits_after_pending + 1,
+        "replay_idempotent_no_second_sync": replay.already_synced is True
+        and replay.external_ref == acknowledged.external_ref
+        and audits_after_replay == audits_after_ack,
+        "restricted_contact_field_not_promoted": restricted.accepted is False
+        and restricted.reason == AudienceSyncDecision.RESTRICTED_FIELD_NOT_PERMITTED
+        and r_status == AcceptanceIntentStatus.PENDING_SYNC.value
+        and r_sync_status == ""
+        and r_crm == ""
+        and audits_after_restricted == before_restricted,
+        "sendable_sync_disabled": sendable.accepted is False
+        and sendable.reason == AudienceSyncDecision.SENDABLE_SYNC_DISABLED
+        and b_status == AcceptanceIntentStatus.PENDING_SYNC.value,
+        "production_refuses_the_contract": prod_refused
+        and prod_status == AcceptanceIntentStatus.PENDING_SYNC.value,
+        "cross_tenant_not_found": cross_not_found,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no CRM write, no send. DCA-155 drives ONE "
+        "accepted record through the EffortlessPromo audience-sync port — the synthetic fake today; "
+        "production refuses the contract (the live adapter is unbuilt, B1). Only an ACKNOWLEDGED ack "
+        "advances the intent pending_sync->synced and persists the platform's external record mapping; a "
+        "PENDING hand-off (a lost acknowledgment) stays pending reconciliation with no accepted status and "
+        "no external ids. The request is re-gated immediately before sync, so a restricted CONTACT field, "
+        "a sendable sync and a disallowed purpose are refused and NEVER promoted. A replay is idempotent "
+        "on the request key. Syncing confers NO recipient consent and performs NO send.)"
+    )
+    return {
+        "checks": checks,
+        "aStatus": a_status,
+        "aSyncStatus": a_sync_status,
+        "pendingStatus": pending_status,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
