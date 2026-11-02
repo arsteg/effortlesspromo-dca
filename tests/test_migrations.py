@@ -3137,6 +3137,96 @@ def test_0071_creates_billable_acceptances_on_a_preexisting_database(clean_schem
 
 
 @requires_pg
+def test_0072_adds_delivery_columns_on_a_preexisting_database(clean_schema):
+    """DCA-158 — the 0072 add-column branch (for a DB migrated before the delivery columns existed).
+
+    A fresh DB gets ``billable_acceptances`` WITH ``delivered_at`` / ``delivery_receipt_id`` /
+    ``delivery_attempt_count`` / ``last_delivery_attempt_at`` from the metadata baseline (0001), so 0072 is
+    a no-op there. To exercise 0072's real job, upgrade to head, DROP the four columns, seed one
+    pre-existing (pre-delivery) ``recorded`` billable-acceptance row, stamp history back to 0071, then
+    upgrade to head again — 0072 must re-add exactly those columns and backfill the existing row to "not
+    delivered" (NULL timestamp, empty handle, 0 attempts) with no new table and no RLS change
+    (``billable_acceptances`` is tenant-owned already).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "billable_acceptances" DROP COLUMN "last_delivery_attempt_at", '
+                'DROP COLUMN "delivery_attempt_count", DROP COLUMN "delivery_receipt_id", '
+                'DROP COLUMN "delivered_at"'
+            )
+        )
+        # Seed a pre-existing acceptance-intent parent (the FK target) + one recorded billable row.
+        conn.execute(
+            text(
+                "INSERT INTO acceptance_intents "
+                "(id, business_id, suggestion_id, run_id, subject_type, subject_id, visibility, "
+                "status, suggestion_schema_version, match_score, schema_version, outbox_event_id, "
+                "sync_status, external_crm_record_id, external_audience_id, external_version, "
+                "accepted_by, accepted_by_type, provenance, created_at) VALUES "
+                "('intent-legacy-72', 'biz-legacy', 'sug-legacy-72', 'run-legacy', 'organization', "
+                "'subj-legacy', 'research_only', 'synced', 1, 0.5, 1, 'outbox-legacy-72', "
+                "'acknowledged', 'crm-legacy-72', 'aud-legacy-72', 'v1', 'actor-legacy', 'user', "
+                "'{}', now())"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO billable_acceptances "
+                "(id, business_id, acceptance_intent_id, suggestion_id, subject_type, subject_id, "
+                "billing_key, external_crm_record_id, outbox_event_id, schema_version, status, "
+                "recorded_by, recorded_by_type, provenance, created_at) VALUES "
+                "('billable-legacy-72', 'biz-legacy', 'intent-legacy-72', 'sug-legacy-72', "
+                "'organization', 'subj-legacy', 'billing-legacy-72', 'crm-legacy-72', "
+                "'outbox-legacy-72', 1, 'recorded', 'actor-legacy', 'user', '{}', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0071_billable_acceptance")  # pretend we predate the delivery columns
+    command.upgrade(cfg, "head")  # 0072 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("billable_acceptances", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT delivered_at, delivery_receipt_id, delivery_attempt_count, "
+                "last_delivery_attempt_at, status FROM billable_acceptances "
+                "WHERE id = 'billable-legacy-72'"
+            )
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'billable_acceptances' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert {
+        "delivered_at",
+        "delivery_receipt_id",
+        "delivery_attempt_count",
+        "last_delivery_attempt_at",
+    }.issubset(cols)  # columns re-added
+    # The pre-existing recorded row backfilled to "not delivered"; its ledger status is untouched.
+    assert backfilled == (None, "", 0, None, "recorded")
+    assert (
+        policy is not None
+    )  # tenant-owned: RLS still in place (unchanged by an add-column branch)
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 

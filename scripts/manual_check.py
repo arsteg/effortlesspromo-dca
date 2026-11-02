@@ -27853,6 +27853,288 @@ def _dca_157(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-158",
+    "DELIVER usage to platform billing: in isolated synthetic Businesses A/B, an authorized A user "
+    "delivers a DCA-157 'recorded' billable acceptance to the (synthetic) EffortlessPromo billing "
+    "capability. An ACKNOWLEDGED receipt advances the ledger entry recorded -> delivered, settles its "
+    "DCA-027 usage record pending -> delivered and stages ONE atomic audit, persisting the platform's "
+    "opaque usage-record handle; the DCA charges NOTHING (pricing is the platform's). Repeated delivery "
+    "never double-bills (a replay short-circuits on the delivered entry). A PENDING (lost-response) and a "
+    "DISABLED (meter has no configured price) receipt each leave the entry 'recorded' with no handle, no "
+    "price and NO charge invented. The provider cost (the DCA's basis) stays DISTINCT from the "
+    "platform-minted customer price. Production refuses the fake; an unauthorized viewer and a cross-tenant "
+    "id are refused with no state change. Local synthetic; no AI/paid action, no network, no send, no "
+    "charge.",
+)
+def _dca_158(ctx: CheckContext) -> dict:
+    """Drive the real DCA-158 deliverer against a disposable DB with isolated synthetic Businesses A/B.
+
+    PRINT the actual state: an acknowledged delivery advances a recorded entry to delivered (+ settles its
+    usage record + one atomic audit) with the platform's handle + customer price (DISTINCT from the DCA's
+    provider cost) and NO DCA charge; a replay never double-bills; a lost-response (PENDING) and an unpriced
+    meter (DISABLED) leave the entry recorded with no charge invented; production refuses the fake; an
+    unauthorized viewer and a cross-tenant id are refused with no state change."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audience import (
+        AudienceField,
+        AudienceFieldClass,
+        FakeEffortlessPromoAudienceSyncPort,
+    )
+    from app.billing import (
+        BillingUsageContractDisabled,
+        FakeEffortlessPromoBillingPort,
+        UsageDeliveryStatus,
+    )
+    from app.billing.fake import DEFAULT_CUSTOMER_PRICE_MINOR
+    from app.db.models import (
+        AuditEvent,
+        BillableAcceptance,
+        BillableAcceptanceStatus,
+        OutboxMessage,
+        OutboxStatus,
+        ProspectSuggestion,
+        SuggestionVisibility,
+    )
+    from app.services.acceptance_intent import AcceptanceIntentActor, AcceptanceIntentRecorder
+    from app.services.acceptance_sync import AcceptanceRecordSynchronizer, AcceptanceSyncActor
+    from app.services.billable_acceptance import OUTBOX_EVENT_BILLABLE, BillableAcceptanceEmitter
+    from app.services.usage_delivery import (
+        AUDIT_ACTION_DELIVERY,
+        UsageBillingDeliverer,
+        UsageDeliveryActor,
+        UsageDeliveryAuthorizationError,
+        UsageDeliveryError,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000158a"
+    biz_b = "00000000-0000-4000-8000-00000000158b"
+    accept_actor = AcceptanceIntentActor(
+        subject="00000000-0000-4000-9000-0000000a0158a", roles=("owner",)
+    )
+    sync_admin = AcceptanceSyncActor(
+        subject="00000000-0000-4000-9000-0000000a0158a", roles=("owner",)
+    )
+    admin = UsageDeliveryActor(subject="00000000-0000-4000-9000-0000000a0158a", roles=("owner",))
+    viewer = UsageDeliveryActor(subject="00000000-0000-4000-9000-0000000a0158b", roles=("viewer",))
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+    provider_cost_minor = 1200  # the DCA's own cost basis (paise) — NOT the customer charge
+    org_field = AudienceField(
+        key="business_type", field_class=AudienceFieldClass.ORGANIZATION, value_digest="retail"
+    )
+
+    def _seed_recorded(session, business_id, subject_id):
+        sug = ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-158",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+            match_score=0.7,
+            rationale="ICP fit 0.70",
+            scored_icp_version=7,
+            schema_version=1,
+            status="suggested",
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+        session.add(sug)
+        session.commit()
+        intent_id = (
+            AcceptanceIntentRecorder(session, business_id)
+            .accept(sug.id, accept_actor, now=now)
+            .intent.id
+        )
+        session.commit()
+        AcceptanceRecordSynchronizer(
+            session,
+            business_id,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).sync(intent_id, sync_admin, fields=(org_field,), now=now)
+        session.commit()
+        entry_id = (
+            BillableAcceptanceEmitter(session, business_id)
+            .emit(intent_id, sync_admin, now=now)
+            .entry.id
+        )
+        session.commit()
+        return entry_id
+
+    def _audits(session):
+        return session.query(AuditEvent).filter_by(action=AUDIT_ACTION_DELIVERY).count()
+
+    def _usage_status(session, entry_id):
+        entry = session.get(BillableAcceptance, entry_id)
+        msg = (
+            session.query(OutboxMessage)
+            .filter_by(event_type=OUTBOX_EVENT_BILLABLE, event_id=entry.outbox_event_id)
+            .one()
+        )
+        return msg.status
+
+    print("\ndeliver usage to platform billing (local synthetic — the DCA charges nothing):")
+
+    with ctx.session_factory() as session:
+        entry_ack = _seed_recorded(session, biz_a, "subject-ack")
+        entry_pending = _seed_recorded(session, biz_a, "subject-pending")
+        entry_unpriced = _seed_recorded(session, biz_a, "subject-unpriced")
+        entry_b = _seed_recorded(session, biz_b, "subject-b")
+
+        # 1) ACKNOWLEDGED -> recorded advances to delivered; usage record settles; one audit; distinct $$.
+        ack_port = FakeEffortlessPromoBillingPort(acknowledges=True, now=now)
+        delivered = UsageBillingDeliverer(
+            session, biz_a, ctx.settings, port=ack_port
+        ).deliver_entry(entry_ack, admin, provider_cost_minor=provider_cost_minor, now=now)
+        session.commit()
+        row = session.get(BillableAcceptance, entry_ack)
+        usage_after = _usage_status(session, entry_ack)
+        audits_after = _audits(session)
+        print("\n  [1] acknowledged delivery -> recorded ADVANCES to delivered (no DCA charge):")
+        print(
+            f"      delivered={delivered.delivered} status={row.status} "
+            f"receiptId={row.delivery_receipt_id!r} usageRecord={usage_after} audits={audits_after} "
+            f"providerCost={delivered.provider_cost_minor} customerPrice={delivered.customer_price_minor} "
+            f"distinct={delivered.provider_cost_minor != delivered.customer_price_minor} "
+            f"chargedByDca={delivered.charged_by_dca}"
+        )
+
+        # 2) Replay is idempotent — same entry, no second attempt / audit, never double-billed.
+        replay = UsageBillingDeliverer(session, biz_a, ctx.settings, port=ack_port).deliver_entry(
+            entry_ack, admin, now=now + timedelta(hours=1)
+        )
+        session.commit()
+        audits_after_replay = _audits(session)
+        replay_attempts = session.get(BillableAcceptance, entry_ack).delivery_attempt_count
+        print("\n  [2] replay is idempotent (never double-billed):")
+        print(
+            f"      alreadyDelivered={replay.already_delivered} attempts={replay_attempts} "
+            f"audits unchanged {audits_after}->{audits_after_replay}"
+        )
+
+        # 3) A PENDING (lost-response) delivery leaves the entry recorded — never marked success.
+        pending_port = FakeEffortlessPromoBillingPort(acknowledges=False, now=now)
+        pending = UsageBillingDeliverer(
+            session, biz_a, ctx.settings, port=pending_port
+        ).deliver_entry(entry_pending, admin, now=now)
+        session.commit()
+        pending_row = session.get(BillableAcceptance, entry_pending)
+        print("\n  [3] lost-response (PENDING) delivery -> entry stays recorded (not success):")
+        print(
+            f"      delivered={pending.delivered} status={pending_row.status} "
+            f"receiptId={pending_row.delivery_receipt_id!r} customerPrice={pending.customer_price_minor} "
+            f"usageRecord={_usage_status(session, entry_pending)}"
+        )
+
+        # 4) A meter with no configured price -> DISABLED; NO charge invented.
+        unpriced_port = FakeEffortlessPromoBillingPort(acknowledges=True, priced_meters=(), now=now)
+        unpriced = UsageBillingDeliverer(
+            session, biz_a, ctx.settings, port=unpriced_port
+        ).deliver_entry(entry_unpriced, admin, now=now)
+        session.commit()
+        unpriced_row = session.get(BillableAcceptance, entry_unpriced)
+        print("\n  [4] meter with no configured price -> DISABLED (no charge invented):")
+        print(
+            f"      delivered={unpriced.delivered} reason={unpriced.reason!r} "
+            f"status={unpriced_row.status} customerPrice={unpriced.customer_price_minor}"
+        )
+
+        # 5) Production refuses the fake (even when one is injected).
+        prod_settings = ctx.settings.model_copy(update={"environment": "production"})
+        try:
+            UsageBillingDeliverer(session, biz_a, prod_settings, port=ack_port).deliver_entry(
+                entry_pending, admin, now=now
+            )
+            prod_refused = False
+        except BillingUsageContractDisabled:
+            prod_refused = True
+        session.rollback()
+        print(f"\n  [5] production refuses the fake: {prod_refused}")
+
+        # 6) An unauthorized viewer is refused with no state change.
+        try:
+            UsageBillingDeliverer(session, biz_a, ctx.settings, port=ack_port).deliver_entry(
+                entry_pending, viewer, now=now
+            )
+            viewer_refused = False
+        except UsageDeliveryAuthorizationError:
+            viewer_refused = True
+        session.rollback()
+        print(f"\n  [6] unauthorized viewer refused: {viewer_refused}")
+
+        # 7) A cross-tenant id reads as not-found (A cannot deliver B's entry by id).
+        try:
+            UsageBillingDeliverer(session, biz_a, ctx.settings, port=ack_port).deliver_entry(
+                entry_b, admin, now=now
+            )
+            cross_not_found = False
+        except UsageDeliveryError as exc:
+            cross_not_found = exc.code == "billable_acceptance_not_found"
+        session.rollback()
+        print(f"\n  [7] cross-tenant id not-found: {cross_not_found}")
+
+        # Snapshot final state while attached (the rollbacks above expire instances).
+        ack_final = session.get(BillableAcceptance, entry_ack)
+        ack_status = ack_final.status
+        ack_receipt = ack_final.delivery_receipt_id
+        ack_attempts = ack_final.delivery_attempt_count
+        ack_prov_delivered = ack_final.provenance["delivered"]
+        ack_prov_charged = ack_final.provenance["chargedByDca"]
+        ack_prov_provider = ack_final.provenance["providerCostMinor"]
+        ack_prov_customer = ack_final.provenance["customerPriceMinor"]
+        pending_status = session.get(BillableAcceptance, entry_pending).status
+        unpriced_status = session.get(BillableAcceptance, entry_unpriced).status
+        b_status = session.get(BillableAcceptance, entry_b).status
+        delivered_count = (
+            session.query(BillableAcceptance)
+            .filter_by(status=BillableAcceptanceStatus.DELIVERED.value)
+            .count()
+        )
+
+    checks = {
+        "delivered_once_advanced_to_delivered": delivered.delivered is True
+        and ack_status == BillableAcceptanceStatus.DELIVERED.value
+        and bool(ack_receipt)
+        and usage_after == OutboxStatus.DELIVERED.value
+        and audits_after == 1
+        and ack_prov_delivered is True,
+        "provider_cost_distinct_from_customer_price": ack_prov_provider == provider_cost_minor
+        and ack_prov_customer == DEFAULT_CUSTOMER_PRICE_MINOR
+        and ack_prov_provider != ack_prov_customer
+        and delivered.charged_by_dca is False
+        and ack_prov_charged is False,
+        "replay_idempotent_no_double_bill": replay.already_delivered is True
+        and ack_attempts == 1
+        and audits_after_replay == audits_after,
+        "pending_delivery_not_marked_success": pending.delivered is False
+        and pending.receipt.status is UsageDeliveryStatus.PENDING
+        and pending_status == BillableAcceptanceStatus.RECORDED.value
+        and pending.customer_price_minor is None,
+        "missing_price_invents_no_charge": unpriced.delivered is False
+        and unpriced.reason == "billing_meter_not_priced"
+        and unpriced_status == BillableAcceptanceStatus.RECORDED.value
+        and unpriced.customer_price_minor is None,
+        "production_refuses_fake": prod_refused,
+        "unauthorized_viewer_refused": viewer_refused,
+        "cross_tenant_not_found": cross_not_found
+        and b_status == BillableAcceptanceStatus.RECORDED.value,
+        "exactly_one_delivered_entry": delivered_count == 1,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send, no charge. DCA-158 DELIVERS a "
+        "DCA-157 'recorded' billable acceptance to the EffortlessPromo billing capability through a typed "
+        "contract + synthetic fake, advancing the ledger entry recorded -> delivered ONLY on an "
+        "acknowledgment. Repeated delivery never double-bills; a lost-response / unpriced-meter delivery "
+        "invents no charge and leaves the entry recorded; the provider cost stays distinct from the "
+        "platform-minted customer price; the DCA charges nothing. Production refuses the fake; the live "
+        "adapter into the platform billing module is the deferred DCA-001 B1 work.)"
+    )
+    return {"checks": checks, "deliveredEntries": delivered_count}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

@@ -1894,6 +1894,21 @@ class BillableAcceptance(TenantOwned, Base):
     # consentConferred / membershipCreated = False).
     provenance: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # DCA-158 — delivery-of-usage-to-platform-billing bookkeeping. An entry is recorded by DCA-157 and
+    # STAYS ``recorded`` until the (synthetic) platform billing capability ACKNOWLEDGES the usage; only
+    # then does ``status`` advance to ``delivered`` and these columns fill. A PENDING / lost-response /
+    # refused (unpriced-meter / unavailable-host) delivery leaves ``status='recorded'`` and these empty —
+    # no entry is ever marked delivered on anything short of an acknowledgment (so a replay never double-
+    # bills), and a missing configured price invents NO charge. ``delivery_receipt_id`` is the platform's
+    # OWN opaque usage-record handle (deterministic in the stable billing/request key, so a retried
+    # delivery resolves to the SAME handle). The DCA never holds a customer price here — pricing is the
+    # platform's; the DCA only records that the usage was delivered + acknowledged.
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    delivery_receipt_id: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    delivery_attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_delivery_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
 
 
 class DiscoveryRunSummary(TenantOwned, Base):
