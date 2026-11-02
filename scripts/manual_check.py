@@ -26399,6 +26399,162 @@ def _dca_151(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-152",
+    "PREVIEW an audience selection — a tenant-scoped, read-only, NON-MUTATING projection of a selected "
+    "subset of a business's prospect suggestions. It separates research-only organizations (never "
+    "activatable — no sendable contact, no recipient consent) from the (disabled-future) activatable "
+    "set, tallies exclusions by reason (freshness / dismissed / not-reviewable / research-only rights / "
+    "not-found), and reports the would-be cost WITHOUT committing billing or creating any audience "
+    "membership. An unknown / cross-tenant id reads as not-found (never leaked). NOTHING fetched / sent "
+    "/ spent / written, and the host audience count stays unchanged. Local synthetic.",
+)
+def _dca_152(ctx: CheckContext) -> dict:
+    """Drive the real DCA-152 previewer against a disposable DB with isolated synthetic Businesses A/B.
+
+    PRINT the actual projection: A selects a MIX of its suggestions (research-only, expired, dismissed,
+    a disabled-future sendable) plus a nonexistent id and B's id; the preview classifies each, separates
+    research-only from activatable, tallies exclusions, and reports the would-be cost. Then prove the
+    invariants: NOTHING is written (suggestion rows + audit unchanged, no audience/membership exists),
+    and B's id reads as not-found (never leaked). Nothing is fetched, sent or spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import AuditEvent, ProspectSuggestion, SuggestionVisibility
+    from app.services.audience_selection_preview import (
+        AudienceSelectionPreviewer,
+        EXCLUSION_NOT_FOUND,
+        EXCLUSION_RESEARCH_ONLY,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000152a"
+    biz_b = "00000000-0000-4000-8000-00000000152b"
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    def _row(business_id, subject_id, *, status="suggested", visibility=None, expires_in_days=30):
+        vis = visibility or SuggestionVisibility.RESEARCH_ONLY.value
+        expires = None if expires_in_days is None else now + timedelta(days=expires_in_days)
+        return ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-152",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=vis,
+            match_score=0.6,
+            rationale="ICP fit 0.60",
+            scored_icp_version=1,
+            schema_version=1,
+            status=status,
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=expires,
+        )
+
+    print("\npreview an audience selection (local synthetic — nothing fetched/sent/spent/written):")
+
+    with ctx.session_factory() as session:
+        research = _row(biz_a, "research-org")
+        expired = _row(biz_a, "expired-org", expires_in_days=-1)
+        dismissed = _row(biz_a, "dismissed-org", status="dismissed")
+        sendable = _row(biz_a, "sendable", visibility=SuggestionVisibility.SENDABLE.value)
+        b_row = _row(biz_b, "b-only")
+        session.add_all([research, expired, dismissed, sendable, b_row])
+        session.commit()
+        a_ids = [research.id, expired.id, dismissed.id, sendable.id]
+        b_id = b_row.id
+
+        audits_before = session.query(AuditEvent).count()
+        rows_before = session.query(ProspectSuggestion).count()
+
+        # A previews its mixed selection plus a nonexistent id and B's id.
+        selection = a_ids + ["does-not-exist", b_id]
+        preview = AudienceSelectionPreviewer(session, biz_a).preview(
+            selection, intended_use="Q4 outreach", channel="email", now=now
+        )
+        session.commit()  # prove even an explicit commit after a preview stages nothing
+
+        audits_after = session.query(AuditEvent).count()
+        rows_after = session.query(ProspectSuggestion).count()
+
+    by_id = {line.suggestion_id: line for line in preview.lines}
+
+    print("\n  [1] the projection over A's selection:")
+    print(
+        f"      selected={preview.selected}  found={preview.found}  "
+        f"notFound={preview.not_found}  activatable={preview.activatable}  "
+        f"researchOnly={preview.research_only}"
+    )
+    print(f"      excluded (by reason) = {preview.excluded}")
+    for line in preview.lines:
+        print(
+            f"      - {line.suggestion_id[:12]:<12} found={line.found} "
+            f"activatable={line.activatable} visibility={line.visibility} "
+            f"status={line.status} fresh={line.fresh} reason={line.exclusion_reason}"
+        )
+
+    print("\n  [2] cost projection — a WOULD-BE figure only (no billing, no membership):")
+    print(
+        f"      estimatedChargeableContacts={preview.estimated_chargeable_contacts}  "
+        f"billingCommitted={preview.billing_committed}  "
+        f"membershipCreated={preview.membership_created}"
+    )
+
+    print("\n  [3] tenant isolation + non-mutating:")
+    print(f"      B's id read by A = found={by_id[b_id].found} (not leaked)")
+    print(
+        f"      suggestion rows {rows_before}->{rows_after}  audit {audits_before}->{audits_after} "
+        f"(unchanged)"
+    )
+
+    no_state_change = audits_after == audits_before and rows_after == rows_before
+    checks = {
+        "research_only_separated_from_activatable": (
+            preview.research_only == 1
+            and preview.activatable == 1
+            and by_id[research.id].activatable is False
+            and by_id[research.id].exclusion_reason == EXCLUSION_RESEARCH_ONLY
+            and by_id[sendable.id].activatable is True
+        ),
+        "exclusions_tallied_by_reason": (
+            preview.excluded.get(EXCLUSION_RESEARCH_ONLY) == 1
+            and preview.excluded.get("expired") == 1
+            and preview.excluded.get("dismissed") == 1
+            and preview.excluded.get(EXCLUSION_NOT_FOUND) == 2
+        ),
+        "cross_tenant_id_not_found_not_leaked": (
+            by_id[b_id].found is False
+            and by_id[b_id].exclusion_reason == EXCLUSION_NOT_FOUND
+            and by_id[b_id].subject_id is None
+        ),
+        "no_billing_or_membership_committed": (
+            preview.billing_committed is False
+            and preview.membership_created is False
+            and preview.estimated_chargeable_contacts == 1
+        ),
+        "non_mutating_rows_and_audit_unchanged": (
+            no_state_change and rows_after == 5 and audits_after == 0
+        ),
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-152 PREVIEWS what an "
+        "audience built from a selection WOULD contain: it reads the business's own suggestion rows, "
+        "separates research-only organizations (never activatable — no sendable contact, no recipient "
+        "consent) from the disabled-future activatable set, tallies exclusions by reason (freshness / "
+        "dismissed / rights / not-found), and reports a would-be cost WITHOUT committing billing or "
+        "creating any audience membership. It is tenant-scoped (another tenant's id reads as not-found) "
+        "and non-mutating, so the projection and every denial reproduce with no state change. Acting on "
+        "the preview — building the audience, sending, or spending — stays a disabled future "
+        "capability.)"
+    )
+    return {
+        "checks": checks,
+        "excluded": preview.excluded,
+        "activatable": preview.activatable,
+        "researchOnly": preview.research_only,
+        "estimatedChargeableContacts": preview.estimated_chargeable_contacts,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

@@ -15,6 +15,7 @@ from app.ai import AiContractDisabled, build_ai_capability_facade
 from app.api.idempotency import install_idempotency
 from app.api.routes import (
     activation_references,
+    audience_preview,
     auth,
     authz,
     budget,
@@ -157,6 +158,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(budget.router)
     app.include_router(spend_summary.router)
     app.include_router(prospect_suggestions.router)
+    app.include_router(audience_preview.router)
     app.include_router(grievances.router)
     app.include_router(privacy_scope.router)
     app.include_router(privacy_erasure.router)
