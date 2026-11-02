@@ -1593,9 +1593,7 @@ class ProspectSuggestion(TenantOwned, Base):
 
     __tablename__ = "prospect_suggestions"
     # At most ONE suggestion per (run, subject) in a business — the "suggested once" idempotency guard.
-    __table_args__ = (
-        tenant_unique("run_id", "subject_id", name="uq_prospect_suggestion_subject"),
-    )
+    __table_args__ = (tenant_unique("run_id", "subject_id", name="uq_prospect_suggestion_subject"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     # The DCA-140 run whose resolved batch this suggestion was drawn from.
@@ -1638,6 +1636,79 @@ class ProspectSuggestion(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # The expiry after which the suggestion should no longer be acted on without a refresh.
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+
+
+class DiscoveryRunSummary(TenantOwned, Base):
+    """DCA-146 — the durable FINALIZED summary of ONE discovery run (tenant-owned, RLS-protected).
+
+    This is the terminal step of the still-disabled discovery pipeline after DCA-145 suggests prospects
+    from a run's resolved batch: it AGGREGATES the run's recorded task outcomes, counts, (held) costs,
+    failure/denial reasons and a durable checkpoint cursor into ONE inert summary row, and settles the
+    run into a terminal :class:`DiscoveryRunStatus` — WITHOUT exposing any raw private data (it holds only
+    aggregate counts, stable reason codes and opaque, checkpointable row references — never a contact
+    value). Finalizing reads already-recorded pipeline state and performs no network fetch, model call,
+    spend or send; ``provenance`` pins ``finalized`` = True and ``sent`` / ``spent`` = False.
+
+    **The two load-bearing invariants (the DCA-146 acceptance criteria):**
+
+    - **Partial failure is reported honestly; a run with no matches is not fabricated success.** The
+      counts mirror the underlying :class:`DiscoveryTaskExecution` records exactly — ``done_count`` /
+      ``failed_count`` / ``denied_count`` out of ``task_count`` — and the per-reason breakdown
+      (``reason_counts``) names why each non-DONE task stopped. ``final_status`` is
+      :attr:`DiscoveryRunStatus.COMPLETED` ONLY when the run did genuine successful work (at least one
+      DONE task); a run whose tasks all failed / were denied, or that executed nothing at all
+      (``empty`` = True), settles to :attr:`DiscoveryRunStatus.FAILED` — never a fabricated success.
+      ``partial_failure`` flags a completed run that nonetheless had failed / denied tasks. The resolved
+      ``matched_count`` is recorded as-is, so "no matches" reads as zero, not as success.
+
+    - **Reproduce the result and the relevant denial without unintended state changes.** The one finalizer
+      checks authority FIRST, then that the run exists in THIS business (an unknown / cross-tenant run is
+      not-found). Each refusal is raised BEFORE the session is mutated, so it changes nothing.
+
+    **Idempotent, tenant-owned.** ``(business_id, run_id)`` is unique: a run finalizes ONCE — re-finalizing
+    returns this existing record and advances no state and writes no second audit. The row is owned by
+    exactly one ``business_id`` (DCA-017/018) and read only within it.
+    """
+
+    __tablename__ = "discovery_run_summaries"
+    # At most ONE summary per run in a business — the "a run finalizes once" idempotency guarantee.
+    __table_args__ = (tenant_unique("run_id", name="uq_discovery_run_summary_run"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-140 run this summary finalizes.
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("discovery_run_requests.id"), index=True
+    )
+    # The terminal status the run was settled to: completed (>=1 DONE task) | failed (no successful work).
+    final_status: Mapped[str] = mapped_column(String(16), index=True)
+    # Task-outcome aggregation over the run's DiscoveryTaskExecution records (honest, mirror of the rows).
+    task_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    done_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    denied_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The total HELD cost (sum of the tasks' DCA-113 reservation holds), in INR minor units (paise). A
+    # reservation is a HOLD, never a spend — the DCA has no spend path — so this is the budget that WOULD
+    # have been consumed, recorded honestly; ``per_run_budget_minor`` echoes the run's spend ceiling.
+    reserved_cost_minor: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    per_run_budget_minor: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    # The run's resolved-batch outcome (0 when the run was never resolved / had no batch — recorded as-is,
+    # so "no matches" is zero, never fabricated success), and how many prospect suggestions it produced.
+    subject_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    matched_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    suggestion_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # A completed run that nonetheless had failed / denied tasks (partial failure reported honestly), and
+    # a run that executed no task at all (empty — settled to FAILED, never fabricated success).
+    partial_failure: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    empty: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    # The per-reason breakdown of why non-DONE tasks stopped: {reason_code: count}. Stable codes only.
+    reason_counts: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The durable checkpoint cursor: which task indices executed, the import counts and opaque
+    # checkpointable row references, and the resolved-batch breakdown — NEVER a contact value.
+    cursor: Mapped[dict] = mapped_column(JSON, default=dict)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Finalization provenance + the load-bearing invariants (finalized = True; sent / spent = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
 class AcquisitionDecision(TenantOwned, Base):

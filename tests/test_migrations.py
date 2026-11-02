@@ -87,6 +87,7 @@ DCA_TABLES = {
     "discovery_task_conversions",
     "observation_batch_resolutions",
     "prospect_suggestions",
+    "discovery_run_summaries",
 }
 
 
@@ -2699,7 +2700,9 @@ def test_0064_creates_prospect_suggestions_on_a_preexisting_database(clean_schem
         conn.execute(text('DROP TABLE IF EXISTS "prospect_suggestions" CASCADE'))
     eng.dispose()
 
-    command.stamp(cfg, "0063_observation_batch_resolutions")  # pretend we predate the suggestion table
+    command.stamp(
+        cfg, "0063_observation_batch_resolutions"
+    )  # pretend we predate the suggestion table
     command.upgrade(cfg, "head")  # 0064 runs its create branch
 
     eng = create_engine(PG_URL)
@@ -2719,6 +2722,51 @@ def test_0064_creates_prospect_suggestions_on_a_preexisting_database(clean_schem
         ).first()
     eng.dispose()
     assert "uq_prospect_suggestion_subject" in uniques  # one suggestion per (tenant, run, subject)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0065_creates_discovery_run_summaries_on_a_preexisting_database(clean_schema):
+    """DCA-146 — the 0065 create branch (for a DB migrated before ``discovery_run_summaries``).
+
+    ``discovery_run_summaries`` is tenant-owned (RLS-protected), like ``prospect_suggestions`` (0064). A
+    fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0065 is a
+    no-op there. To exercise 0065's real job, upgrade to head, drop the table + policy, stamp history back
+    to 0064, then upgrade to head again — 0065 must recreate the table (with its per-tenant per-run unique
+    constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "discovery_run_summaries" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0064_prospect_suggestions")  # pretend we predate the summary table
+    command.upgrade(cfg, "head")  # 0065 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "discovery_run_summaries" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("discovery_run_summaries", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'discovery_run_summaries' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_discovery_run_summary_run" in uniques  # one summary per (tenant, run)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

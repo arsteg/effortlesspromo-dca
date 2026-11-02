@@ -24317,7 +24317,10 @@ def _dca_144(ctx: CheckContext) -> dict:
         SourceTermsStatus,
         TenantAgent,
     )
-    from app.services.discovery_observation import DiscoveryObservationConverter, TaskConversionActor
+    from app.services.discovery_observation import (
+        DiscoveryObservationConverter,
+        TaskConversionActor,
+    )
     from app.services.discovery_planner import PLAN_PURPOSE
     from app.services.discovery_run import create_discovery_run
     from app.services.discovery_task_execution import (
@@ -24343,9 +24346,13 @@ def _dca_144(ctx: CheckContext) -> dict:
     biz_b = "00000000-0000-4000-8000-00000000014b"
     allowed_key = "mca_master_data"
     fixture_name = "Synthetic Textiles Pvt Ltd"
-    exec_admin = TaskExecutionActor(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
+    exec_admin = TaskExecutionActor(
+        subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",)
+    )
     approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
-    conv_admin = TaskConversionActor(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
+    conv_admin = TaskConversionActor(
+        subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",)
+    )
     corrector = FieldCorrector(subject="00000000-0000-4000-9000-0000000a0144c", roles=("owner",))
     admin = BatchResolutionActor(subject="00000000-0000-4000-9000-0000000a0144a", roles=("owner",))
 
@@ -24561,7 +24568,9 @@ def _dca_144(ctx: CheckContext) -> dict:
         res2 = ObservationBatchResolver(session, biz_a).resolve_run(run_a_id, admin)
         session.commit()
         resolutions = session.query(ObservationBatchResolution).filter_by(business_id=biz_a).count()
-        suggestions_after = session.query(IdentityMatchSuggestion).filter_by(business_id=biz_a).count()
+        suggestions_after = (
+            session.query(IdentityMatchSuggestion).filter_by(business_id=biz_a).count()
+        )
         print(
             f"\n  Business A — re-resolve idempotent: already_resolved={res2.already_resolved}  "
             f"resolutions still={resolutions}  suggestions still={suggestions_after}"
@@ -24575,7 +24584,9 @@ def _dca_144(ctx: CheckContext) -> dict:
             refused_code = exc.code
         print("\n  Business B — A's run is not reachable cross-tenant:")
         print(f"      resolveRefusedWith={refused_code}")
-        b_resolutions = session.query(ObservationBatchResolution).filter_by(business_id=biz_b).count()
+        b_resolutions = (
+            session.query(ObservationBatchResolution).filter_by(business_id=biz_b).count()
+        )
 
     checks = {
         "a_single_subject_batch": res.subject_count == 1,
@@ -24645,7 +24656,10 @@ def _dca_145(ctx: CheckContext) -> dict:
         SourceTermsStatus,
         TenantAgent,
     )
-    from app.services.discovery_observation import DiscoveryObservationConverter, TaskConversionActor
+    from app.services.discovery_observation import (
+        DiscoveryObservationConverter,
+        TaskConversionActor,
+    )
     from app.services.discovery_planner import PLAN_PURPOSE
     from app.services.discovery_run import create_discovery_run
     from app.services.discovery_task_execution import (
@@ -24670,13 +24684,23 @@ def _dca_145(ctx: CheckContext) -> dict:
     biz_b = "00000000-0000-4000-8000-00000000015b"
     allowed_key = "mca_master_data"
     fixture_name = "Synthetic Textiles Pvt Ltd"
-    exec_admin = TaskExecutionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    exec_admin = TaskExecutionActor(
+        subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",)
+    )
     approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
-    conv_admin = TaskConversionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
-    resolve_admin = BatchResolutionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
+    conv_admin = TaskConversionActor(
+        subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",)
+    )
+    resolve_admin = BatchResolutionActor(
+        subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",)
+    )
     field_actor = AuditActor(id="00000000-0000-4000-9000-0000000a0145c", type=ActorType.USER)
-    admin = ProspectSuggestionActor(subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",))
-    viewer = ProspectSuggestionActor(subject="00000000-0000-4000-9000-0000000a0145b", roles=("viewer",))
+    admin = ProspectSuggestionActor(
+        subject="00000000-0000-4000-9000-0000000a0145a", roles=("owner",)
+    )
+    viewer = ProspectSuggestionActor(
+        subject="00000000-0000-4000-9000-0000000a0145b", roles=("viewer",)
+    )
 
     settings = ctx.settings.model_copy(update={"feature_enabled": True})
 
@@ -24864,9 +24888,13 @@ def _dca_145(ctx: CheckContext) -> dict:
         row = session.query(ProspectSuggestion).filter_by(business_id=biz_a).one()
         print("\n  Business A — the created prospect suggestion:")
         print(f"      subject            = {subject.id[:8]}… ({subject.display_name!r})")
-        print(f"      matchScore         = {res.match_score}  matchedDimensions={res.matched_dimensions}")
+        print(
+            f"      matchScore         = {res.match_score}  matchedDimensions={res.matched_dimensions}"
+        )
         print(f"      rationale          = {res.rationale!r}")
-        print(f"      scoredIcpVersion   = {res.scored_icp_version}  schemaVersion={row.schema_version}")
+        print(
+            f"      scoredIcpVersion   = {res.scored_icp_version}  schemaVersion={row.schema_version}"
+        )
         print(f"      visibility         = {res.visibility}  sendable={res.sendable}")
         print(f"      status             = {row.status}  expiresAt={res.expires_at}")
         print(
@@ -24931,6 +24959,373 @@ def _dca_145(ctx: CheckContext) -> dict:
         "matchScore": res.match_score,
         "visibility": res.visibility,
         "scoredIcpVersion": res.scored_icp_version,
+    }
+
+
+@register(
+    "DCA-146",
+    "FINALIZE a discovery run summary — aggregate the run's recorded task outcomes/counts, the held "
+    "(never spent) reservation cost, the failure/denial reasons, the resolved-batch counts, the "
+    "suggestion count and a durable checkpoint cursor into ONE durable summary WITHOUT exposing raw "
+    "private data, and settle the run into a terminal status. Partial failure is reported honestly; a "
+    "run with no successful work (all-denied or empty) is FAILED, never fabricated success; re-finalizing "
+    "is an idempotent no-op; an unauthorized caller and a cross-tenant run are both refused with no state "
+    "change. NO fetch/model/spend/send. Local synthetic only.",
+)
+def _dca_146(ctx: CheckContext) -> dict:
+    """Drive the real DCA-146 finalizer against a disposable DB. Business A runs the full pipeline
+    (execute DCA-142 + convert DCA-143 + resolve DCA-144 + suggest DCA-145) on run #1 then FINALIZES it —
+    PRINT the durable summary (terminal status, honest outcome counts, held cost, resolved matches /
+    suggestions, reason breakdown and the checkpoint cursor). Then FINALIZE an EMPTY run #2 (nothing
+    executed) → FAILED (NOT fabricated success). Show an idempotent re-finalize and the refusals (an
+    unauthorized viewer, and Business B reading A's run as not-found). Nothing fetched, sent or spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audit.sink import ActorType, AuditActor
+    from app.db.models import (
+        BudgetLimit,
+        BusinessSourceEntitlement,
+        DiscoveryPlan,
+        DiscoveryRunStatus,
+        DiscoveryRunSummary,
+        FieldInferenceLabel,
+        IcpConfirmation,
+        IcpDraft,
+        OrgObservation,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_observation import (
+        DiscoveryObservationConverter,
+        TaskConversionActor,
+    )
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.discovery_run_finalization import (
+        DiscoveryRunFinalizer,
+        RunFinalizationActor,
+        RunFinalizationAuthorizationError,
+        RunFinalizationError,
+    )
+    from app.services.discovery_task_execution import (
+        DiscoveryTaskExecutor,
+        OrgDatasetTaskInput,
+        TaskExecutionActor,
+    )
+    from app.services.field_observation import FieldObservationInput, FieldObservationStore
+    from app.services.observation_resolution import BatchResolutionActor, ObservationBatchResolver
+    from app.services.org_observation import ExternalIdInput
+    from app.services.prospect_suggestion import ProspectSuggestionActor, ProspectSuggestionCreator
+    from app.services.run_plan_approval import RunPlanApprover, approve_run_plan
+    from app.sources.org_dataset_import import DatasetManifest, DatasetRow
+
+    biz_a = "00000000-0000-4000-8000-00000000016a"
+    biz_b = "00000000-0000-4000-8000-00000000016b"
+    allowed_key = "mca_master_data"
+    fixture_name = "Synthetic Textiles Pvt Ltd"
+    exec_admin = TaskExecutionActor(
+        subject="00000000-0000-4000-9000-0000000a0146a", roles=("owner",)
+    )
+    approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0146a", roles=("owner",))
+    conv_admin = TaskConversionActor(
+        subject="00000000-0000-4000-9000-0000000a0146a", roles=("owner",)
+    )
+    resolve_admin = BatchResolutionActor(
+        subject="00000000-0000-4000-9000-0000000a0146a", roles=("owner",)
+    )
+    field_actor = AuditActor(id="00000000-0000-4000-9000-0000000a0146c", type=ActorType.USER)
+    suggest_admin = ProspectSuggestionActor(
+        subject="00000000-0000-4000-9000-0000000a0146a", roles=("owner",)
+    )
+    admin = RunFinalizationActor(subject="00000000-0000-4000-9000-0000000a0146a", roles=("owner",))
+    viewer = RunFinalizationActor(
+        subject="00000000-0000-4000-9000-0000000a0146b", roles=("viewer",)
+    )
+
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session, biz):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(IcpConfirmation(business_id=biz, version=1, actor_id="seed", actor_type="user"))
+        session.add(
+            BudgetLimit(
+                business_id=biz,
+                version=1,
+                currency="INR",
+                daily_cap_minor=10_000_000,
+                monthly_cap_minor=100_000_000,
+                per_run_cap_minor=1_000_000,
+                timezone="Asia/Kolkata",
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        if not session.query(Source).filter_by(key=allowed_key).count():
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=["org_name", "org_identifier"],
+                    access_method=SourceAccessMethod.BULK_DOWNLOAD.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _planned(session, biz):
+        run = create_discovery_run(session, settings, biz).run
+        assert run is not None
+        if not session.query(DiscoveryPlan).filter_by(business_id=biz).count():
+            session.add(
+                DiscoveryPlan(
+                    business_id=biz,
+                    version=1,
+                    icp_version=1,
+                    status="draft",
+                    tasks=[
+                        {
+                            "sourceKey": allowed_key,
+                            "fields": ["org_name"],
+                            "filters": {"geography": ["KA"]},
+                            "maxQueries": 2,
+                        }
+                    ],
+                    excluded=[],
+                    task_cap=5,
+                    query_cap=3,
+                    rationale="reviewed discovery plan",
+                    overall_confidence=0.8,
+                    source="discovery_plan",
+                    source_version="pv-1",
+                    provenance={},
+                )
+            )
+            session.flush()
+        approve_run_plan(session, biz, run.id, 1, approver)
+        session.flush()
+        return run
+
+    def _adapter_input():
+        return OrgDatasetTaskInput(
+            manifest=DatasetManifest(
+                dataset_id="mca-2026-q3",
+                source_key=allowed_key,
+                source_version="2026-09-30",
+                license="data.gov.in-GODL-1.0",
+                purpose=PLAN_PURPOSE,
+            ),
+            rows=(
+                DatasetRow(
+                    row_ref="le-1",
+                    entity_type="legal_entity",
+                    display_name=fixture_name,
+                    external_ids=(ExternalIdInput("cin", "U17120MH2026PTC900099"),),
+                ),
+            ),
+        )
+
+    print("\nfinalize a discovery run summary (local synthetic — nothing fetched/sent/spent):")
+
+    with ctx.session_factory() as session:
+        _seed(session, biz_a)
+        _seed(session, biz_b)
+        session.flush()
+
+        # Run #1 — full pipeline then FINALIZE → COMPLETED.
+        run1 = _planned(session, biz_a)
+        session.commit()
+        run1_id = run1.id
+        DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run1_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        DiscoveryObservationConverter(session, biz_a).convert_task(run1_id, 0, conv_admin)
+        session.commit()
+        subject = session.query(OrgObservation).filter_by(business_id=biz_a).one()
+        FieldObservationStore(session, biz_a).record(
+            FieldObservationInput(
+                subject_type="organization",
+                subject_id=subject.id,
+                field_key="industry",
+                field_value="information technology",
+                inference_label=FieldInferenceLabel.OBSERVED.value,
+                provenance_ref=f"discovery_run:{run1_id}/task:0#evidence=seed",
+                observed_at=datetime.now(UTC),
+                scope="nationwide",
+                rights_basis="synthetic_fixture",
+                source_key=allowed_key,
+                source_version=1,
+            ),
+            field_actor,
+        )
+        session.commit()
+        ObservationBatchResolver(session, biz_a).resolve_run(run1_id, resolve_admin)
+        session.commit()
+        ProspectSuggestionCreator(session, biz_a).suggest(run1_id, subject.id, suggest_admin)
+        session.commit()
+
+        res1 = DiscoveryRunFinalizer(session, biz_a).finalize_run(run1_id, admin)
+        session.commit()
+        summary1 = session.query(DiscoveryRunSummary).filter_by(run_id=run1_id).one()
+        run1_row = session.get(type(run1), run1_id)
+        print("\n  Business A — run #1 finalized (full pipeline, successful work):")
+        print(f"      finalStatus        = {res1.final_status}  (run.status now {run1_row.status})")
+        print(
+            f"      taskOutcomes       = {res1.task_count} task(s): done={res1.done_count} "
+            f"failed={res1.failed_count} denied={res1.denied_count}"
+        )
+        print(f"      partialFailure     = {res1.partial_failure}  empty={res1.empty}")
+        print(
+            f"      heldCostMinor      = {res1.reserved_cost_minor} paise (a HOLD, never a spend; "
+            f"per-run ceiling {summary1.per_run_budget_minor})"
+        )
+        print(
+            f"      resolvedBatch      = subjects={res1.subject_count} matched={res1.matched_count} "
+            f"(NO matches = recorded as 0, not fabricated success)  suggestions={res1.suggestion_count}"
+        )
+        print(f"      reasonCounts       = {res1.reason_counts}")
+        print(f"      cursor             = {summary1.cursor}")
+        print(f"      provenance         = {summary1.provenance}")
+
+        # Idempotent re-finalize.
+        res1b = DiscoveryRunFinalizer(session, biz_a).finalize_run(run1_id, admin)
+        session.commit()
+        summaries_total = session.query(DiscoveryRunSummary).filter_by(business_id=biz_a).count()
+        print(
+            f"\n  Business A — re-finalize idempotent: already_finalized={res1b.already_finalized}  "
+            f"summaries still={summaries_total}"
+        )
+
+        # Run #2 — EMPTY run (nothing executed): finalize → FAILED, honest, NOT fabricated success.
+        run2 = create_discovery_run(session, settings, biz_a).run
+        session.commit()
+        run2_id = run2.id
+        res2 = DiscoveryRunFinalizer(session, biz_a).finalize_run(run2_id, admin)
+        session.commit()
+        run2_row = session.get(type(run2), run2_id)
+        print("\n  Business A — run #2 finalized (empty run — nothing executed):")
+        print(
+            f"      finalStatus        = {res2.final_status}  empty={res2.empty}  "
+            f"tasks={res2.task_count}  (run.status now {run2_row.status})"
+        )
+        print(f"      honest: a run with no work is NOT fabricated as success ({res2.succeeded=})")
+
+        # An unauthorized (viewer) caller is refused before any read.
+        viewer_refused = None
+        try:
+            DiscoveryRunFinalizer(session, biz_a).finalize_run(run1_id, viewer)
+        except RunFinalizationAuthorizationError as exc:
+            viewer_refused = exc.code
+        print(f"\n  Business A — unauthorized viewer refused: {viewer_refused}")
+
+        # Business B — A's run is not-found cross-tenant (a B-scoped finalizer can never reach it).
+        refused_code = None
+        try:
+            DiscoveryRunFinalizer(session, biz_b).finalize_run(run1_id, admin)
+        except RunFinalizationError as exc:
+            refused_code = exc.code
+        b_total = session.query(DiscoveryRunSummary).filter_by(business_id=biz_b).count()
+        print("\n  Business B — A's run is not reachable cross-tenant:")
+        print(f"      finalizeRefusedWith={refused_code}  B_summaries={b_total}")
+
+    checks = {
+        "run1_completed_with_work": res1.final_status == DiscoveryRunStatus.COMPLETED.value
+        and res1.done_count == 1
+        and res1.task_count == 1,
+        "run1_not_partial_not_empty": res1.partial_failure is False and res1.empty is False,
+        "run1_held_cost_recorded": res1.reserved_cost_minor == 1000,
+        "run1_no_matches_not_fabricated": res1.subject_count == 1
+        and res1.matched_count == 0
+        and res1.suggestion_count == 1,
+        "run1_cursor_opaque_checkpoint": summary1.cursor["importedRowRefs"] == ["le-1"]
+        and summary1.cursor["resolved"] is True,
+        "run1_invariants_no_send_no_spend": summary1.provenance["finalized"] is True
+        and summary1.provenance["sent"] is False
+        and summary1.provenance["spent"] is False,
+        "run1_settled_terminal": run1_row.status == DiscoveryRunStatus.COMPLETED.value,
+        "refinalize_idempotent": res1b.already_finalized is True and summaries_total == 1,
+        "empty_run_failed_not_success": res2.final_status == DiscoveryRunStatus.FAILED.value
+        and res2.empty is True
+        and res2.succeeded is False,
+        "unauthorized_refused": viewer_refused == "run_finalization_not_authorized",
+        "cross_tenant_not_found": refused_code == "discovery_run_not_found" and b_total == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-146 FINALIZES a run into a "
+        "durable summary: partial failure is reported honestly and a run with no matches / no work is "
+        "FAILED — never fabricated success. The summary exposes only aggregate counts, stable reason codes "
+        "and opaque row refs, never raw private data. The denials reproduce with no state change.)"
+    )
+    return {
+        "checks": checks,
+        "run1": run1_id,
+        "run1FinalStatus": res1.final_status,
+        "run2FinalStatus": res2.final_status,
     }
 
 
