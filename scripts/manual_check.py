@@ -25329,6 +25329,369 @@ def _dca_146(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-147",
+    "ADVANCE the existing discovery stages — a resumable, checkpoint-driven orchestrator drives ONLY the "
+    "inert post-extraction tail (convert -> resolve -> suggest -> finalize) off the durable rows the "
+    "DCA-143"
+    "..146 stages wrote. A restart resumes at the next-incomplete stage (an already-converted task is not "
+    "re-imported) and advancing makes ZERO provider calls (the extraction's count is unchanged) with no "
+    "model loop. A run still needing an input-driven stage (plan approval / task execution) is reported "
+    "blocked and advanced no further; a cancelled run is stopped cold; an unauthorized caller and a "
+    "cross-tenant run are both refused with no state change. NO fetch/model/spend/send. Local synthetic.",
+)
+def _dca_147(ctx: CheckContext) -> dict:
+    """Drive the real DCA-147 orchestrator against a disposable DB with isolated synthetic Businesses A/B.
+    Business A executes ONE task (the extraction, the only provider call) then STOPS; a restart ADVANCEs
+    the inert tail to a terminal COMPLETED run — PRINT the resumed stage, the stages advanced, the settled
+    status/summary and the UNCHANGED provider-call count. Show a second advance is a no-op; a run blocked
+    awaiting execution advances nothing; a cancelled run is not finalized; and the two refusals (an
+    unauthorized viewer, Business B reading A's run as not-found). Nothing fetched, sent or spent."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import (
+        BudgetLimit,
+        BusinessSourceEntitlement,
+        DiscoveryPlan,
+        DiscoveryRunStatus,
+        DiscoveryRunSummary,
+        DiscoveryTaskConversion,
+        IcpConfirmation,
+        IcpDraft,
+        ProviderCallRecord,
+        Source,
+        SourceAccessMethod,
+        SourceApprovalStatus,
+        SourceKind,
+        SourceStatus,
+        SourceTerms,
+        SourceTermsApproval,
+        SourceTermsStatus,
+        TenantAgent,
+    )
+    from app.services.discovery_planner import PLAN_PURPOSE
+    from app.services.discovery_run import create_discovery_run
+    from app.services.discovery_run_advancement import (
+        STAGE_AWAITING_EXECUTION,
+        STAGE_CANCELLED,
+        STAGE_CONVERT,
+        STAGE_DONE,
+        STAGE_FINALIZE,
+        STAGE_RESOLVE,
+        STAGE_SUGGEST,
+        DiscoveryRunAdvancer,
+        RunAdvanceActor,
+        RunAdvancementAuthorizationError,
+        RunAdvancementError,
+    )
+    from app.services.discovery_task_execution import (
+        DiscoveryTaskExecutor,
+        OrgDatasetTaskInput,
+        TaskExecutionActor,
+    )
+    from app.services.org_observation import ExternalIdInput
+    from app.services.run_plan_approval import RunPlanApprover, approve_run_plan
+    from app.sources.org_dataset_import import DatasetManifest, DatasetRow
+
+    biz_a = "00000000-0000-4000-8000-00000000147a"
+    biz_b = "00000000-0000-4000-8000-00000000147b"
+    allowed_key = "mca_master_data"
+    fixture_name = "Synthetic Textiles Pvt Ltd"
+    exec_admin = TaskExecutionActor(
+        subject="00000000-0000-4000-9000-0000000a0147a", roles=("owner",)
+    )
+    approver = RunPlanApprover(subject="00000000-0000-4000-9000-0000000a0147a", roles=("owner",))
+    admin = RunAdvanceActor(subject="00000000-0000-4000-9000-0000000a0147a", roles=("owner",))
+    viewer = RunAdvanceActor(subject="00000000-0000-4000-9000-0000000a0147b", roles=("viewer",))
+
+    settings = ctx.settings.model_copy(update={"feature_enabled": True})
+
+    def _seed(session, biz):
+        now = datetime.now(UTC)
+        session.add(TenantAgent(business_id=biz, country="IN", enabled=True))
+        session.add(
+            IcpDraft(
+                business_id=biz,
+                version=1,
+                industries=["information technology"],
+                size_bands=["small"],
+                roles=["owner"],
+                geography=["KA", "MH"],
+                status="draft",
+            )
+        )
+        session.add(IcpConfirmation(business_id=biz, version=1, actor_id="seed", actor_type="user"))
+        session.add(
+            BudgetLimit(
+                business_id=biz,
+                version=1,
+                currency="INR",
+                daily_cap_minor=10_000_000,
+                monthly_cap_minor=100_000_000,
+                per_run_cap_minor=1_000_000,
+                timezone="Asia/Kolkata",
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+        if not session.query(Source).filter_by(key=allowed_key).count():
+            session.add(
+                Source(
+                    key=allowed_key,
+                    name=allowed_key,
+                    kind=SourceKind.OFFICIAL.value,
+                    trust_tier="official_registry",
+                    capabilities=["org_discovery"],
+                    fields=["org_name", "org_identifier"],
+                    access_method=SourceAccessMethod.BULK_DOWNLOAD.value,
+                    india_coverage={"nationwide": True, "states": []},
+                    status=SourceStatus.ENABLED.value,
+                    enabled=True,
+                    permissions=[],
+                )
+            )
+            session.add(
+                SourceTerms(
+                    source_key=allowed_key,
+                    version=1,
+                    operation_rights={"collect": True},
+                    field_rights={},
+                    purposes=[PLAN_PURPOSE],
+                    contract_evidence={"reference": "lic-1", "kind": "licence", "uri": ""},
+                    status=SourceTermsStatus.ACTIVE.value,
+                )
+            )
+            session.add(
+                SourceTermsApproval(
+                    source_key=allowed_key,
+                    terms_version=1,
+                    reviewer_id="op-1",
+                    reviewer_type="platform_operator",
+                    review_evidence={"reference": "rev-1", "kind": "review", "uri": ""},
+                    reviewed_at=now - timedelta(days=1),
+                    effective_from=now - timedelta(days=1),
+                    expires_at=now + timedelta(days=365),
+                    approved_operation_rights={"collect": True},
+                    approved_field_rights={},
+                    status=SourceApprovalStatus.ACTIVE.value,
+                )
+            )
+        session.add(
+            BusinessSourceEntitlement(
+                business_id=biz,
+                source_key=allowed_key,
+                version=1,
+                enabled=True,
+                operation_rights={"collect": True},
+                field_rights={},
+                purposes=[PLAN_PURPOSE],
+                approved_terms_version=1,
+                actor_id="seed",
+                actor_type="user",
+            )
+        )
+
+    def _planned(session, biz):
+        run = create_discovery_run(session, settings, biz).run
+        assert run is not None
+        if not session.query(DiscoveryPlan).filter_by(business_id=biz).count():
+            session.add(
+                DiscoveryPlan(
+                    business_id=biz,
+                    version=1,
+                    icp_version=1,
+                    status="draft",
+                    tasks=[
+                        {
+                            "sourceKey": allowed_key,
+                            "fields": ["org_name"],
+                            "filters": {"geography": ["KA"]},
+                            "maxQueries": 2,
+                        }
+                    ],
+                    excluded=[],
+                    task_cap=5,
+                    query_cap=3,
+                    rationale="reviewed discovery plan",
+                    overall_confidence=0.8,
+                    source="discovery_plan",
+                    source_version="pv-1",
+                    provenance={},
+                )
+            )
+            session.flush()
+        approve_run_plan(session, biz, run.id, 1, approver)
+        session.flush()
+        return run
+
+    def _adapter_input():
+        return OrgDatasetTaskInput(
+            manifest=DatasetManifest(
+                dataset_id="mca-2026-q3",
+                source_key=allowed_key,
+                source_version="2026-09-30",
+                license="data.gov.in-GODL-1.0",
+                purpose=PLAN_PURPOSE,
+            ),
+            rows=(
+                DatasetRow(
+                    row_ref="le-1",
+                    entity_type="legal_entity",
+                    display_name=fixture_name,
+                    external_ids=(ExternalIdInput("cin", "U17120MH2026PTC900099"),),
+                ),
+            ),
+        )
+
+    def _calls(session, biz):
+        return session.query(ProviderCallRecord).filter_by(business_id=biz).count()
+
+    print("\nadvance the existing discovery stages (local synthetic — nothing fetched/sent/spent):")
+
+    with ctx.session_factory() as session:
+        _seed(session, biz_a)
+        _seed(session, biz_b)
+        session.flush()
+
+        # Run #1 — plan + EXECUTE one task (the extraction), then STOP.
+        run1 = _planned(session, biz_a)
+        session.commit()
+        run1_id = run1.id
+        DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run1_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        calls_after_extraction = _calls(session, biz_a)
+        resumed_stage = DiscoveryRunAdvancer(session, biz_a).progress(run1_id).next_stage
+        print("\n  Business A — run #1 stopped AFTER extraction (a worker crash point):")
+        print(
+            f"      providerCalls      = {calls_after_extraction}  (the one DCA-142 extraction call)"
+        )
+        print(f"      nextIncompleteStage= {resumed_stage}  (what a restart resumes at)")
+
+        # Restart — ADVANCE the inert tail to a terminal run.
+        adv1 = DiscoveryRunAdvancer(session, biz_a).advance_run(run1_id, admin)
+        session.commit()
+        run1_row = session.get(type(run1), run1_id)
+        summary1 = session.query(DiscoveryRunSummary).filter_by(run_id=run1_id).one()
+        calls_after_advance = _calls(session, biz_a)
+        print("\n  Business A — run #1 restarted + advanced:")
+        print(f"      startedStage       = {adv1.started_stage}")
+        print(f"      stagesAdvanced     = {adv1.stages_advanced}")
+        print(f"      finalStage         = {adv1.final_stage}  (run.status now {run1_row.status})")
+        print(
+            f"      conversions={adv1.conversions_made}  suggestions={adv1.suggestions_created}  "
+            f"resolved={adv1.resolved}  finalized={adv1.finalized}"
+        )
+        print(
+            f"      providerCalls      = {calls_after_advance}  (UNCHANGED — advancing makes NO provider "
+            f"call; providerCallsMade={adv1.provider_calls_made})"
+        )
+        print(
+            f"      summary.finalStatus= {summary1.final_status}  suggestions={summary1.suggestion_count}"
+        )
+
+        # A second advance is a no-op (the run is already settled).
+        adv1b = DiscoveryRunAdvancer(session, biz_a).advance_run(run1_id, admin)
+        session.commit()
+        conv_count = session.query(DiscoveryTaskConversion).filter_by(business_id=biz_a).count()
+        print(
+            f"\n  Business A — re-advance idempotent: startedStage={adv1b.started_stage}  "
+            f"stagesAdvanced={adv1b.stages_advanced}  conversions_total={conv_count}"
+        )
+
+        # Run #2 — planned but NOT executed: the advancer cannot execute a task, so it BLOCKS.
+        run2 = _planned(session, biz_a)
+        session.commit()
+        run2_id = run2.id
+        adv2 = DiscoveryRunAdvancer(session, biz_a).advance_run(run2_id, admin)
+        session.commit()
+        run2_status_at_block = session.get(type(run2), run2_id).status
+        print("\n  Business A — run #2 awaiting execution is BLOCKED (nothing advanced):")
+        print(
+            f"      startedStage={adv2.started_stage}  stoppedReason={adv2.stopped_reason}  "
+            f"run.status={run2_status_at_block}  advanced={adv2.advanced}"
+        )
+
+        # Run #2 continued — now EXECUTE its task then CANCEL it (a withdrawal): the advancer stops cold
+        # and does NOT finalize. (Reuses run #2 so the single-active-run-per-ICP overlap guard holds.)
+        DiscoveryTaskExecutor(session, biz_a).execute_task(
+            run2_id, 0, exec_admin, adapter_input=_adapter_input()
+        )
+        session.commit()
+        run3 = session.get(type(run2), run2_id)
+        run3.status = DiscoveryRunStatus.CANCELLED.value
+        session.commit()
+        adv3 = DiscoveryRunAdvancer(session, biz_a).advance_run(run2_id, admin)
+        session.commit()
+        run3_row = session.get(type(run2), run2_id)
+        cancelled_summary = session.query(DiscoveryRunSummary).filter_by(run_id=run2_id).count()
+        print("\n  Business A — run #3 CANCELLED is stopped cold (not finalized):")
+        print(
+            f"      startedStage={adv3.started_stage}  stoppedReason={adv3.stopped_reason}  "
+            f"run.status={run3_row.status}  summaries={cancelled_summary}"
+        )
+
+        # An unauthorized (viewer) caller is refused before any read.
+        viewer_refused = None
+        try:
+            DiscoveryRunAdvancer(session, biz_a).advance_run(run2_id, viewer)
+        except RunAdvancementAuthorizationError as exc:
+            viewer_refused = exc.code
+        print(f"\n  Business A — unauthorized viewer refused: {viewer_refused}")
+
+        # Business B — A's run is not-found cross-tenant (a B-scoped advancer can never reach it).
+        refused_code = None
+        try:
+            DiscoveryRunAdvancer(session, biz_b).advance_run(run1_id, admin)
+        except RunAdvancementError as exc:
+            refused_code = exc.code
+        b_summaries = session.query(DiscoveryRunSummary).filter_by(business_id=biz_b).count()
+        print("\n  Business B — A's run is not reachable cross-tenant:")
+        print(f"      advanceRefusedWith={refused_code}  B_summaries={b_summaries}")
+
+    checks = {
+        "resumes_at_convert_after_extraction": resumed_stage == STAGE_CONVERT,
+        "advance_drives_full_tail": adv1.started_stage == STAGE_CONVERT
+        and adv1.stages_advanced == [STAGE_CONVERT, STAGE_RESOLVE, STAGE_SUGGEST, STAGE_FINALIZE]
+        and adv1.final_stage == STAGE_DONE,
+        "run1_settled_completed": run1_row.status == DiscoveryRunStatus.COMPLETED.value
+        and summary1.final_status == DiscoveryRunStatus.COMPLETED.value
+        and summary1.suggestion_count == 1,
+        "advance_adds_no_provider_call": calls_after_extraction == 1
+        and calls_after_advance == 1
+        and adv1.provider_calls_made == 0,
+        "re_advance_is_noop": adv1b.started_stage == STAGE_DONE
+        and adv1b.stages_advanced == []
+        and conv_count == 1,
+        "awaiting_execution_blocked": adv2.started_stage == STAGE_AWAITING_EXECUTION
+        and adv2.stopped_reason == STAGE_AWAITING_EXECUTION
+        and run2_status_at_block == DiscoveryRunStatus.PLANNED.value
+        and adv2.advanced is False,
+        "cancelled_run_not_finalized": adv3.started_stage == STAGE_CANCELLED
+        and adv3.stopped_reason == STAGE_CANCELLED
+        and run3_row.status == DiscoveryRunStatus.CANCELLED.value
+        and cancelled_summary == 0,
+        "unauthorized_refused": viewer_refused == "run_advancement_not_authorized",
+        "cross_tenant_not_found": refused_code == "discovery_run_not_found" and b_summaries == 0,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-147 ADVANCES a run by "
+        "composing the accepted DCA-143..146 stages off durable checkpoints: a restart resumes at the "
+        "next-incomplete stage and adds ZERO provider calls with no model loop; a run needing an "
+        "input-driven stage is reported blocked and a cancelled run is stopped cold — neither is finalized. "
+        "The refusals reproduce with no state change. Future capabilities stay disabled.)"
+    )
+    return {
+        "checks": checks,
+        "run1": run1_id,
+        "run1FinalStatus": run1_row.status,
+        "resumedStage": resumed_stage,
+        "providerCallsAfterAdvance": calls_after_advance,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
