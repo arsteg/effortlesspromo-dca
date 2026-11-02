@@ -26801,6 +26801,177 @@ def _dca_153(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-154",
+    "sync an accepted prospect ONLY through EffortlessPromo: in isolated synthetic Businesses A/B, build "
+    "an audience-sync request from a DCA-153 acceptance intent (stable request key + minimized, "
+    "class-tagged fields) and request the sync through a fake platform CRM. A research-only acceptance "
+    "with organization fields is taken as PENDING (queued, no external ids) or, when the host "
+    "acknowledges, ACKNOWLEDGED with external ids — the two outcomes differ. A restricted CONTACT field "
+    "is DISABLED (never promoted), a marketing purpose and a sendable sync are DISABLED, and a replay is "
+    "idempotent in its key. Prove the port has no create/promote path and confers no consent. Local "
+    "synthetic; no AI/paid action, no network, no CRM write, no send.",
+)
+def _dca_154(ctx: CheckContext) -> dict:
+    """Drive the audience-sync contract + synthetic CRM fake directly (no DB, no network, no write): a
+    research-only acceptance syncs for research as PENDING (no external ids) or ACKNOWLEDGED (external
+    ids present) — the outcomes differ; a restricted CONTACT field, a marketing purpose and a sendable
+    subject each DISABLE the sync instead of being silently promoted; a replay is idempotent. The DCA
+    holds no CRM/create/promote path and a sync is never recipient consent."""
+    from datetime import UTC, datetime
+
+    from app.audience import (
+        AudienceField,
+        AudienceFieldClass,
+        AudienceSyncDecision,
+        AudienceSyncPort,
+        AudienceSyncPurpose,
+        AudienceSyncStatus,
+        FakeEffortlessPromoAudienceSyncPort,
+        audience_sync_request_from_intent,
+    )
+    from app.db.models import AcceptanceIntent, AcceptanceIntentStatus, SuggestionVisibility
+
+    biz_a = "11111111-1111-1111-1111-11111111a154"
+    biz_b = "22222222-2222-2222-2222-22222222b154"
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    def _intent(business_id: str, *, visibility: str) -> AcceptanceIntent:
+        return AcceptanceIntent(
+            id=f"intent-{business_id[-4:]}",
+            business_id=business_id,
+            suggestion_id=f"sugg-{business_id[-4:]}",
+            run_id="run-154",
+            subject_type="organization",
+            subject_id=f"subject-{business_id[-4:]}",
+            visibility=visibility,
+            status=AcceptanceIntentStatus.PENDING_SYNC.value,
+            outbox_event_id=f"outbox-{business_id[-4:]}",
+            created_at=now,
+        )
+
+    org_field = AudienceField(
+        key="business_type", field_class=AudienceFieldClass.ORGANIZATION, value_digest="retail"
+    )
+    contact_field = AudienceField(
+        key="email",
+        field_class=AudienceFieldClass.CONTACT,
+        value_digest="sha256-of-synthetic-email",
+    )
+
+    intent_a = _intent(biz_a, visibility=SuggestionVisibility.RESEARCH_ONLY.value)
+    req = audience_sync_request_from_intent(intent_a, fields=(org_field,))
+    print(
+        "\nsync an accepted prospect through EffortlessPromo (local synthetic — nothing written/sent):"
+    )
+    print(
+        f"\n  request: businessId={req.business_id} requestKey={req.request_key!r} "
+        f"visibility={req.visibility} purpose={req.purpose.value} "
+        f"fields={[(f.key, f.field_class.value) for f in req.fields]} confersConsent={req.confers_consent}"
+    )
+
+    # 1) A host that does NOT acknowledge yet -> PENDING hand-off, no external ids.
+    pending = FakeEffortlessPromoAudienceSyncPort(acknowledges=False).sync(req)
+    print(
+        f"\n  [1] PENDING hand-off -> accepted={pending.accepted} status={pending.status.value} "
+        f"externalRef={pending.external_ref}"
+    )
+
+    # 2) A host that acknowledges -> ACKNOWLEDGED write with external ids (deterministic in the key).
+    ack_host = FakeEffortlessPromoAudienceSyncPort(acknowledges=True)
+    acknowledged = ack_host.sync(req)
+    replay = ack_host.sync(req)
+    print(
+        f"\n  [2] ACKNOWLEDGED write -> accepted={acknowledged.accepted} "
+        f"status={acknowledged.status.value} crmRecordId={acknowledged.external_ref.crm_record_id!r} "
+        f"audienceId={acknowledged.external_ref.audience_id!r}"
+    )
+    print(
+        f"      replay same key -> sameExternalRef={replay.external_ref == acknowledged.external_ref}"
+    )
+    print(
+        f"      pending vs acknowledged differ -> status {pending.status.value}!="
+        f"{acknowledged.status.value}, externalIds {pending.external_ref}!="
+        f"{acknowledged.external_ref is not None}"
+    )
+
+    # 3) A restricted CONTACT field under a research-only acceptance -> DISABLED (never promoted).
+    restricted_req = audience_sync_request_from_intent(intent_a, fields=(org_field, contact_field))
+    restricted = ack_host.sync(restricted_req)
+    print(
+        f"\n  [3] restricted CONTACT field -> accepted={restricted.accepted} "
+        f"status={restricted.status.value} reason={restricted.reason} "
+        f"externalRef={restricted.external_ref} (nothing promoted)"
+    )
+
+    # 4) A marketing purpose on a research-only subject -> DISABLED.
+    marketing_req = audience_sync_request_from_intent(
+        intent_a, fields=(org_field,), purpose=AudienceSyncPurpose.MARKETING
+    )
+    marketing = ack_host.sync(marketing_req)
+    print(
+        f"\n  [4] marketing purpose -> accepted={marketing.accepted} status={marketing.status.value} "
+        f"reason={marketing.reason}"
+    )
+
+    # 5) B's sendable acceptance -> DISABLED (requires consent that does not exist).
+    intent_b = _intent(biz_b, visibility=SuggestionVisibility.SENDABLE.value)
+    sendable_req = audience_sync_request_from_intent(intent_b, fields=(org_field,))
+    sendable = ack_host.sync(sendable_req)
+    print(
+        f"\n  [5] B sendable sync -> accepted={sendable.accepted} status={sendable.status.value} "
+        f"reason={sendable.reason}"
+    )
+
+    # 6) The port exposes ONLY sync — no direct create/promote/write path exists.
+    surface = [n for n in dir(FakeEffortlessPromoAudienceSyncPort) if not n.startswith("_")]
+    forbidden = [
+        n
+        for n in ("create", "upsert", "promote", "add_to_audience", "send", "write")
+        if n in surface or n in dir(AudienceSyncPort)
+    ]
+    print(f"\n  [6] port surface (public) = {surface}; forbidden create/promote path = {forbidden}")
+
+    checks = {
+        "pending_handoff_has_no_external_ids": pending.accepted is True
+        and pending.status is AudienceSyncStatus.PENDING
+        and pending.external_ref is None,
+        "acknowledged_write_carries_external_ids": acknowledged.accepted is True
+        and acknowledged.status is AudienceSyncStatus.ACKNOWLEDGED
+        and acknowledged.external_ref is not None,
+        "pending_and_acknowledged_differ": pending.status is not acknowledged.status
+        and (pending.external_ref is None)
+        and (acknowledged.external_ref is not None),
+        "sync_is_idempotent_in_key": replay.external_ref == acknowledged.external_ref,
+        "restricted_contact_field_not_promoted": restricted.accepted is False
+        and restricted.status is AudienceSyncStatus.DISABLED
+        and restricted.reason == AudienceSyncDecision.RESTRICTED_FIELD_NOT_PERMITTED
+        and restricted.external_ref is None,
+        "marketing_purpose_disabled": marketing.accepted is False
+        and marketing.reason == AudienceSyncDecision.PURPOSE_NOT_PERMITTED,
+        "sendable_sync_disabled": sendable.accepted is False
+        and sendable.reason == AudienceSyncDecision.SENDABLE_SYNC_DISABLED,
+        "no_create_or_promote_path": forbidden == [],
+        "sync_confers_no_consent": acknowledged.confers_consent is False,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no CRM write, no send. The DCA can only "
+        "REQUEST a sync of an accepted prospect through EffortlessPromo — it owns no CRM/audience and "
+        "holds no create/promote path. A PENDING hand-off differs from an ACKNOWLEDGED write (external "
+        "ids present only on the latter). The contract can NEVER silently promote a restricted contact "
+        "field: a CONTACT field under a research-only acceptance, a marketing purpose, and a sendable "
+        "sync are each DISABLED. A sync is NOT recipient consent and NOT a send; the platform's CRM owns "
+        "the write, which stays a disabled future capability.)"
+    )
+    return {
+        "pending": pending.model_dump(),
+        "acknowledged": acknowledged.model_dump(),
+        "restricted": restricted.model_dump(),
+        "checks": checks,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
