@@ -3015,6 +3015,80 @@ def test_0069_adds_acceptance_sync_columns_on_a_preexisting_database(clean_schem
 
 
 @requires_pg
+def test_0070_adds_sync_reconcile_columns_on_a_preexisting_database(clean_schema):
+    """DCA-156 — the 0070 add-column branch (for a DB migrated before the reconcile columns existed).
+
+    A fresh DB gets ``acceptance_intents`` WITH ``sync_reconcile_state`` / ``reconcile_attempt_count`` /
+    ``last_reconciled_at`` from the metadata baseline (0001), so 0070 is a no-op there. To exercise 0070's
+    real job, upgrade to head, DROP the three columns, seed one pre-existing intent row, stamp history
+    back to 0069, then upgrade to head again — 0070 must re-add exactly those columns and backfill the
+    existing row to "never reconciled" (empty string, 0, NULL timestamp), with no new table and no RLS
+    change (``acceptance_intents`` is tenant-owned already).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "acceptance_intents" DROP COLUMN "last_reconciled_at", '
+                'DROP COLUMN "reconcile_attempt_count", DROP COLUMN "sync_reconcile_state"'
+            )
+        )
+        # Seed one pre-existing (pre-reconcile) pending_sync intent row to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO acceptance_intents "
+                "(id, business_id, suggestion_id, run_id, subject_type, subject_id, visibility, "
+                "status, suggestion_schema_version, match_score, schema_version, outbox_event_id, "
+                "sync_status, external_crm_record_id, external_audience_id, external_version, "
+                "accepted_by, accepted_by_type, provenance, created_at) VALUES "
+                "('intent-legacy-70', 'biz-legacy', 'sug-legacy-70', 'run-legacy', 'organization', "
+                "'subj-legacy', 'research_only', 'pending_sync', 1, 0.5, 1, 'outbox-legacy-70', "
+                "'pending', '', '', '', 'actor-legacy', 'user', '{}', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0069_acceptance_intent_sync")  # pretend we predate the reconcile columns
+    command.upgrade(cfg, "head")  # 0070 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("acceptance_intents", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT sync_reconcile_state, reconcile_attempt_count, last_reconciled_at "
+                "FROM acceptance_intents WHERE id = 'intent-legacy-70'"
+            )
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'acceptance_intents' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert {
+        "sync_reconcile_state",
+        "reconcile_attempt_count",
+        "last_reconciled_at",
+    }.issubset(cols)  # columns re-added
+    # The pre-existing row backfilled to "never reconciled": empty string, 0, NULL timestamp.
+    assert backfilled == ("", 0, None)
+    assert (
+        policy is not None
+    )  # tenant-owned: RLS still in place (unchanged by an add-column branch)
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 

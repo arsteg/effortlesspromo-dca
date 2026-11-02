@@ -1757,6 +1757,26 @@ class AcceptanceIntent(TenantOwned, Base):
     last_sync_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
+    # --- DCA-156 uncertain-sync reconciliation (resolving an in-doubt DCA-155 hand-off) --------------
+    # The reconciliation state of an UNCERTAIN sync (a DCA-155 attempt whose ack was lost / timed-out /
+    # returned PENDING, leaving ``sync_status='pending'`` in-doubt): '' = never reconciled / not in doubt,
+    # 'resolved' = a re-driven sync under the SAME request key came back ACKNOWLEDGED, so the intent was
+    # resolved to 'synced' with the platform's external ids (idempotent — the stable key can only ever
+    # map to the SAME external record, never a duplicate), 'needs_review' = the host's receipt/status
+    # lookup did NOT confirm the write (still pending / unavailable), so the ambiguity is marked for
+    # operator review rather than being assumed successful. 'needs_review' is NOT terminal — a later
+    # reconcile may still resolve it once the host acknowledges. Reconciling never sends / spends / consents.
+    sync_reconcile_state: Mapped[str] = mapped_column(
+        String(16), default="", server_default="", index=True
+    )
+    # How many times an uncertain sync has been reconciled (re-driven) for this intent — bounded,
+    # inspectable evidence that retries are duplicate-safe (the stable request key means a re-drive can
+    # never create a second CRM record). 0 until the first reconcile attempt.
+    reconcile_attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # WHEN the uncertain sync was last reconciled (NULL until first reconciled); neither implies a send.
+    last_reconciled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
     # WHO recorded the acceptance — an opaque business actor id + its kind (never a name/email).
     accepted_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
     accepted_by_type: Mapped[str] = mapped_column(String(16), default="user", server_default="user")

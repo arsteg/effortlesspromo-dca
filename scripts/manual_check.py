@@ -27248,6 +27248,314 @@ def _dca_155(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-156",
+    "RECONCILE an UNCERTAIN audience synchronization: in isolated synthetic Businesses A/B, an "
+    "authorized A user reconciles a DCA-155 sync that was left in-doubt (pending_sync / sync_status="
+    "'pending' by a lost acknowledgment) by RE-DRIVING the DCA-154 audience-sync port under the SAME "
+    "stable request key (the synthetic fake; production refuses it). An acknowledging re-drive resolves "
+    "the intent pending_sync->synced and persists the platform's external mapping (the SAME deterministic "
+    "record a first successful sync would have minted — never a duplicate) with ONE atomic reconcile "
+    "audit; an UNCONFIRMED re-drive (still pending / unavailable lookup) marks needs_review for operator "
+    "review and NEVER implies success; an already-synced intent is an idempotent no-op; a restricted "
+    "CONTACT field is refused immediately before the re-drive (never promoted); a never-synced intent "
+    "carries no ambiguity; production refuses the contract; a cross-tenant id is not-found. Reconciling "
+    "confers NO consent and performs NO send. Local synthetic; no AI/paid action, no network, no send.",
+)
+def _dca_156(ctx: CheckContext) -> dict:
+    """Drive the real DCA-156 reconciler against a disposable DB with isolated synthetic Businesses A/B.
+
+    PRINT the actual state: an acknowledging re-drive resolves an in-doubt intent to synced (SAME
+    deterministic external record, never a duplicate) with one atomic reconcile audit; an unconfirmed
+    re-drive marks needs_review (an unavailable status lookup NEVER implies success); an already-synced
+    intent is an idempotent no-op (no re-drive, no second audit); a restricted CONTACT field is refused
+    with no state change (never promoted); a never-synced intent is not an uncertain outcome; production
+    refuses the contract; and a cross-tenant id reads as not-found. Nothing is sent, spent or consented."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audience import (
+        AudienceField,
+        AudienceFieldClass,
+        AudienceSyncContractDisabled,
+        AudienceSyncDecision,
+        AudienceSyncStatus,
+        FakeEffortlessPromoAudienceSyncPort,
+    )
+    from app.db.models import (
+        AcceptanceIntent,
+        AcceptanceIntentStatus,
+        AuditEvent,
+        ProspectSuggestion,
+        SuggestionVisibility,
+    )
+    from app.services.acceptance_intent import AcceptanceIntentActor, AcceptanceIntentRecorder
+    from app.services.acceptance_sync import AcceptanceRecordSynchronizer, AcceptanceSyncActor
+    from app.services.acceptance_sync_reconcile import (
+        AUDIT_ACTION_RECONCILE,
+        RECONCILE_NEEDS_REVIEW,
+        RECONCILE_RESOLVED,
+        AcceptanceSyncReconcileError,
+        UncertainAudienceSyncReconciler,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000156a"
+    biz_b = "00000000-0000-4000-8000-00000000156b"
+    accept_actor = AcceptanceIntentActor(
+        subject="00000000-0000-4000-9000-0000000a0156a", roles=("owner",)
+    )
+    admin = AcceptanceSyncActor(subject="00000000-0000-4000-9000-0000000a0156a", roles=("owner",))
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    org_field = AudienceField(
+        key="business_type", field_class=AudienceFieldClass.ORGANIZATION, value_digest="retail"
+    )
+    contact_field = AudienceField(
+        key="email", field_class=AudienceFieldClass.CONTACT, value_digest="sha256-of-synthetic"
+    )
+
+    def _seed_pending(session, business_id, subject_id):
+        sug = ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-156",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+            match_score=0.7,
+            rationale="ICP fit 0.70",
+            scored_icp_version=7,
+            schema_version=1,
+            status="suggested",
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+        session.add(sug)
+        session.commit()
+        res = AcceptanceIntentRecorder(session, business_id).accept(sug.id, accept_actor, now=now)
+        session.commit()
+        return res.intent.id
+
+    def _seed_uncertain(session, business_id, subject_id):
+        intent_id = _seed_pending(session, business_id, subject_id)
+        AcceptanceRecordSynchronizer(
+            session,
+            business_id,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=False),
+        ).sync(intent_id, admin, fields=(org_field,), now=now)
+        session.commit()
+        return intent_id
+
+    def _reconcile_audits(session):
+        return session.query(AuditEvent).filter_by(action=AUDIT_ACTION_RECONCILE).count()
+
+    print("\nreconcile an uncertain audience synchronization (local synthetic — nothing sent):")
+
+    prod_settings = ctx.settings.model_copy(update={"environment": "production"})
+
+    with ctx.session_factory() as session:
+        intent_ack = _seed_uncertain(session, biz_a, "subject-ack")
+        intent_review = _seed_uncertain(session, biz_a, "subject-review")
+        intent_restricted = _seed_uncertain(session, biz_a, "subject-restricted")
+        intent_fresh = _seed_pending(
+            session, biz_a, "subject-fresh"
+        )  # never synced -> not uncertain
+        intent_prod = _seed_uncertain(session, biz_a, "subject-prod")
+        intent_b = _seed_uncertain(session, biz_b, "subject-b")
+
+        request_key = session.get(AcceptanceIntent, intent_ack).outbox_event_id
+
+        # 1) Acknowledging re-drive -> resolved to synced, same deterministic external record.
+        resolved = UncertainAudienceSyncReconciler(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).reconcile(intent_ack, admin, fields=(org_field,), now=now)
+        session.commit()
+        row = session.get(AcceptanceIntent, intent_ack)
+        audits_after_ack = _reconcile_audits(session)
+        print("\n  [1] acknowledging re-drive -> RESOLVED to synced (same deterministic record):")
+        print(
+            f"      status={row.status} syncStatus={row.sync_status} "
+            f"reconcileState={row.sync_reconcile_state} crmRecordId={row.external_crm_record_id!r} "
+            f"attempts={row.reconcile_attempt_count} reconcileAudits={audits_after_ack}"
+        )
+        same_record = row.external_crm_record_id == f"synthetic-crm-{request_key}"
+        print(f"      no-duplicate (deterministic in the request key): {same_record}")
+
+        # 2) Idempotent replay — already synced, no re-drive, no second audit, same refs.
+        replay = UncertainAudienceSyncReconciler(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).reconcile(intent_ack, admin, fields=(org_field,), now=now + timedelta(hours=1))
+        session.commit()
+        audits_after_replay = _reconcile_audits(session)
+        print("\n  [2] replay is an idempotent no-op:")
+        print(
+            f"      alreadyResolved={replay.already_resolved} attempted={replay.attempted} "
+            f"sameExternalRef={replay.external_ref == resolved.external_ref} "
+            f"reconcileAudits unchanged {audits_after_ack}->{audits_after_replay}"
+        )
+
+        # 3) Unconfirmed re-drive -> operator review (an unavailable lookup NEVER implies success).
+        review = UncertainAudienceSyncReconciler(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=False),
+        ).reconcile(intent_review, admin, fields=(org_field,), now=now)
+        session.commit()
+        row_review = session.get(AcceptanceIntent, intent_review)
+        print("\n  [3] unconfirmed re-drive -> NEEDS_REVIEW (no accepted status, no external ids):")
+        print(
+            f"      needsReview={review.needs_review} status={row_review.status} "
+            f"syncStatus={row_review.sync_status} reconcileState={row_review.sync_reconcile_state} "
+            f"externalCrmRecordId={row_review.external_crm_record_id!r}"
+        )
+
+        # 4) Restricted CONTACT field under a research-only acceptance -> refused, never promoted.
+        before_restricted = _reconcile_audits(session)
+        restricted = UncertainAudienceSyncReconciler(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).reconcile(intent_restricted, admin, fields=(org_field, contact_field), now=now)
+        session.commit()
+        row_restricted = session.get(AcceptanceIntent, intent_restricted)
+        audits_after_restricted = _reconcile_audits(session)
+        print("\n  [4] restricted CONTACT field -> refused, nothing promoted:")
+        print(
+            f"      refused={restricted.refused} reason={restricted.reason} "
+            f"status={row_restricted.status} reconcileState={row_restricted.sync_reconcile_state!r} "
+            f"externalCrmRecordId={row_restricted.external_crm_record_id!r}"
+        )
+
+        # 5) A never-synced intent carries no ambiguity to reconcile.
+        try:
+            UncertainAudienceSyncReconciler(
+                session,
+                biz_a,
+                ctx.settings,
+                port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+            ).reconcile(intent_fresh, admin, fields=(org_field,), now=now)
+            not_uncertain = False
+        except AcceptanceSyncReconcileError as exc:
+            not_uncertain = exc.code == "acceptance_sync_not_uncertain"
+        session.rollback()
+        print(f"\n  [5] never-synced intent is not an uncertain outcome: {not_uncertain}")
+
+        # 6) Production refuses the contract outright (the live adapter is unbuilt; the fake is dev-only).
+        try:
+            UncertainAudienceSyncReconciler(session, biz_a, prod_settings).reconcile(
+                intent_prod, admin, fields=(org_field,), now=now
+            )
+            prod_refused = False
+        except AudienceSyncContractDisabled:
+            prod_refused = True
+        session.rollback()
+        row_prod = session.get(AcceptanceIntent, intent_prod)
+        print("\n  [6] production refuses the contract:")
+        print(
+            f"      refused={prod_refused} status={row_prod.status} "
+            f"reconcileState={row_prod.sync_reconcile_state!r}"
+        )
+
+        # 7) A cross-tenant id reads as not-found (A cannot reconcile B's intent by id).
+        try:
+            UncertainAudienceSyncReconciler(
+                session,
+                biz_a,
+                ctx.settings,
+                port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+            ).reconcile(intent_b, admin, fields=(org_field,), now=now)
+            cross_not_found = False
+        except AcceptanceSyncReconcileError as exc:
+            cross_not_found = exc.code == "acceptance_intent_not_found"
+        session.rollback()
+        print(f"\n  [7] cross-tenant id not-found: {cross_not_found}")
+
+        # Snapshot values while attached (the rollbacks above expire instances).
+        a = session.get(AcceptanceIntent, intent_ack)
+        a_status, a_sync_status = a.status, a.sync_status
+        a_reconcile_state = a.sync_reconcile_state
+        a_crm, a_aud = a.external_crm_record_id, a.external_audience_id
+        a_synced_at = a.synced_at is not None
+        a_prov_synced = a.provenance["synced"]
+        a_prov_sent = a.provenance["sent"]
+        a_prov_consent = a.provenance["consentConferred"]
+        a_prov_membership = a.provenance["membershipCreated"]
+        review_status = session.get(AcceptanceIntent, intent_review).status
+        review_sync_status = session.get(AcceptanceIntent, intent_review).sync_status
+        review_state = session.get(AcceptanceIntent, intent_review).sync_reconcile_state
+        review_crm = session.get(AcceptanceIntent, intent_review).external_crm_record_id
+        r_status = session.get(AcceptanceIntent, intent_restricted).status
+        r_state = session.get(AcceptanceIntent, intent_restricted).sync_reconcile_state
+        r_crm = session.get(AcceptanceIntent, intent_restricted).external_crm_record_id
+        prod_status = session.get(AcceptanceIntent, intent_prod).status
+        b_status = session.get(AcceptanceIntent, intent_b).status
+        b_state = session.get(AcceptanceIntent, intent_b).sync_reconcile_state
+
+    checks = {
+        "acknowledged_redrive_resolves_to_synced_with_external_mapping": a_status
+        == AcceptanceIntentStatus.SYNCED.value
+        and a_sync_status == AudienceSyncStatus.ACKNOWLEDGED.value
+        and a_reconcile_state == RECONCILE_RESOLVED
+        and bool(a_crm)
+        and bool(a_aud)
+        and a_synced_at
+        and a_prov_synced is True,
+        "redrive_is_duplicate_safe_same_deterministic_record": same_record,
+        "no_send_or_consent_side_effect": a_prov_sent is False
+        and a_prov_consent is False
+        and a_prov_membership is False
+        and resolved.confers_consent is False,
+        "reconcile_wrote_exactly_one_audit": audits_after_ack == 1,
+        "replay_idempotent_no_second_redrive": replay.already_resolved is True
+        and replay.attempted is False
+        and replay.external_ref == resolved.external_ref
+        and audits_after_replay == audits_after_ack,
+        "unconfirmed_redrive_marks_operator_review_not_success": review.needs_review is True
+        and review_status == AcceptanceIntentStatus.PENDING_SYNC.value
+        and review_sync_status == AudienceSyncStatus.PENDING.value
+        and review_state == RECONCILE_NEEDS_REVIEW
+        and review_crm == "",
+        "restricted_contact_field_not_promoted": restricted.refused is True
+        and restricted.reason == AudienceSyncDecision.RESTRICTED_FIELD_NOT_PERMITTED
+        and r_status == AcceptanceIntentStatus.PENDING_SYNC.value
+        and r_state == ""
+        and r_crm == ""
+        and audits_after_restricted == before_restricted,
+        "never_synced_intent_is_not_uncertain": not_uncertain,
+        "production_refuses_the_contract": prod_refused
+        and prod_status == AcceptanceIntentStatus.PENDING_SYNC.value,
+        "cross_tenant_not_found_and_untouched": cross_not_found
+        and b_status == AcceptanceIntentStatus.PENDING_SYNC.value
+        and b_state == "",
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no CRM write, no send. DCA-156 "
+        "reconciles ONE in-doubt audience sync by RE-DRIVING the EffortlessPromo audience-sync port "
+        "under the SAME stable request key — the synthetic fake today; production refuses the contract "
+        "(the live adapter is unbuilt, B1). An acknowledging re-drive resolves the intent "
+        "pending_sync->synced and persists the SAME deterministic external record (never a duplicate); an "
+        "unconfirmed re-drive marks needs_review for operator review and NEVER implies success. The "
+        "request is re-gated immediately before the re-drive, so a restricted CONTACT field is refused "
+        "and NEVER promoted. An already-synced intent is an idempotent no-op. Reconciling confers NO "
+        "recipient consent and performs NO send.)"
+    )
+    return {
+        "checks": checks,
+        "aStatus": a_status,
+        "aReconcileState": a_reconcile_state,
+        "reviewState": review_state,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
