@@ -26239,6 +26239,166 @@ def _dca_150(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-151",
+    "DISMISS a prospect suggestion PRIVATELY — an authorized business user records a per-business "
+    "dismissal + relevance-feedback reason, which flips the suggestion's status to 'dismissed' so it "
+    "drops out of the DCA-150 VISIBLE list for THAT business only. The dismissal is business-private: "
+    "it changes no global fact or policy and leaves another tenant's independent suggestion for the "
+    "same subject untouched (A cannot remove B's suggestion). Idempotent; a read-only viewer is refused "
+    "with no state change; a cross-tenant id is not-found. NOTHING fetched/sent/spent. Local synthetic.",
+)
+def _dca_151(ctx: CheckContext) -> dict:
+    """Drive the real DCA-151 dismisser against a disposable DB with isolated synthetic Businesses A/B.
+    A and B each hold an INDEPENDENT suggestion for the SAME subject. PRINT the actual state: an
+    authorized A admin dismisses A's suggestion (it leaves A's visible list, stamped with its feedback
+    reason/actor); a re-dismiss is an idempotent no-op (no second audit); a read-only viewer is refused
+    with no state change; a cross-tenant id reads as not-found; and B's identical suggestion stays
+    visible and 'suggested'. Nothing is fetched, sent or spent — it flips one tenant-owned row + its
+    atomic audit."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import AuditEvent, ProspectSuggestion, SuggestionVisibility
+    from app.services.prospect_suggestion import (
+        AUDIT_ACTION_DISMISS,
+        DISMISSED_STATUS,
+        ProspectSuggestionDismissAuthorizationError,
+        ProspectSuggestionDismissError,
+        ProspectSuggestionDismisser,
+        ProspectSuggestionReader,
+        SuggestionDismisser,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000151a"
+    biz_b = "00000000-0000-4000-8000-00000000151b"
+    admin = SuggestionDismisser(subject="00000000-0000-4000-9000-0000000a0151a", roles=("owner",))
+    viewer = SuggestionDismisser(subject="00000000-0000-4000-9000-0000000a0151b", roles=("viewer",))
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    def _row(business_id, subject_id):
+        return ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-151",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+            match_score=0.7,
+            rationale="ICP fit 0.70",
+            scored_icp_version=1,
+            schema_version=1,
+            status="suggested",
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+
+    print("\ndismiss a suggestion PRIVATELY (local synthetic — nothing fetched/sent/spent):")
+
+    with ctx.session_factory() as session:
+        a = _row(biz_a, "shared-subject")
+        b = _row(biz_b, "shared-subject")
+        session.add_all([a, b])
+        session.commit()
+        a_id, b_id = a.id, b.id
+
+        reader_a = ProspectSuggestionReader(session, biz_a)
+        reader_b = ProspectSuggestionReader(session, biz_b)
+        dismisser_a = ProspectSuggestionDismisser(session, biz_a)
+
+        before_a = [i.subject_id for i in reader_a.list_visible(now=now).items]
+        print(f"\n  [1] before — A's visible candidates: {before_a}")
+
+        # 1) An authorized admin dismisses A's suggestion privately.
+        result = dismisser_a.dismiss(a_id, admin, reason="already a customer", now=now)
+        session.commit()
+        after_a = [i.subject_id for i in reader_a.list_visible(now=now).items]
+        row_a = session.get(ProspectSuggestion, a_id)
+        first_already = result.already_dismissed
+        a_status, a_dismissed_at, a_reason = (
+            row_a.status,
+            row_a.dismissed_at,
+            row_a.dismissal_reason,
+        )
+        print("\n  [2] A admin dismisses it — leaves A's visible list:")
+        print(
+            f"      status={a_status}  dismissedAt={a_dismissed_at.isoformat()}  "
+            f"reason={a_reason!r}  A.visible_after={after_a}"
+        )
+
+        # 2) Idempotent replay — a re-dismiss changes nothing and stages no second audit.
+        audits_before = session.query(AuditEvent).filter_by(action=AUDIT_ACTION_DISMISS).count()
+        replay = dismisser_a.dismiss(a_id, admin, reason="different", now=now + timedelta(days=1))
+        session.commit()
+        audits_after = session.query(AuditEvent).filter_by(action=AUDIT_ACTION_DISMISS).count()
+        replay_already = replay.already_dismissed
+        a_reason_after = session.get(ProspectSuggestion, a_id).dismissal_reason
+        print("\n  [3] re-dismiss is an idempotent no-op:")
+        print(
+            f"      alreadyDismissed={replay_already}  "
+            f"reasonUnchanged={a_reason_after!r}  "
+            f"auditCount {audits_before}->{audits_after}"
+        )
+
+        # 3) Denial — a read-only viewer is refused with NO state change.
+        fresh = _row(biz_a, "another-subject")
+        session.add(fresh)
+        session.commit()
+        fresh_id = fresh.id
+        try:
+            dismisser_a.dismiss(fresh_id, viewer, now=now)
+            viewer_refused = False
+        except ProspectSuggestionDismissAuthorizationError:
+            viewer_refused = True
+        session.rollback()
+        fresh_status = session.get(ProspectSuggestion, fresh_id).status
+        print("\n  [4] read-only viewer refused (a denial changes nothing):")
+        print(f"      refused={viewer_refused}  status_still={fresh_status}")
+
+        # 4) A cross-tenant id reads as not-found (A cannot touch B's row by id).
+        try:
+            dismisser_a.dismiss(b_id, admin, now=now)
+            cross_not_found = False
+        except ProspectSuggestionDismissError as exc:
+            cross_not_found = exc.code == "prospect_suggestion_not_found"
+        session.rollback()
+
+        # 5) B's identical suggestion is wholly unaffected — private to A.
+        b_visible = [i.subject_id for i in reader_b.list_visible(now=now).items]
+        row_b = session.get(ProspectSuggestion, b_id)
+        b_status, b_dismissed_at = row_b.status, row_b.dismissed_at
+        print("\n  [5] B's identical suggestion is untouched (dismissal is private):")
+        print(f"      B.visible={b_visible}  B.status={b_status}  B.dismissedAt={b_dismissed_at}")
+
+    checks = {
+        "dismissed_and_left_visible_list": first_already is False
+        and a_status == DISMISSED_STATUS
+        and a_reason == "already a customer"
+        and after_a == [],
+        "idempotent_no_second_audit": replay_already is True
+        and a_reason_after == "already a customer"
+        and audits_after == audits_before,
+        "viewer_refused_no_state_change": viewer_refused and fresh_status == "suggested",
+        "cross_tenant_not_found": cross_not_found,
+        "other_business_unaffected": b_visible == ["shared-subject"]
+        and b_status == "suggested"
+        and b_dismissed_at is None,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send. DCA-151 records a "
+        "business-PRIVATE dismissal + relevance-feedback reason on one tenant-owned suggestion row, "
+        "flipping it out of the DCA-150 VISIBLE list for THAT business only. It changes no global fact "
+        "or policy and never touches another tenant's independent suggestion for the same subject, so a "
+        "dismissal and its denials reproduce with no unintended state change. Future capabilities stay "
+        "disabled.)"
+    )
+    return {
+        "checks": checks,
+        "aVisibleAfter": after_a,
+        "bVisible": b_visible,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",

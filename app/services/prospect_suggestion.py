@@ -701,6 +701,204 @@ class ProspectSuggestionReader:
         )
 
 
+# --------------------------------------------------------------------------------------------------
+# DCA-151 — dismiss a suggestion PRIVATELY (a per-business relevance-feedback mutation)
+# --------------------------------------------------------------------------------------------------
+
+# The terminal status a dismissed suggestion holds. A dismissed row is no longer in the reviewable
+# VISIBLE_STATUS ('suggested'), so the DCA-150 reader stops surfacing it WITHOUT any reader change.
+DISMISSED_STATUS = "dismissed"
+
+# The audited action code for dismissing a suggestion (a controlled code, like the other mutations).
+AUDIT_ACTION_DISMISS = "prospect.suggestion.dismissed"
+
+# A dismissal reason is bounded so an opaque relevance note can never grow unbounded. The reason is
+# treated as opaque feedback text and is screened (like every audit payload) for secret/contact data.
+MAX_DISMISSAL_REASON_CHARS = 500
+
+# Stable refusal codes raised (never recorded) for a dismiss that cannot proceed — each BEFORE any
+# state is mutated, so a refusal changes nothing.
+REASON_DISMISS_NOT_AUTHORIZED = "prospect_suggestion_dismiss_not_authorized"
+REASON_SUGGESTION_NOT_FOUND = "prospect_suggestion_not_found"
+
+
+class ProspectSuggestionDismissError(ProspectSuggestionError):
+    """A dismiss was refused with a stable ``code``. Raised before the session is mutated, so a refusal
+    stages nothing. The one non-authorization code is :data:`REASON_SUGGESTION_NOT_FOUND` — an unknown
+    or cross-tenant suggestion id reads exactly like not-found."""
+
+
+class ProspectSuggestionDismissAuthorizationError(ProspectSuggestionError):
+    """The caller is not authorized to dismiss a prospect suggestion.
+
+    A distinct type so an HTTP boundary can map it to a 403 while :data:`REASON_SUGGESTION_NOT_FOUND`
+    maps to a 404. Raised FIRST — before any state is read or written. ``code`` is
+    :data:`REASON_DISMISS_NOT_AUTHORIZED`.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(REASON_DISMISS_NOT_AUTHORIZED, message)
+
+
+@dataclass(frozen=True)
+class SuggestionDismisser:
+    """The business principal dismissing a prospect suggestion.
+
+    ``subject`` is an opaque actor id (never a name/email) recorded on the dismissal + its atomic audit
+    entry. ``roles`` are the caller's verified business-plane membership roles (from the tenant context,
+    NEVER a bare token claim). :meth:`may_dismiss` grants the action only when those roles yield
+    :attr:`~app.identity.permissions.Scope.CANDIDATE_DISMISS` — an acting user and an administrator hold
+    it; a read-only viewer (who may only VIEW candidates) and a platform operator (holding no business
+    scope) cannot perform it.
+    """
+
+    subject: str
+    roles: tuple[str, ...] = ()
+    actor_type: str = "user"
+
+    def may_dismiss(self) -> bool:
+        return Scope.CANDIDATE_DISMISS in scopes_for_business_roles(self.roles)
+
+    def as_audit_actor(self) -> AuditActor:
+        return AuditActor(id=self.subject, type=ActorType(self.actor_type))
+
+
+@dataclass
+class SuggestionDismissResult:
+    """The inert, inspectable outcome of one dismiss attempt.
+
+    ``suggestion`` is the (now dismissed) :class:`~app.db.models.ProspectSuggestion`. ``already_dismissed``
+    is ``True`` when this was an idempotent no-op (the suggestion was already dismissed, so no field and
+    no audit changed). ``reason`` echoes the recorded relevance-feedback note.
+    """
+
+    business_id: str
+    suggestion: ProspectSuggestion
+    reason: str = ""
+    already_dismissed: bool = False
+
+
+class ProspectSuggestionDismisser:
+    """Dismiss ONE of a business's prospect suggestions PRIVATELY, for ONE business.
+
+    Construct with the active session and the verified business scope (a route resolves it from the
+    membership-verified tenant context). Every query is confined to this business — there is no argument
+    to widen the scope, so a dismissal can never reach another tenant's row or any shared/global master.
+    The dismisser stages into the caller's session and never commits; it only ever makes the agent do
+    LESS (hide a candidate from this business's own list) and sends/spends nothing.
+
+    The dismissal is business-private by construction: it flips only THIS ``business_id`` row's status
+    to :data:`DISMISSED_STATUS` and records the feedback reason + actor on that same row. Another tenant
+    with an independent suggestion for the same subject has its OWN row, untouched — so B's suggestion
+    can never be removed by A's dismissal (a DCA-151 acceptance criterion).
+    """
+
+    def __init__(self, session: Session, business_id: str) -> None:
+        self._session = session
+        self._business_id = business_id
+
+    def get(self, suggestion_id: str) -> ProspectSuggestion | None:
+        """Fetch one suggestion by id WITHIN this business, or ``None`` — an unknown or cross-tenant id
+        reads exactly like not-found (a dismissal can never target another tenant's row)."""
+        if not suggestion_id:
+            return None
+        stmt = (
+            select(ProspectSuggestion)
+            .where(ProspectSuggestion.business_id == self._business_id)
+            .where(ProspectSuggestion.id == suggestion_id)
+        )
+        return self._session.scalars(stmt).one_or_none()
+
+    def dismiss(
+        self,
+        suggestion_id: str,
+        actor: SuggestionDismisser,
+        *,
+        reason: str = "",
+        now: datetime | None = None,
+    ) -> SuggestionDismissResult:
+        """Privately dismiss ``suggestion_id`` for this business.
+
+        Order (each gate leaves prior state unchanged when it refuses):
+
+        1. **Authority FIRST.** A caller lacking
+           :attr:`~app.identity.permissions.Scope.CANDIDATE_DISMISS` is refused
+           (:class:`ProspectSuggestionDismissAuthorizationError`) before any state is read — the relevant
+           denial.
+        2. **The suggestion exists in THIS business.** Otherwise refused
+           (:data:`REASON_SUGGESTION_NOT_FOUND`) — an unknown or cross-tenant id reads as not-found, so a
+           dismissal can never touch another tenant's row.
+        3. **Idempotent replay.** An already-dismissed suggestion is returned unchanged (no field
+           re-written, no second audit) — dismissing is idempotent.
+        4. **Dismiss.** The row's ``status`` flips to :data:`DISMISSED_STATUS` and the feedback reason +
+           actor are stamped, so it drops out of the DCA-150 VISIBLE list. An atomic DCA-026 audit entry
+           is staged in the caller's unit of work (opaque references only — never a contact value).
+
+        The dismissal changes NO global fact or policy: it only edits this business's own suggestion row.
+        """
+        moment = now or datetime.now(UTC)
+
+        # 1) Authority FIRST — an unauthorized caller is refused with no state touched.
+        if not actor.may_dismiss():
+            raise ProspectSuggestionDismissAuthorizationError(
+                "dismissing a prospect suggestion requires a business user holding "
+                f"'{Scope.CANDIDATE_DISMISS.value}'; a read-only viewer or a platform operator "
+                "(holding no business scope) cannot perform it"
+            )
+
+        # 2) The suggestion must exist WITHIN this business (an unknown / cross-tenant id is not-found).
+        suggestion = self.get(suggestion_id)
+        if suggestion is None:
+            raise ProspectSuggestionDismissError(
+                REASON_SUGGESTION_NOT_FOUND,
+                "no such prospect suggestion in this business (an unknown or cross-tenant id is "
+                "not-found)",
+                detail=suggestion_id,
+            )
+
+        trimmed_reason = (reason or "").strip()[:MAX_DISMISSAL_REASON_CHARS]
+
+        # 3) Idempotent replay — an already-dismissed suggestion is returned unchanged (no second audit).
+        if suggestion.status == DISMISSED_STATUS:
+            return SuggestionDismissResult(
+                business_id=self._business_id,
+                suggestion=suggestion,
+                reason=suggestion.dismissal_reason,
+                already_dismissed=True,
+            )
+
+        # 4) Flip this business's OWN row to dismissed + stamp the feedback reason/actor. No shared or
+        #    global master is touched, and another tenant's independent suggestion row is untouched.
+        suggestion.status = DISMISSED_STATUS
+        suggestion.dismissed_at = moment
+        suggestion.dismissal_reason = trimmed_reason
+        suggestion.dismissed_by = actor.subject
+        suggestion.dismissed_by_type = actor.actor_type
+
+        # Atomic audit (SEC-001/BR-122): staged into the caller's session so it commits with the change.
+        # References stay OPAQUE — the suggestion id, run id, subject id and visibility — never a contact
+        # value. The reason is screened like every audit payload.
+        AuditSink(
+            self._session, business_id=self._business_id, actor=actor.as_audit_actor()
+        ).record(
+            action=AUDIT_ACTION_DISMISS,
+            reason=f"dismissed prospect suggestion '{suggestion.id}' (private relevance feedback)",
+            references={
+                "prospectSuggestionId": suggestion.id,
+                "runId": suggestion.run_id,
+                "subjectId": suggestion.subject_id,
+                "subjectType": suggestion.subject_type,
+                "visibility": suggestion.visibility,
+                "hasReason": bool(trimmed_reason),
+            },
+        )
+        return SuggestionDismissResult(
+            business_id=self._business_id,
+            suggestion=suggestion,
+            reason=trimmed_reason,
+        )
+
+
 __all__ = [
     "SUBJECT_TYPE",
     "DIMENSION_INDUSTRY",
@@ -728,4 +926,14 @@ __all__ = [
     "SuggestionListItem",
     "SuggestionPage",
     "ProspectSuggestionReader",
+    "DISMISSED_STATUS",
+    "AUDIT_ACTION_DISMISS",
+    "MAX_DISMISSAL_REASON_CHARS",
+    "REASON_DISMISS_NOT_AUTHORIZED",
+    "REASON_SUGGESTION_NOT_FOUND",
+    "ProspectSuggestionDismissError",
+    "ProspectSuggestionDismissAuthorizationError",
+    "SuggestionDismisser",
+    "SuggestionDismissResult",
+    "ProspectSuggestionDismisser",
 ]

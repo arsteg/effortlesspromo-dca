@@ -1636,6 +1636,16 @@ class ProspectSuggestion(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     # The expiry after which the suggestion should no longer be acted on without a refresh.
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # DCA-151 — a business-PRIVATE dismissal (relevance feedback). NULL/empty until THIS business
+    # dismisses the suggestion, which flips ``status`` to 'dismissed' and so drops it out of the VISIBLE
+    # 'suggested' list (DCA-150). The dismissal lives only on this ``business_id`` row: it never edits
+    # any shared/global master and never affects another tenant's independent suggestion for the same
+    # subject. ``dismissed_by`` / ``dismissed_by_type`` record WHO dismissed it (an opaque business
+    # actor id + its kind; server-default ``''`` so pre-existing rows backfill to "not dismissed").
+    dismissed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    dismissal_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    dismissed_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    dismissed_by_type: Mapped[str] = mapped_column(String(16), default="", server_default="")
 
 
 class DiscoveryRunSummary(TenantOwned, Base):

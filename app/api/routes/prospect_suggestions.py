@@ -24,17 +24,24 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_session
+from app.api.idempotency import IdempotencyContext, commit_idempotent, idempotency
 from app.core.security import require_business_permission_on_path
 from app.identity.permissions import Scope
 from app.identity.tenant_context import TenantContext
 from app.services.prospect_suggestion import (
     DEFAULT_PAGE_SIZE,
+    MAX_DISMISSAL_REASON_CHARS,
     MAX_PAGE_SIZE,
+    ProspectSuggestionDismissAuthorizationError,
+    ProspectSuggestionDismissError,
+    ProspectSuggestionDismisser,
     ProspectSuggestionReader,
+    SuggestionDismisser,
     SuggestionListFilters,
     SuggestionListItem,
     SuggestionPage,
@@ -43,10 +50,17 @@ from app.services.prospect_suggestion import (
 router = APIRouter(prefix="/v1/tenants", tags=["prospect-suggestions"])
 
 SessionDep = Annotated[Session, Depends(get_session)]
+IdempotencyDep = Annotated[IdempotencyContext, Depends(idempotency)]
 # Viewing suggestions is an ordinary-business-user action (DCA-019 ``candidate.read``): a viewer, an
 # acting user and an administrator all hold it; a non-member (incl. a platform operator) is denied.
 CandidateReadDep = Annotated[
     TenantContext, Depends(require_business_permission_on_path(Scope.CANDIDATE_READ))
+]
+# Dismissing a suggestion is a WRITE (DCA-019 ``candidate.dismiss``): an acting user and an
+# administrator hold it; a read-only viewer (who may only VIEW) and a non-member (incl. a platform
+# operator) are denied before anything is read or written.
+CandidateDismissDep = Annotated[
+    TenantContext, Depends(require_business_permission_on_path(Scope.CANDIDATE_DISMISS))
 ]
 
 
@@ -108,3 +122,64 @@ def list_prospect_suggestions(
         offset=offset,
     )
     return _page_view(page)
+
+
+class DismissBody(BaseModel):
+    # extra='forbid' so an UNSUPPORTED field (a typo / a field from a future story) is a clear 422
+    # rather than being silently ignored.
+    model_config = ConfigDict(extra="forbid")
+
+    # An optional, opaque relevance-feedback note explaining WHY the suggestion was dismissed. Bounded
+    # so it can never grow unbounded; it is screened (like every audit payload) for secret/contact data.
+    reason: str = Field(default="", max_length=MAX_DISMISSAL_REASON_CHARS)
+
+
+def _dismissed_view(result) -> dict:
+    s = result.suggestion
+    return {
+        "id": s.id,
+        "businessId": s.business_id,
+        "runId": s.run_id,
+        "subjectType": s.subject_type,
+        "subjectId": s.subject_id,
+        "visibility": s.visibility,
+        "status": s.status,
+        "dismissed": s.status == "dismissed",
+        "dismissedAt": s.dismissed_at.isoformat() if s.dismissed_at else None,
+        "dismissalReason": s.dismissal_reason,
+        "alreadyDismissed": result.already_dismissed,
+    }
+
+
+@router.post("/{business_id}/prospect-suggestions/{suggestion_id}/dismiss", status_code=200)
+def dismiss_prospect_suggestion(
+    business_id: str,
+    suggestion_id: str,
+    body: DismissBody,
+    context: CandidateDismissDep,
+    session: SessionDep,
+    idem: IdempotencyDep,
+) -> dict:
+    """DCA-151 — dismiss ONE of this business's prospect suggestions PRIVATELY (relevance feedback).
+
+    Requires the ``candidate.dismiss`` scope on a membership-verified tenant context: a read-only viewer,
+    a non-member and a platform operator (who holds no membership in any client business) are all denied
+    (403, audited) before anything is read or written. The dismisser is bound to the verified business,
+    so an unknown or cross-tenant suggestion id reads as not-found (404) — a dismissal can never touch
+    another tenant's row or any shared/global master. It drops the suggestion out of the VISIBLE list
+    (DCA-150) for THIS business only, leaving another tenant's independent suggestion untouched.
+
+    Idempotent: re-dismissing an already-dismissed suggestion is a 200 no-op (no field re-written, no
+    second audit), and a retried request carrying the same ``Idempotency-Key`` replays verbatim. Writes
+    nothing beyond this one row + its atomic audit entry; spends nothing and sends nothing.
+    """
+    dismisser = SuggestionDismisser(subject=context.subject, roles=context.roles, actor_type="user")
+    try:
+        result = ProspectSuggestionDismisser(session, context.business_id).dismiss(
+            suggestion_id, dismisser, reason=body.reason
+        )
+    except ProspectSuggestionDismissAuthorizationError as exc:  # pragma: no cover - gated first
+        raise HTTPException(status_code=403, detail=exc.code) from exc
+    except ProspectSuggestionDismissError as exc:
+        raise HTTPException(status_code=404, detail=exc.code) from exc
+    return commit_idempotent(session, idem, _dismissed_view(result), status_code=200)

@@ -2817,6 +2817,79 @@ def test_0066_creates_search_partition_backoffs_on_a_preexisting_database(clean_
 
 
 @requires_pg
+def test_0067_adds_suggestion_dismissal_columns_on_a_preexisting_database(clean_schema):
+    """DCA-151 — the 0067 add-column branch (for a DB migrated before the dismissal columns existed).
+
+    A fresh DB gets ``prospect_suggestions`` WITH ``dismissed_at`` / ``dismissal_reason`` /
+    ``dismissed_by`` / ``dismissed_by_type`` from the metadata baseline (0001), so 0067 is a no-op there.
+    To exercise 0067's real job, upgrade to head, DROP the four columns, seed one pre-existing (not
+    dismissed) suggestion row, stamp history back to 0066, then upgrade to head again — 0067 must re-add
+    exactly those columns and backfill the existing row to "not dismissed" (empty strings, NULL
+    timestamp), with no new table and no RLS change (``prospect_suggestions`` is tenant-owned already).
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text(
+                'ALTER TABLE "prospect_suggestions" DROP COLUMN "dismissed_by_type", '
+                'DROP COLUMN "dismissed_by", DROP COLUMN "dismissal_reason", '
+                'DROP COLUMN "dismissed_at"'
+            )
+        )
+        # Seed one pre-existing (pre-dismissal) suggested row to prove the backfill.
+        conn.execute(
+            text(
+                "INSERT INTO prospect_suggestions "
+                "(id, business_id, run_id, subject_type, subject_id, visibility, match_score, "
+                "rationale, scored_icp_version, schema_version, status, provenance, created_at) VALUES "
+                "('sug-legacy', 'biz-legacy', 'run-legacy', 'organization', 'subj-legacy', "
+                "'research_only', 0.5, '', 1, 1, 'suggested', '{}', now())"
+            )
+        )
+    eng.dispose()
+
+    command.stamp(cfg, "0066_search_partition_backoffs")  # pretend we predate the dismissal columns
+    command.upgrade(cfg, "head")  # 0067 runs its add-column branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("prospect_suggestions", schema=clean_schema)}
+    with eng.connect() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        backfilled = conn.execute(
+            text(
+                "SELECT dismissed_at, dismissal_reason, dismissed_by, dismissed_by_type "
+                "FROM prospect_suggestions WHERE id = 'sug-legacy'"
+            )
+        ).first()
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'prospect_suggestions' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert {
+        "dismissed_at",
+        "dismissal_reason",
+        "dismissed_by",
+        "dismissed_by_type",
+    }.issubset(cols)  # columns re-added
+    # The pre-existing row backfilled to "not dismissed": NULL timestamp, empty strings.
+    assert backfilled == (None, "", "", "")
+    assert (
+        policy is not None
+    )  # tenant-owned: RLS still in place (unchanged by an add-column branch)
+
+
+@requires_pg
 def test_host_schema_setting_is_rejected_and_changes_nothing(clean_schema):
     from alembic import command
 

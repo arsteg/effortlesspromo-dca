@@ -32,6 +32,14 @@ class Scope(str, Enum):
 
     # --- business plane (granted via business membership roles only) ---
     CANDIDATE_READ = "candidate.read"  # ordinary business user: view suggestions
+    # dismiss a prospect suggestion PRIVATELY for THIS business — relevance feedback that drops the
+    # suggestion out of the business's VISIBLE candidate list (DCA-151). A WRITE scope: an ordinary
+    # acting business user holds it (dismissing a candidate you are reviewing is a normal acting-user
+    # action, never admin-only), a read-only viewer does NOT (viewing ≠ editing). It is a business-plane
+    # scope, so a platform operator (holding no membership) can never dismiss a client's suggestion with
+    # their global rights alone; a dismissal is business-private and never touches any shared/global
+    # master or another tenant's independent suggestion for the same subject.
+    CANDIDATE_DISMISS = "candidate.dismiss"
     # correct/override a field value the agent recorded about one of this business's subjects
     # (DCA-070). A WRITE scope: an ordinary acting business user holds it, a read-only viewer does
     # NOT — correcting a value is an edit, not a view. It is a business-plane scope, so a platform
@@ -158,6 +166,8 @@ class Scope(str, Enum):
 _ADMIN_SCOPES = frozenset(
     {
         Scope.CANDIDATE_READ,
+        # dismissing a candidate privately is a normal review action an administrator also holds.
+        Scope.CANDIDATE_DISMISS,
         Scope.FIELD_CORRECT,
         Scope.IDENTITY_MERGE,
         Scope.CONSENT_WITHDRAW,
@@ -180,6 +190,9 @@ _ADMIN_SCOPES = frozenset(
 _ACTING_USER_SCOPES = frozenset(
     {
         Scope.CANDIDATE_READ,
+        # an acting user may dismiss a suggestion privately (relevance feedback) — a read-only viewer
+        # may only view it, never dismiss.
+        Scope.CANDIDATE_DISMISS,
         Scope.FIELD_CORRECT,
         Scope.IDENTITY_MERGE,
         Scope.CONSENT_WITHDRAW,
