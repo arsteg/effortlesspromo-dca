@@ -280,7 +280,13 @@ def client() -> TestClient:
 
 
 def _seed_business_spend(client: TestClient, business_id: str, *, amount: int) -> None:
-    """Seed one in-force budget + a reserved hold and an uncertain hold for a business over the app's DB."""
+    """Seed one in-force budget + a reserved hold and an uncertain hold for a business over the app's DB.
+
+    The HTTP endpoint computes its daily/monthly window from the real wall-clock (it takes no injectable
+    ``now``), so the holds are seeded at the current moment — not the fixed ``NOW`` the in-process tests
+    use — to keep them inside today's civil-day window regardless of the date the suite runs on.
+    """
+    seed_now = datetime.now(UTC)
     factory = client.app.state.session_factory
     with factory() as session:
         BudgetLimitStore(session, business_id).save(
@@ -294,20 +300,20 @@ def _seed_business_spend(client: TestClient, business_id: str, *, amount: int) -
         BudgetReservationStore(session, business_id).reserve(
             ReservationRequest(idempotency_key="http-active", amount_minor=amount),
             RES_ADMIN,
-            now=NOW,
+            now=seed_now,
         )
         session.commit()
     with factory() as session:
         u = BudgetReservationStore(session, business_id).reserve(
             ReservationRequest(idempotency_key="http-uncertain", amount_minor=1_000),
             RES_ADMIN,
-            now=NOW,
+            now=seed_now,
         )
         session.commit()
         BudgetReconciliationStore(session, business_id).reconcile(
             ReconciliationRequest(u.id, "http-call-u", ReconcileOutcome.MARK_UNCERTAIN),
             REC_ADMIN,
-            now=NOW,
+            now=seed_now,
         )
         session.commit()
 
