@@ -1711,6 +1711,111 @@ class DiscoveryRunSummary(TenantOwned, Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class SearchPartitionState(str, Enum):
+    """DCA-149 — the backoff state of ONE repeated-search partition (a business/search-scope unit).
+
+    A partition starts (implicitly) :attr:`ACTIVE` — eligible to search. When consecutive rounds keep
+    producing no NEW results (or only marginal yield), the partition is bounded off:
+
+    - :attr:`ACTIVE` — yielding, or not yet over the low-yield streak. A fresh search is eligible NOW.
+    - :attr:`BACKING_OFF` — the low-yield streak crossed the threshold, so the partition is paused for a
+      bounded, exponentially-growing window; a fresh search is refused until ``next_eligible_at`` passes.
+      A later good-yield round recovers it to ACTIVE; another low-yield round grows the window.
+    - :attr:`EXHAUSTED` — the backoff stepped up to the hard ceiling: the market looks exhausted, so the
+      partition is visibly paused with NO ``next_eligible_at`` (never auto-retried). A later good-yield
+      round (driven by a different scope / fresh signal) still recovers it; nothing auto-resumes it.
+
+    The states make the stop VISIBLE and auditable: an exhausted market is paused rather than repeatedly
+    spending or inventing records (the DCA has no spend/fetch path regardless — this only ever does LESS).
+    """
+
+    ACTIVE = "active"
+    BACKING_OFF = "backing_off"
+    EXHAUSTED = "exhausted"
+
+    @classmethod
+    def paused_values(cls) -> frozenset[str]:
+        """The states in which a fresh search is (at least sometimes) refused — not plain ACTIVE."""
+        return frozenset({cls.BACKING_OFF.value, cls.EXHAUSTED.value})
+
+
+class SearchPartitionBackoff(TenantOwned, Base):
+    """DCA-149 — the durable no-new-result / marginal-yield STOP-and-backoff state of ONE search
+    partition (tenant-owned, RLS-protected).
+
+    One row is the inert, inspectable backoff state for one repeated-search partition of a business — a
+    logical ``(business_id, partition_key)`` unit (e.g. a confirmed-ICP + source-scope fingerprint). After
+    each bounded discovery round the DCA-149 recorder measures that round's YIELD (how many NEW results it
+    produced versus how many it saw) and advances this state machine: a round with no new results — or only
+    marginal yield — grows a consecutive-low-yield streak; once the streak crosses the configured bound the
+    partition is :attr:`SearchPartitionState.BACKING_OFF` for a bounded, exponentially-growing window
+    (``next_eligible_at``), and once the backoff steps up to the hard ceiling it is
+    :attr:`SearchPartitionState.EXHAUSTED` (paused, never auto-retried). A later good-yield round RESETS the
+    streak and recovers the partition to :attr:`SearchPartitionState.ACTIVE`.
+
+    **The two load-bearing invariants (the DCA-149 acceptance criteria):**
+
+    - **An exhausted market is visibly paused / backed off, never repeatedly spent on or fabricated.** The
+      state (and ``next_eligible_at``) is a durable, auditable record a future (still-disabled) search
+      scheduler consults BEFORE starting a round, so an exhausted partition does LESS, not more. Recording a
+      round reads already-recorded yield and performs NO fetch, model call, spend or send (``provenance``
+      pins ``sent`` / ``spent`` = False); it never invents a result.
+
+    - **Reproduce the result and the relevant denial without unintended state changes.** The recorder checks
+      authority FIRST, then confines every read/write to THIS business (an unknown / cross-tenant partition
+      is never read). An eligibility CHECK is a pure read that mutates nothing, so both an eligible result
+      and a backing-off / exhausted denial reproduce deterministically.
+
+    **Idempotent-by-partition, tenant-owned.** ``(business_id, partition_key)`` is unique: a partition has
+    exactly ONE backoff row, advanced in place. The row is owned by exactly one ``business_id`` (DCA-017/018)
+    and read only within it. It holds only aggregate counts, stable reason codes and opaque row references —
+    never a contact value or a secret.
+    """
+
+    __tablename__ = "search_partition_backoffs"
+    # At most ONE backoff row per search partition in a business — the state is advanced in place.
+    __table_args__ = (tenant_unique("partition_key", name="uq_search_partition_backoff"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The logical repeated-search partition within the business (a caller-supplied / derived key, e.g. a
+    # confirmed-ICP + source-scope fingerprint). Bounded and opaque — never contact data.
+    partition_key: Mapped[str] = mapped_column(String(64), index=True)
+    # active | backing_off | exhausted (:class:`SearchPartitionState`).
+    state: Mapped[str] = mapped_column(
+        String(16),
+        default=SearchPartitionState.ACTIVE.value,
+        server_default=SearchPartitionState.ACTIVE.value,
+        index=True,
+    )
+    # How many rounds have been recorded against this partition (monotonic, for review).
+    rounds_recorded: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The current run of CONSECUTIVE low-yield rounds (reset to 0 by any good-yield round).
+    consecutive_low_yield: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # How many times the backoff window has stepped up (the exponent of the exponential backoff); 0 while
+    # ACTIVE and not yet backed off. Reset to 0 on recovery.
+    backoff_level: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The last recorded round's yield (opaque counts) and how it was classified.
+    last_new_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_total_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_low_yield: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false())
+    # The stable reason the last round was (or was not) low-yield: none | no_new_results | marginal_yield.
+    last_stop_reason: Mapped[str] = mapped_column(String(32), default="", server_default="")
+    last_round_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # When a BACKING_OFF partition may search again (NULL while ACTIVE, and NULL when EXHAUSTED — an
+    # exhausted partition is paused with no scheduled retry).
+    next_eligible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    # An opaque reference to the last originating discovery run (never contact data), when a round was
+    # derived from a finalized run summary — for traceability only.
+    last_run_id: Mapped[str | None] = mapped_column(String(36), default=None)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Backoff provenance + the load-bearing invariants (sent / spent = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
 class AcquisitionDecision(TenantOwned, Base):
     """Auditable per-record decision (mirror of the platform's SendDecision philosophy)."""
 

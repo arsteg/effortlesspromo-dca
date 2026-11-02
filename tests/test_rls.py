@@ -95,6 +95,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "observation_batch_resolutions",
         "prospect_suggestions",
         "discovery_run_summaries",
+        "search_partition_backoffs",
     }
 
 
@@ -922,6 +923,56 @@ def test_discovery_run_summary_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_RUN_SUMMARY, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_SEARCH_BACKOFF = (
+    "INSERT INTO search_partition_backoffs "
+    "(id, business_id, partition_key, state, rounds_recorded, consecutive_low_yield, backoff_level, "
+    "last_new_count, last_total_count, last_low_yield, last_stop_reason, schema_version, provenance, "
+    "created_at, updated_at) "
+    "VALUES (gen_random_uuid()::text, %s, 'icp:1:src:deadbeef', 'backing_off', 3, 2, 1, 0, 5, true, "
+    "'no_new_results', 1, '{}', now(), now())"
+)
+
+
+@requires_pg
+def test_search_partition_backoff_is_tenant_isolated(rls_db):
+    """DCA-149 — a search-partition backoff state is tenant-owned: each tenant can read only its OWN
+    partitions' stop/backoff state (RLS on real Postgres), so one business can never see or infer another's
+    exhausted / backing-off search partitions."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_SEARCH_BACKOFF, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_SEARCH_BACKOFF, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM search_partition_backoffs").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM search_partition_backoffs").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_search_partition_backoff_write_check_rejects_foreign_owner(rls_db):
+    """A backoff row can never be stamped for another tenant: writing a B-owned row while scoped to A
+    violates the WITH CHECK clause (defence-in-depth beneath the recorder's own per-row business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_SEARCH_BACKOFF, (B,))
         conn.rollback()
     finally:
         conn.close()

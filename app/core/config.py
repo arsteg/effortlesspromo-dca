@@ -258,6 +258,27 @@ class Settings(BaseSettings):
     source_result_cache_max_fresh_seconds: int = 2592000  # 30d hard cap on any positive entry
     source_result_cache_negative_ttl_seconds: int = 3600  # 1h bounded negative-result TTL
 
+    # --- search stop / backoff (DCA-149) — bound a low-yield / exhausted repeated search ---
+    # The yield thresholds and backoff schedule the DCA-149 recorder applies PER search partition so a
+    # market that stops producing NEW results is paused rather than searched (and spent on) forever. These
+    # are POLICY values (not a feature switch): the backoff exists and is enforced the moment any search
+    # scheduler consults it. All are validated at boot to be genuinely bounded — a non-positive window /
+    # streak / ceiling, or a ratio outside (0, 1], would disable the very protection. Enforcing them
+    # performs NO fetch, model call, spend or send (the DCA has no spend/fetch path regardless).
+    # A round producing fewer than this many NEW results is a no-new-result (low-yield) round.
+    search_low_yield_min_new_results: int = 1
+    # A round whose NEW/total ratio is below this (but with some new results) is a marginal-yield (low-
+    # yield) round. Must be within (0, 1] — 0 would never fire, >1 would fire on everything.
+    search_marginal_yield_min_ratio: float = 0.1
+    # How many CONSECUTIVE low-yield rounds are tolerated before the partition is backed off. Must be >= 1.
+    search_low_yield_rounds_before_backoff: int = 2
+    # The first backoff window, then doubled each additional low-yield round up to the hard cap. Positive.
+    search_backoff_base_seconds: int = 3600  # 1h first pause
+    search_backoff_max_seconds: int = 604800  # 7d hard cap on any backoff window
+    # After this many backoff steps the partition is EXHAUSTED (paused with no scheduled retry). Must be
+    # >= 1 so an exhausted market is reachable.
+    search_exhaust_after_backoffs: int = 4
+
     # --- scope guards ---
     allowed_countries: list[str] = ["IN"]  # India-only build (DCA story boundary)
     candidate_ttl_days: int = 30
@@ -616,6 +637,30 @@ def validate_required(settings: Settings) -> None:
         raise RuntimeError(
             "EFFORTLESSPROMO_DCA_SOURCE_RESULT_CACHE_NEGATIVE_TTL_SECONDS must be positive"
         )
+
+    # DCA-149: the search stop / backoff policy must be genuinely bounded, or it would stop protecting a
+    # low-yield / exhausted market. A non-positive window / streak / ceiling disables the protection, and a
+    # marginal-yield ratio outside (0, 1] either never fires or fires on every round. Fail fast, naming
+    # only the offending key.
+    if settings.search_low_yield_min_new_results < 1:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_SEARCH_LOW_YIELD_MIN_NEW_RESULTS must be >= 1")
+    if not 0 < settings.search_marginal_yield_min_ratio <= 1:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_SEARCH_MARGINAL_YIELD_MIN_RATIO must be within (0, 1]"
+        )
+    if settings.search_low_yield_rounds_before_backoff < 1:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_SEARCH_LOW_YIELD_ROUNDS_BEFORE_BACKOFF must be >= 1"
+        )
+    if settings.search_backoff_base_seconds <= 0:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_SEARCH_BACKOFF_BASE_SECONDS must be positive")
+    if settings.search_backoff_max_seconds < settings.search_backoff_base_seconds:
+        raise RuntimeError(
+            "EFFORTLESSPROMO_DCA_SEARCH_BACKOFF_MAX_SECONDS must be >= "
+            "EFFORTLESSPROMO_DCA_SEARCH_BACKOFF_BASE_SECONDS"
+        )
+    if settings.search_exhaust_after_backoffs < 1:
+        raise RuntimeError("EFFORTLESSPROMO_DCA_SEARCH_EXHAUST_AFTER_BACKOFFS must be >= 1")
 
     if settings.is_production:
         _validate_production(settings)

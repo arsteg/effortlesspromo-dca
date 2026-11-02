@@ -88,6 +88,7 @@ DCA_TABLES = {
     "observation_batch_resolutions",
     "prospect_suggestions",
     "discovery_run_summaries",
+    "search_partition_backoffs",
 }
 
 
@@ -2767,6 +2768,51 @@ def test_0065_creates_discovery_run_summaries_on_a_preexisting_database(clean_sc
         ).first()
     eng.dispose()
     assert "uq_discovery_run_summary_run" in uniques  # one summary per (tenant, run)
+    assert policy is not None  # RLS re-established, not just the bare table
+
+
+@requires_pg
+def test_0066_creates_search_partition_backoffs_on_a_preexisting_database(clean_schema):
+    """DCA-149 — the 0066 create branch (for a DB migrated before ``search_partition_backoffs``).
+
+    ``search_partition_backoffs`` is tenant-owned (RLS-protected), like ``discovery_run_summaries`` (0065).
+    A fresh DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0066 is a
+    no-op there. To exercise 0066's real job, upgrade to head, drop the table + policy, stamp history back
+    to 0065, then upgrade to head again — 0066 must recreate the table (with its per-tenant per-partition
+    unique constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(text('DROP TABLE IF EXISTS "search_partition_backoffs" CASCADE'))
+    eng.dispose()
+
+    command.stamp(cfg, "0065_discovery_run_summaries")  # pretend we predate the backoff table
+    command.upgrade(cfg, "head")  # 0066 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "search_partition_backoffs" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"]
+        for u in insp.get_unique_constraints("search_partition_backoffs", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'search_partition_backoffs' "
+                "AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_search_partition_backoff" in uniques  # one backoff row per (tenant, partition)
     assert policy is not None  # RLS re-established, not just the bare table
 
 

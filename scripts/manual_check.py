@@ -25932,6 +25932,168 @@ def _dca_148(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-149",
+    "STOP low-yield or exhausted searches — record each bounded search round's YIELD against a "
+    "(business, search partition) and advance a durable no-new-result / marginal-yield backoff state. "
+    "Consecutive low-yield rounds BACK the partition off for a bounded, exponentially-growing window (a "
+    "fresh search is then refused), and a further low-yield round EXHAUSTS it (paused, no retry); a "
+    "good-yield round RECOVERS it. The exhausted market is visibly paused rather than searched/spent on, "
+    "and the relevant denials (an unauthorized caller, a cross-tenant partition) change no state. NOTHING "
+    "fetched/sent/spent/invented. Local synthetic.",
+)
+def _dca_149(ctx: CheckContext) -> dict:
+    """Drive the real DCA-149 backoff recorder against a disposable DB with isolated synthetic Businesses
+    A/B. PRINT the actual per-round state: a yielding round stays ACTIVE/eligible; two no-new-result rounds
+    back the partition off (next eligible run shown); a further round EXHAUSTS it (paused, no retry) and the
+    eligibility check refuses it; a good-yield round recovers it to ACTIVE. Then the denials: an unauthorized
+    viewer is refused with no row staged, and Business B cannot see A's backed-off partition. Nothing is
+    fetched, sent or spent — it advances an inert state machine over synthetic round yields."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.db.models import SearchPartitionBackoff, SearchPartitionState, TenantAgent
+    from app.services.search_backoff import (
+        DENY_BACKING_OFF,
+        DENY_EXHAUSTED,
+        DiscoverySearchBackoff,
+        RoundYield,
+        SearchBackoffActor,
+        SearchBackoffAuthorizationError,
+        partition_key_for,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000149a"
+    biz_b = "00000000-0000-4000-8000-00000000149b"
+    partition = partition_key_for(1, ["synthetic.mca", "synthetic.gst"])
+    admin = SearchBackoffActor(subject="00000000-0000-4000-9000-0000000a0149a", roles=("owner",))
+    viewer = SearchBackoffActor(subject="00000000-0000-4000-9000-0000000a0149b", roles=("viewer",))
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    # Small, deterministic thresholds for a clear demo: 2 low-yield rounds back off; a 3rd exhausts.
+    settings = ctx.settings.model_copy(
+        update={
+            "search_low_yield_min_new_results": 1,
+            "search_marginal_yield_min_ratio": 0.5,
+            "search_low_yield_rounds_before_backoff": 2,
+            "search_backoff_base_seconds": 3600,
+            "search_backoff_max_seconds": 86400,
+            "search_exhaust_after_backoffs": 2,
+        }
+    )
+
+    print("\nstop low-yield / exhausted searches (local synthetic — nothing fetched):")
+
+    with ctx.session_factory() as session:
+        session.add(TenantAgent(business_id=biz_a, country="IN", enabled=True))
+        session.add(TenantAgent(business_id=biz_b, country="IN", enabled=True))
+        session.flush()
+
+        store = DiscoverySearchBackoff(session, biz_a, settings)
+
+        # 1) A yielding round keeps the partition ACTIVE and eligible.
+        good = store.record_round(
+            partition, RoundYield(new_results=7, total_results=10), admin, now=now
+        )
+        session.flush()
+        elig_good = store.check_eligibility(partition, now=now)
+        print("\n  [1] a yielding round — partition stays active:")
+        print(f"      state={good.state}  lowYield={good.low_yield}  eligible={elig_good.eligible}")
+
+        # 2) Two consecutive no-new-result rounds back the partition OFF (the visible stop).
+        store.record_round(partition, RoundYield(0, 6), admin, now=now)
+        session.flush()
+        backed = store.record_round(partition, RoundYield(0, 9), admin, now=now)
+        session.flush()
+        denied_window = store.check_eligibility(partition, now=now + timedelta(seconds=60))
+        print("\n  [2] two no-new-result rounds — backed off:")
+        print(
+            f"      state={backed.state}  backoffLevel={backed.backoff_level}  "
+            f"nextEligibleAt={backed.next_eligible_at.isoformat()}"
+        )
+        print(
+            f"      within window: eligible={denied_window.eligible}  reason={denied_window.reason}"
+        )
+
+        # 3) A further low-yield round EXHAUSTS the market (paused, no scheduled retry).
+        exhausted = store.record_round(partition, RoundYield(0, 5), admin, now=now)
+        session.flush()
+        denied_exhausted = store.check_eligibility(partition, now=now + timedelta(days=365))
+        print("\n  [3] a further low-yield round — exhausted market:")
+        print(
+            f"      state={exhausted.state}  exhausted={exhausted.exhausted}  "
+            f"nextEligibleAt={exhausted.next_eligible_at}"
+        )
+        print(
+            f"      far future: eligible={denied_exhausted.eligible}  reason={denied_exhausted.reason}"
+        )
+
+        # 4) A good-yield round RECOVERS the partition to ACTIVE.
+        recovered = store.record_round(partition, RoundYield(6, 8), admin, now=now)
+        session.flush()
+        elig_recovered = store.check_eligibility(partition, now=now)
+        print("\n  [4] a good-yield round — recovered:")
+        print(
+            f"      state={recovered.state}  recovered={recovered.recovered}  "
+            f"eligible={elig_recovered.eligible}"
+        )
+
+        # 5) Denial — an unauthorized viewer is refused with NO state change.
+        rows_before = session.query(SearchPartitionBackoff).count()
+        try:
+            store.record_round(partition, RoundYield(0, 5), viewer, now=now)
+            unauthorized_refused = False
+        except SearchBackoffAuthorizationError:
+            unauthorized_refused = True
+        rows_after = session.query(SearchPartitionBackoff).count()
+        no_state_change = rows_after == rows_before
+        print("\n  [5] unauthorized viewer refused (a denial changes nothing):")
+        print(f"      refused={unauthorized_refused}  noStateChange={no_state_change}")
+
+        # Drive B to a DIFFERENT (backed-off) state so isolation is unmistakable.
+        store_b = DiscoverySearchBackoff(session, biz_b, settings)
+        b_sees_a = store_b.get(partition)
+        b_elig = store_b.check_eligibility(partition, now=now + timedelta(seconds=60))
+        print("\n  [6] tenant isolation — Business B cannot see A's partition:")
+        print(f"      B.sees_A_row={b_sees_a is not None}  B.eligible={b_elig.eligible}")
+
+    checks = {
+        "yielding_round_active_and_eligible": good.state == SearchPartitionState.ACTIVE.value
+        and good.low_yield is False
+        and elig_good.eligible is True,
+        "consecutive_low_yield_backs_off": backed.state == SearchPartitionState.BACKING_OFF.value
+        and backed.backoff_level == 1
+        and backed.next_eligible_at == now + timedelta(seconds=3600),
+        "within_window_refused": denied_window.eligible is False
+        and denied_window.reason == DENY_BACKING_OFF,
+        "further_low_yield_exhausts": exhausted.state == SearchPartitionState.EXHAUSTED.value
+        and exhausted.exhausted is True
+        and exhausted.next_eligible_at is None,
+        "exhausted_refused_no_retry": denied_exhausted.eligible is False
+        and denied_exhausted.reason == DENY_EXHAUSTED
+        and denied_exhausted.next_eligible_at is None,
+        "good_round_recovers": recovered.state == SearchPartitionState.ACTIVE.value
+        and recovered.recovered is True
+        and elig_recovered.eligible is True,
+        "unauthorized_refused_no_state_change": unauthorized_refused and no_state_change,
+        "tenant_isolated": b_sees_a is None and b_elig.eligible is True,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; NO network, NO model, NO spend, NO send, NO invented records. DCA-149 "
+        "records each bounded search round's YIELD against a (business, partition) and advances a durable "
+        "no-new-result / marginal-yield backoff state: consecutive low-yield rounds back the partition off "
+        "for a bounded, exponentially-growing window and a further one exhausts it — a future scheduler "
+        "consults this state BEFORE a round, so an exhausted market is visibly paused rather than searched "
+        "or spent on. It stages only an inert state row + its atomic audit, so a round and its denials "
+        "reproduce with no unintended state change, and acquisition stays a disabled future capability.)"
+    )
+    return {
+        "checks": checks,
+        "backedOffNextEligibleAt": backed.next_eligible_at.isoformat(),
+        "finalStateAfterRecovery": recovered.state,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
