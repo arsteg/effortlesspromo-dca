@@ -97,6 +97,7 @@ def test_rls_covers_exactly_the_tenant_owned_tables():
         "discovery_run_summaries",
         "search_partition_backoffs",
         "acceptance_intents",
+        "billable_acceptances",
     }
 
 
@@ -1037,6 +1038,79 @@ def test_acceptance_intent_write_check_rejects_foreign_owner(rls_db):
         conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
         with pytest.raises(InsufficientPrivilege):
             conn.execute(_SEED_ACCEPTANCE, (B,))
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+_SEED_BILLABLE = (
+    "WITH r AS ("
+    "INSERT INTO discovery_run_requests "
+    "(id, business_id, icp_version, status, source_scope, target_cap, task_cap, query_cap, "
+    "requested, clamped, clamp_notes, provenance, created_at) "
+    "VALUES (gen_random_uuid()::text, %s, 1, 'completed', '[]', 50, 5, 3, '{}', false, '[]', '{}', now()) "
+    "RETURNING id, business_id), "
+    "s AS ("
+    "INSERT INTO prospect_suggestions "
+    "(id, business_id, run_id, subject_type, subject_id, visibility, match_score, rationale, "
+    "scored_icp_version, schema_version, status, provenance, created_at, expires_at) "
+    "SELECT gen_random_uuid()::text, r.business_id, r.id, 'organization', 'subj-1', 'research_only', "
+    "0.5, '', 1, 1, 'suggested', '{}', now(), now() + interval '30 days' FROM r "
+    "RETURNING id, business_id, run_id), "
+    "i AS ("
+    "INSERT INTO acceptance_intents "
+    "(id, business_id, suggestion_id, run_id, subject_type, subject_id, visibility, status, "
+    "scored_icp_version, suggestion_schema_version, match_score, schema_version, outbox_event_id, "
+    "sync_status, external_crm_record_id, external_audience_id, external_version, "
+    "accepted_by, accepted_by_type, provenance, created_at) "
+    "SELECT gen_random_uuid()::text, s.business_id, s.id, s.run_id, 'organization', 'subj-1', "
+    "'research_only', 'synced', 1, 1, 0.5, 1, 'evt-1', 'acknowledged', 'crm-1', 'aud-1', 'v1', "
+    "'admin-1', 'user', '{}', now() FROM s "
+    "RETURNING id, business_id, suggestion_id) "
+    "INSERT INTO billable_acceptances "
+    "(id, business_id, acceptance_intent_id, suggestion_id, subject_type, subject_id, billing_key, "
+    "external_crm_record_id, outbox_event_id, schema_version, status, recorded_by, recorded_by_type, "
+    "provenance, created_at) "
+    "SELECT gen_random_uuid()::text, i.business_id, i.id, i.suggestion_id, 'organization', 'subj-1', "
+    "'bill-key-1', 'crm-1', 'usage-evt-1', 1, 'recorded', 'admin-1', 'user', '{}', now() FROM i"
+)
+
+
+@requires_pg
+def test_billable_acceptance_is_tenant_isolated(rls_db):
+    """DCA-157 — a billable-acceptance ledger entry is tenant-owned: each tenant can read only its OWN
+    billable acceptances (RLS on real Postgres), so one business can never see or meter another's."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        conn.execute(_SEED_BILLABLE, (A,))
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        conn.execute(_SEED_BILLABLE, (B,))
+        conn.commit()
+
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        a_rows = conn.execute("SELECT business_id FROM billable_acceptances").fetchall()
+        assert a_rows == [(A,)]
+        conn.commit()
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, B))
+        b_rows = conn.execute("SELECT business_id FROM billable_acceptances").fetchall()
+        assert b_rows == [(B,)]
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@requires_pg
+def test_billable_acceptance_write_check_rejects_foreign_owner(rls_db):
+    """A billable acceptance can never be stamped for another tenant: writing a B-owned row while scoped
+    to A violates the WITH CHECK clause (defence-in-depth beneath the emitter's own per-row
+    business_id)."""
+    conn = _app_conn()
+    try:
+        conn.execute("SELECT set_config(%s, %s, true)", (RLS_GUC, A))
+        with pytest.raises(InsufficientPrivilege):
+            conn.execute(_SEED_BILLABLE, (B,))
         conn.rollback()
     finally:
         conn.close()

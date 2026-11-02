@@ -90,6 +90,7 @@ DCA_TABLES = {
     "discovery_run_summaries",
     "search_partition_backoffs",
     "acceptance_intents",
+    "billable_acceptances",
 }
 
 
@@ -3086,6 +3087,53 @@ def test_0070_adds_sync_reconcile_columns_on_a_preexisting_database(clean_schema
     assert (
         policy is not None
     )  # tenant-owned: RLS still in place (unchanged by an add-column branch)
+
+
+@requires_pg
+def test_0071_creates_billable_acceptances_on_a_preexisting_database(clean_schema):
+    """DCA-157 — the 0071 create branch (for a DB migrated before ``billable_acceptances`` existed).
+
+    ``billable_acceptances`` is tenant-owned (RLS-protected), like ``acceptance_intents`` (0068). A fresh
+    DB gets the table from the metadata baseline (0001) and its RLS policy from 0002, so 0071 is a no-op
+    there. To exercise 0071's real job, upgrade to head, drop the table + policy, stamp history back to
+    0070, then upgrade to head again — 0071 must recreate the table (with its per-tenant per-intent unique
+    constraint) AND its tenant-isolation RLS policy.
+    """
+    from alembic import command
+
+    cfg = _alembic_config(clean_schema)
+    command.upgrade(cfg, "head")
+
+    eng = create_engine(PG_URL)
+    with eng.begin() as conn:
+        conn.execute(text(f'SET search_path TO "{clean_schema}"'))
+        conn.execute(
+            text('DROP TABLE IF EXISTS "billable_acceptances" CASCADE')
+        )  # policy drops too
+    eng.dispose()
+
+    command.stamp(
+        cfg, "0070_acceptance_sync_reconcile"
+    )  # pretend we predate the billable-acceptance table
+    command.upgrade(cfg, "head")  # 0071 runs its create branch
+
+    eng = create_engine(PG_URL)
+    insp = inspect(eng)
+    assert "billable_acceptances" in set(insp.get_table_names(schema=clean_schema))
+    uniques = {
+        u["name"] for u in insp.get_unique_constraints("billable_acceptances", schema=clean_schema)
+    }
+    with eng.connect() as conn:
+        policy = conn.execute(
+            text(
+                "SELECT 1 FROM pg_policies WHERE schemaname = :s "
+                "AND tablename = 'billable_acceptances' AND policyname = 'tenant_isolation'"
+            ),
+            {"s": clean_schema},
+        ).first()
+    eng.dispose()
+    assert "uq_billable_acceptance_intent" in uniques  # one billable entry per (tenant, intent)
+    assert policy is not None  # RLS re-established, not just the bare table
 
 
 @requires_pg

@@ -57,6 +57,19 @@ def outbox_event_id(business_id: str, event_type: str, dedup_key: str) -> str:
     return str(uuid.uuid5(_OUTBOX_EVENT_NS, f"{business_id}\x1f{event_type}\x1f{dedup_key}"))
 
 
+# Fixed namespace for deriving the STABLE logical BILLING key of one accepted prospect (DCA-157). The
+# key is uuid5 over ``(business_id, acceptance_intent_id)``, so an accepted prospect maps to exactly ONE
+# billing key within a business, deterministically — re-deriving it (on a replay / reconcile) yields the
+# SAME key rather than a new one, which (with the per-tenant uniqueness below) makes a prospect billable
+# exactly once. A distinct namespace from the outbox id keeps the two id spaces from ever colliding.
+_BILLABLE_ACCEPTANCE_NS = uuid.UUID("a7b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d")
+
+
+def billable_acceptance_key(business_id: str, acceptance_intent_id: str) -> str:
+    """The stable, deterministic logical billing key for ONE accepted prospect within a business."""
+    return str(uuid.uuid5(_BILLABLE_ACCEPTANCE_NS, f"{business_id}\x1f{acceptance_intent_id}"))
+
+
 class DataMode(str, Enum):
     """How the agent is allowed to source prospects for a business (DCA-024).
 
@@ -149,6 +162,25 @@ class AcceptanceIntentStatus(str, Enum):
 
     PENDING_SYNC = "pending_sync"
     SYNCED = "synced"
+
+
+class BillableAcceptanceStatus(str, Enum):
+    """DCA-157 — delivery state of ONE billable-acceptance ledger entry (controlled vocabulary).
+
+    ``RECORDED`` — the billable acceptance has been durably recorded in the DCA's OWN ledger (a usage
+    fact) AFTER the audience sync was ACKNOWLEDGED. It is the ONLY status this story writes: it records
+    the billable fact + stages a durable DCA-027 outbox usage record, but it performs NO live billing
+    API call and charges nothing — the actual delivery of usage to platform billing is a later,
+    currently-DISABLED story (DCA-158).
+
+    ``DELIVERED`` — reserved for that later story: once it has delivered the usage to platform billing
+    inside its own unit of work it marks the entry delivered. No path here EVER sets it; the state
+    models the lifecycle so DCA-158 can reconcile a hand-off, exactly like :class:`OutboxStatus` models
+    ``DELIVERED`` without any delivery path existing yet.
+    """
+
+    RECORDED = "recorded"
+    DELIVERED = "delivered"
 
 
 class InboxStatus(str, Enum):
@@ -1782,6 +1814,84 @@ class AcceptanceIntent(TenantOwned, Base):
     accepted_by_type: Mapped[str] = mapped_column(String(16), default="user", server_default="user")
     # Acceptance provenance + the load-bearing invariants (accepted = True; sendable / synced / sent /
     # spent / consentConferred / membershipCreated = False).
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class BillableAcceptance(TenantOwned, Base):
+    """DCA-157 — ONE billable-acceptance ledger entry for an ACKNOWLEDGED audience sync (RLS).
+
+    The audience stage's metering step after the DCA-155 sync / DCA-156 reconcile has driven a DCA-153
+    :class:`AcceptanceIntent` to ``synced`` (its external mapping persisted by an ACKNOWLEDGED platform
+    acknowledgment). Recording this entry is the durable record that the accepted prospect is BILLABLE —
+    a usage fact the platform will later meter. Creating it performs NO live billing API call and charges
+    NOTHING: the actual delivery of usage to platform billing is a later, currently-DISABLED story
+    (DCA-158). It stages a durable DCA-027 outbox usage record alongside, so that disabled delivery story
+    has something to relay, exactly like the DCA-153 intent stages its pending-sync request.
+
+    **The load-bearing invariants (the DCA-157 acceptance criteria):**
+
+    - **Billable EXACTLY once, ONLY after acknowledgment.** An entry is emitted ONLY when the intent is
+      ``synced`` with the platform's external mapping present — never for a ``pending`` / uncertain
+      (``needs_review``) / failed / ``pending_sync`` intent, so an unacknowledged or in-doubt sync is
+      never charged. ``(business_id, acceptance_intent_id)`` is UNIQUE — a prospect is billable once per
+      business — so a replay (or a DCA-156 reconcile that re-resolved the same intent) returns the
+      existing entry and stages no duplicate, no second usage record and no second audit: never
+      double-charged. The ``billing_key`` is the STABLE logical billing key
+      (:func:`billable_acceptance_key`), deterministic in ``(business, intent)``, so the same accepted
+      prospect always maps to the same billing key across retries.
+
+    - **A billable fact is not a send / spend / consent.** The recorded ``provenance`` pins the
+      invariants (``billable`` = ``True``; ``delivered`` / ``sent`` / ``spent`` / ``consentConferred`` /
+      ``membershipCreated`` = ``False``). Metering an accepted prospect confers NO recipient consent
+      (acceptance is NOT consent) and performs NO send — and nothing is charged until the disabled
+      DCA-158 delivery story runs.
+
+    **Idempotent, tenant-owned.** The row is owned by exactly one ``business_id`` (DCA-017/018) and read
+    only within it; it holds the intent / suggestion / subject ids + the platform's OWN external record
+    id + opaque metadata — never a contact value.
+    """
+
+    __tablename__ = "billable_acceptances"
+    # At most ONE billable acceptance per accepted prospect in a business — the "billable once" guard.
+    __table_args__ = (tenant_unique("acceptance_intent_id", name="uq_billable_acceptance_intent"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    # The DCA-153 acceptance intent this billable fact meters, and the suggestion / subject it is about
+    # (captured so the entry is self-describing). Scoped within the business.
+    acceptance_intent_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("acceptance_intents.id"), index=True
+    )
+    suggestion_id: Mapped[str] = mapped_column(String(36), index=True)
+    subject_type: Mapped[str] = mapped_column(
+        String(16), default="organization", server_default="organization"
+    )
+    subject_id: Mapped[str] = mapped_column(String(36), index=True)
+    # The STABLE logical billing key (uuid5 over business + intent), so the same accepted prospect maps
+    # to the same billing key across retries — the idempotency anchor a later billing-delivery story
+    # meters against. Indexed for lookup/reconciliation.
+    billing_key: Mapped[str] = mapped_column(String(36), default="", server_default="", index=True)
+    # The platform's OWN external record id, CAPTURED from the acknowledged intent — the mapping that
+    # proves the sync was acknowledged (an entry is never recorded without it). Opaque; never contact.
+    external_crm_record_id: Mapped[str] = mapped_column(String(128), default="", server_default="")
+    # The stable DCA-027 outbox event id of the usage record staged with this entry (an opaque reference
+    # to the pending billing-usage hand-off) — so the entry and its outbox record can be joined.
+    outbox_event_id: Mapped[str] = mapped_column(String(36), default="", server_default="")
+    # The billable-acceptance contract version (expand→migrate→contract).
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # Lifecycle. 'recorded' is the only status this story writes; the actual billing DELIVERY
+    # ('delivered') stays a disabled future capability (DCA-158), so an entry never self-advances.
+    status: Mapped[str] = mapped_column(
+        String(16),
+        default=BillableAcceptanceStatus.RECORDED.value,
+        server_default=BillableAcceptanceStatus.RECORDED.value,
+        index=True,
+    )
+    # WHO recorded the billable acceptance — an opaque business actor id + its kind (never a name/email).
+    recorded_by: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    recorded_by_type: Mapped[str] = mapped_column(String(16), default="user", server_default="user")
+    # Billable provenance + the load-bearing invariants (billable = True; delivered / sent / spent /
+    # consentConferred / membershipCreated = False).
     provenance: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 

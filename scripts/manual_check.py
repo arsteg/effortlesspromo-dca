@@ -27556,6 +27556,303 @@ def _dca_156(ctx: CheckContext) -> dict:
     }
 
 
+@register(
+    "DCA-157",
+    "EMIT a BILLABLE acceptance ONLY AFTER acknowledgment: in isolated synthetic Businesses A/B, an "
+    "authorized A user emits the billable acceptance for a DCA-155 intent that was ACKNOWLEDGED (synced + "
+    "external mapping). It records ONE durable billable-acceptance ledger entry + ONE DCA-027 usage record "
+    "+ ONE atomic audit, under the STABLE logical billing key (deterministic in business + intent), with "
+    "NO live billing call and NO charge (delivery to platform billing is the disabled DCA-158 story). A "
+    "pending (never-synced), an uncertain (lost-acknowledgment PENDING) and a needs_review (unconfirmed "
+    "reconcile) intent each emit NOTHING; a replay — and a DCA-156 reconcile that re-resolved the SAME "
+    "intent — never double-charges (one entry); an unauthorized viewer and a cross-tenant id are refused "
+    "with no state change. Emitting confers NO consent and performs NO send. Local synthetic; no AI/paid "
+    "action, no network, no send, no charge.",
+)
+def _dca_157(ctx: CheckContext) -> dict:
+    """Drive the real DCA-157 emitter against a disposable DB with isolated synthetic Businesses A/B.
+
+    PRINT the actual state: an acknowledged intent emits ONE billable ledger entry (+ one usage record +
+    one atomic audit) under the stable billing key with NO live billing call / charge; a pending /
+    uncertain / needs_review intent emits NOTHING; a replay (and a reconcile re-resolution) is idempotent
+    (one entry, never double-charged); an unauthorized viewer and a cross-tenant id are refused with no
+    state change. Nothing is sent, spent, charged or consented."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.audience import (
+        AudienceField,
+        AudienceFieldClass,
+        AudienceSyncStatus,
+        FakeEffortlessPromoAudienceSyncPort,
+    )
+    from app.db.models import (
+        AcceptanceIntent,
+        AcceptanceIntentStatus,
+        AuditEvent,
+        BillableAcceptance,
+        BillableAcceptanceStatus,
+        OutboxMessage,
+        ProspectSuggestion,
+        SuggestionVisibility,
+        billable_acceptance_key,
+    )
+    from app.services.acceptance_intent import AcceptanceIntentActor, AcceptanceIntentRecorder
+    from app.services.acceptance_sync import AcceptanceRecordSynchronizer, AcceptanceSyncActor
+    from app.services.acceptance_sync_reconcile import (
+        RECONCILE_NEEDS_REVIEW,
+        UncertainAudienceSyncReconciler,
+    )
+    from app.services.billable_acceptance import (
+        AUDIT_ACTION_BILLABLE,
+        OUTBOX_EVENT_BILLABLE,
+        BillableAcceptanceAuthorizationError,
+        BillableAcceptanceEmitter,
+        BillableAcceptanceError,
+    )
+
+    biz_a = "00000000-0000-4000-8000-00000000157a"
+    biz_b = "00000000-0000-4000-8000-00000000157b"
+    accept_actor = AcceptanceIntentActor(
+        subject="00000000-0000-4000-9000-0000000a0157a", roles=("owner",)
+    )
+    admin = AcceptanceSyncActor(subject="00000000-0000-4000-9000-0000000a0157a", roles=("owner",))
+    viewer = AcceptanceSyncActor(subject="00000000-0000-4000-9000-0000000a0157b", roles=("viewer",))
+    now = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+    org_field = AudienceField(
+        key="business_type", field_class=AudienceFieldClass.ORGANIZATION, value_digest="retail"
+    )
+
+    def _seed_pending(session, business_id, subject_id):
+        sug = ProspectSuggestion(
+            business_id=business_id,
+            run_id="run-157",
+            subject_type="organization",
+            subject_id=subject_id,
+            visibility=SuggestionVisibility.RESEARCH_ONLY.value,
+            match_score=0.7,
+            rationale="ICP fit 0.70",
+            scored_icp_version=7,
+            schema_version=1,
+            status="suggested",
+            provenance={"source": "prospect_suggestion", "matchedDimensions": ["industry"]},
+            created_at=now,
+            expires_at=now + timedelta(days=30),
+        )
+        session.add(sug)
+        session.commit()
+        res = AcceptanceIntentRecorder(session, business_id).accept(sug.id, accept_actor, now=now)
+        session.commit()
+        return res.intent.id
+
+    def _seed_acknowledged(session, business_id, subject_id):
+        intent_id = _seed_pending(session, business_id, subject_id)
+        AcceptanceRecordSynchronizer(
+            session,
+            business_id,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).sync(intent_id, admin, fields=(org_field,), now=now)
+        session.commit()
+        return intent_id
+
+    def _seed_uncertain(session, business_id, subject_id):
+        intent_id = _seed_pending(session, business_id, subject_id)
+        AcceptanceRecordSynchronizer(
+            session,
+            business_id,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=False),
+        ).sync(intent_id, admin, fields=(org_field,), now=now)
+        session.commit()
+        return intent_id
+
+    def _seed_needs_review(session, business_id, subject_id):
+        intent_id = _seed_uncertain(session, business_id, subject_id)
+        UncertainAudienceSyncReconciler(
+            session,
+            business_id,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=False),
+        ).reconcile(intent_id, admin, fields=(org_field,), now=now)
+        session.commit()
+        return intent_id
+
+    def _billable_entries(session):
+        return session.query(BillableAcceptance).count()
+
+    def _billable_audits(session):
+        return session.query(AuditEvent).filter_by(action=AUDIT_ACTION_BILLABLE).count()
+
+    def _usage_records(session):
+        return session.query(OutboxMessage).filter_by(event_type=OUTBOX_EVENT_BILLABLE).count()
+
+    print("\nemit a billable acceptance ONLY after acknowledgment (local synthetic — no charge):")
+
+    with ctx.session_factory() as session:
+        intent_ack = _seed_acknowledged(session, biz_a, "subject-ack")
+        intent_pending = _seed_pending(session, biz_a, "subject-pending")  # never synced
+        intent_uncertain = _seed_uncertain(session, biz_a, "subject-uncertain")
+        intent_review = _seed_needs_review(session, biz_a, "subject-review")
+        intent_b = _seed_acknowledged(session, biz_b, "subject-b")
+
+        emitter_a = BillableAcceptanceEmitter(session, biz_a)
+
+        # 1) Acknowledged -> ONE billable entry + ONE usage record + ONE audit, stable billing key.
+        emitted = emitter_a.emit(intent_ack, admin, now=now)
+        session.commit()
+        row = session.get(BillableAcceptance, emitted.entry.id)
+        stable_key = emitted.billing_key == billable_acceptance_key(biz_a, intent_ack)
+        entries_after_ack = _billable_entries(session)
+        usage_after_ack = _usage_records(session)
+        audits_after_ack = _billable_audits(session)
+        print("\n  [1] acknowledged intent -> billable entry RECORDED (no live billing call):")
+        print(
+            f"      emitted={emitted.emitted} status={row.status} billingKey={row.billing_key} "
+            f"stableKey={stable_key} crmRecordId={row.external_crm_record_id!r} "
+            f"charged={emitted.charged} entries={entries_after_ack} usageRecords={usage_after_ack} "
+            f"audits={audits_after_ack}"
+        )
+
+        # 2) Replay is idempotent — same entry, no second usage record / audit, never double-charged.
+        replay = emitter_a.emit(intent_ack, admin, now=now + timedelta(hours=1))
+        session.commit()
+        print("\n  [2] replay is idempotent (never double-charged):")
+        print(
+            f"      alreadyEmitted={replay.already_emitted} sameEntry={replay.entry.id == emitted.entry.id} "
+            f"entries unchanged {entries_after_ack}->{_billable_entries(session)} "
+            f"usage unchanged {usage_after_ack}->{_usage_records(session)} "
+            f"audits unchanged {audits_after_ack}->{_billable_audits(session)}"
+        )
+
+        # 3) A DCA-156 reconcile re-resolution of the SAME intent still never double-charges.
+        UncertainAudienceSyncReconciler(
+            session,
+            biz_a,
+            ctx.settings,
+            port=FakeEffortlessPromoAudienceSyncPort(acknowledges=True),
+        ).reconcile(intent_ack, admin, fields=(org_field,), now=now + timedelta(hours=2))
+        session.commit()
+        after_reconcile = emitter_a.emit(intent_ack, admin, now=now + timedelta(hours=3))
+        session.commit()
+        print("\n  [3] reconcile re-resolution of the same intent -> still one entry:")
+        print(
+            f"      alreadyEmitted={after_reconcile.already_emitted} "
+            f"entries={_billable_entries(session)} usageRecords={_usage_records(session)}"
+        )
+
+        # 4) A pending / uncertain / needs_review intent emits NOTHING.
+        def _refused(intent_id):
+            try:
+                emitter_a.emit(intent_id, admin, now=now)
+                code = ""
+            except BillableAcceptanceError as exc:
+                code = exc.code
+            session.rollback()
+            return code
+
+        pending_code = _refused(intent_pending)
+        uncertain_code = _refused(intent_uncertain)
+        review_code = _refused(intent_review)
+        print("\n  [4] pending / uncertain / needs_review intents emit NOTHING:")
+        print(
+            f"      neverSynced={pending_code!r} uncertain={uncertain_code!r} "
+            f"needsReview={review_code!r} entries={_billable_entries(session)}"
+        )
+
+        # 5) An unauthorized viewer is refused with no state change.
+        try:
+            emitter_a.emit(intent_ack, viewer, now=now)
+            viewer_refused = False
+        except BillableAcceptanceAuthorizationError:
+            viewer_refused = True
+        session.rollback()
+        print(f"\n  [5] unauthorized viewer refused: {viewer_refused}")
+
+        # 6) A cross-tenant id reads as not-found (A cannot meter B's intent by id).
+        try:
+            emitter_a.emit(intent_b, admin, now=now)
+            cross_not_found = False
+        except BillableAcceptanceError as exc:
+            cross_not_found = exc.code == "acceptance_intent_not_found"
+        session.rollback()
+        print(f"\n  [6] cross-tenant id not-found: {cross_not_found}")
+
+        # Snapshot values while attached (the rollbacks above expire instances).
+        e = session.get(BillableAcceptance, emitted.entry.id)
+        e_status = e.status
+        e_crm = e.external_crm_record_id
+        e_prov_billable = e.provenance["billable"]
+        e_prov_delivered = e.provenance["delivered"]
+        e_prov_sent = e.provenance["sent"]
+        e_prov_spent = e.provenance["spent"]
+        e_prov_consent = e.provenance["consentConferred"]
+        e_prov_membership = e.provenance["membershipCreated"]
+        final_entries = _billable_entries(session)
+        final_usage = _usage_records(session)
+        final_audits = _billable_audits(session)
+        # B's acknowledged intent was never metered by the A-emitter.
+        b_entries = session.query(BillableAcceptance).filter_by(business_id=biz_b).count()
+        needs_review_state = (
+            session.get(AcceptanceIntent, intent_review).sync_reconcile_state
+            == RECONCILE_NEEDS_REVIEW
+        )
+        ack_is_acknowledged = (
+            session.get(AcceptanceIntent, intent_ack).sync_status
+            == AudienceSyncStatus.ACKNOWLEDGED.value
+            and session.get(AcceptanceIntent, intent_ack).status
+            == AcceptanceIntentStatus.SYNCED.value
+        )
+
+    checks = {
+        "emitted_one_billable_on_acknowledgment": emitted.emitted is True
+        and e_status == BillableAcceptanceStatus.RECORDED.value
+        and bool(e_crm)
+        and entries_after_ack == 1
+        and usage_after_ack == 1
+        and audits_after_ack == 1,
+        "billing_key_is_stable_and_deterministic": stable_key,
+        "acknowledged_precondition_holds": ack_is_acknowledged,
+        "no_live_billing_call_or_charge": emitted.charged is False
+        and emitted.confers_consent is False
+        and e_prov_billable is True
+        and e_prov_delivered is False
+        and e_prov_sent is False
+        and e_prov_spent is False
+        and e_prov_consent is False
+        and e_prov_membership is False,
+        "replay_idempotent_never_double_charged": replay.already_emitted is True
+        and replay.entry.id == emitted.entry.id,
+        "reconcile_re_resolution_never_double_charges": after_reconcile.already_emitted is True,
+        "not_emitted_for_pending_uncertain_or_failed": pending_code
+        == "acceptance_sync_not_acknowledged"
+        and uncertain_code == "acceptance_sync_not_acknowledged"
+        and review_code == "acceptance_sync_not_acknowledged"
+        and needs_review_state,
+        "unauthorized_viewer_refused": viewer_refused,
+        "cross_tenant_not_found": cross_not_found and b_entries == 0,
+        "exactly_one_entry_one_usage_one_audit_at_end": final_entries == 1
+        and final_usage == 1
+        and final_audits == 1,
+    }
+    print(f"\nchecks: {checks}")
+    print(
+        "\n(local synthetic only; no AI/paid action, no network, no send, no charge. DCA-157 emits a "
+        "BILLABLE acceptance ONLY AFTER the audience sync was ACKNOWLEDGED (intent synced + external "
+        "mapping). It records a durable billable-acceptance ledger entry + a DCA-027 usage record under "
+        "the STABLE logical billing key, with NO live billing call and NO charge — the actual delivery of "
+        "usage to platform billing is the disabled DCA-158 story. A pending / uncertain / needs_review "
+        "intent emits nothing; a replay and a DCA-156 reconcile re-resolution never double-charge "
+        "(exactly one entry per accepted prospect). Emitting confers NO recipient consent and performs NO "
+        "send.)"
+    )
+    return {
+        "checks": checks,
+        "billingKey": emitted.billing_key,
+        "entries": final_entries,
+    }
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manual_check.py",
